@@ -181,6 +181,17 @@ def main() -> None:
         ohlcv = dp.fetch_ohlcv(symbol, config["data"]["timeframe"], since=ts - 3_600_000, limit=2)
         return float(ohlcv.iloc[-1]["close"])
 
+    risk_check_cfg = config.get("risk_check", {}) or {}
+    _recent_window_minutes = int(risk_check_cfg.get("recent_window_minutes", 300))
+
+    def recent_price_provider(symbol: str, ts: int) -> list:
+        """每小时确定性风控检查用(见 config.yaml risk_check 段 + main.py
+        run_risk_check_cycle)。只拉最近一小段分钟线(默认5小时=300根1分钟K线,
+        OKX单次调用上限内,不需要分页),不是2年历史那个量级。"""
+        since = ts - _recent_window_minutes * 60_000
+        ohlcv = dp.fetch_ohlcv(symbol, "1m", since=since, limit=_recent_window_minutes)
+        return [(int(row["timestamp"]), float(row["close"])) for _, row in ohlcv.iterrows()]
+
     scheduler = main_module.AlphaLoopScheduler(
         config=config, clock=clock, simulators={"main": sim_main}, trader=trader,
         reflector=reflector, researcher=researcher, memory_store=memory_store, scorer=scorer,
@@ -188,6 +199,7 @@ def main() -> None:
         cold_start_gate=cold_start_gate, git_merge_executor=git_merge_executor,
         next_bar_provider=next_bar_provider, snapshot_provider=snapshot_provider,
         funding_rate_lookup=funding_rate_lookup, price_lookup=price_lookup,
+        recent_price_provider=recent_price_provider,
         log_root=LOG_ROOT, state_path=STATE_ROOT / "scheduler_state.json",
         # main.py 默认 trader_timeout_seconds=30.0,是为"真实API几秒内应该
         # 返回"这个假设设计的。llm_client 现在是要等一个人/agent签入并手动
@@ -211,6 +223,8 @@ def main() -> None:
 
     print("=== 进入常驻调度循环(每分钟轮询一次到期任务,Ctrl+C 停止)===", flush=True)
     last_settlement_check_ms = 0
+    last_risk_check_ms = 0
+    risk_check_interval_ms = scheduler._risk_check_interval_hours * 3_600_000
     while True:
         now = clock.now_ms()
         try:
@@ -228,6 +242,17 @@ def main() -> None:
             except Exception:  # noqa: BLE001
                 print(f"[{now}] run_settlement_catchup 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
             last_settlement_check_ms = now
+
+        # 用户新增护栏:每小时确定性风控检查,不经过Trader/LLM(见
+        # LOCKED/position_risk_monitor.py + main.py.run_risk_check_cycle)。
+        if now - last_risk_check_ms >= risk_check_interval_ms:
+            try:
+                risk_result = scheduler.run_risk_check_cycle("main")
+                if risk_result.get("triggered"):
+                    print(f"[{now}] 紧急风控平仓触发: {risk_result['triggered']}", flush=True)
+            except Exception:  # noqa: BLE001
+                print(f"[{now}] run_risk_check_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+            last_risk_check_ms = now
 
         write_heartbeat(clock, {"status": "running"})
         time.sleep(POLL_SECONDS)

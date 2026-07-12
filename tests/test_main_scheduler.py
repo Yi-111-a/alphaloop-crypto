@@ -746,3 +746,137 @@ def test_run_decision_cycle_generates_latest_advice_automatically(tmp_path, log_
     assert result["advice_path"] is not None
     content = result["advice_path"].read_text(encoding="utf-8")
     assert content.startswith(DISCLAIMER)
+
+
+# ===========================================================================
+# M5 用户新增护栏:每小时确定性紧急风控检查(不在原六条硬要求里,是点火
+# 过程中用户直接补充的,详见 LOCKED/position_risk_monitor.py 模块 docstring
+# 记录的设计裁决:必须是确定性代码判断,不经过 Trader/LLM)。
+# ===========================================================================
+
+
+class FakeRecentPriceProvider:
+    """recent_price_provider 的 fake:symbol -> 预先注入的 (ts, price) 序列。
+    记录被调用过的 symbol,用于断言"只查询了实际持仓涉及的symbol"。"""
+
+    def __init__(self, prices_by_symbol: dict[str, list[tuple[int, float]]]):
+        self.prices_by_symbol = prices_by_symbol
+        self.calls: list[str] = []
+
+    def __call__(self, symbol: str, ts: int) -> list[tuple[int, float]]:
+        self.calls.append(symbol)
+        return self.prices_by_symbol.get(symbol, [])
+
+
+def test_risk_check_triggers_emergency_close_on_drawdown_breach(tmp_path, log_root):
+    """核心场景:多头持仓最近窗口从高点回撤超过阈值(config默认5%)->
+    不经过Trader,直接构造close决策并真实执行。"""
+    clock = FakeClock(BASE_TS)
+    sim_main = _make_sim(tmp_path, log_root, "main")
+    trade = _open_long(sim_main, log_root, "main", BASE_TS, price=50_000.0, pct=30.0, leverage=3)
+    assert sim_main.positions  # sanity: 持仓真的开出来了
+
+    # peak 51000 -> current 47000: (51000-47000)/51000*100 ≈ 7.84% > 5% 阈值
+    price_provider = FakeRecentPriceProvider({
+        "BTC/USDT:USDT": [(BASE_TS, 50_000.0), (BASE_TS + 60_000, 51_000.0), (BASE_TS + 120_000, 47_000.0)],
+    })
+    trader = FakeTrader()
+    scheduler = _make_scheduler(
+        tmp_path, log_root, clock, {"main": sim_main}, trader, recent_price_provider=price_provider,
+    )
+
+    clock.advance_ms(3_600_000)
+    result = scheduler.run_risk_check_cycle("main")
+
+    assert result["status"] == "checked"
+    assert len(result["triggered"]) == 1
+    assert result["triggered"][0]["symbol"] == "BTC/USDT:USDT"
+    assert "BTC/USDT:USDT" not in sim_main.positions  # 真的平仓了
+    assert trader.call_count == 0  # 全程没有经过Trader/LLM
+
+    # 落盘的决策必须诚实标注这是确定性触发,不是Trader/LLM的判断
+    decisions = log_writer.read_jsonl("decisions.jsonl", root=log_root)
+    close_decision = [d for d in decisions if d.get("action") == "close"][0]
+    assert "非LLM判断" in close_decision["thesis"] or "确定性" in close_decision["thesis"]
+    assert len(close_decision["thesis"]) >= 20
+    assert len(close_decision["falsifier"]) >= 20
+
+
+def test_risk_check_does_not_trigger_below_threshold(tmp_path, log_root):
+    clock = FakeClock(BASE_TS)
+    sim_main = _make_sim(tmp_path, log_root, "main")
+    _open_long(sim_main, log_root, "main", BASE_TS, price=50_000.0, pct=30.0, leverage=3)
+
+    # small dip well under the 5% threshold
+    price_provider = FakeRecentPriceProvider({
+        "BTC/USDT:USDT": [(BASE_TS, 50_000.0), (BASE_TS + 60_000, 50_500.0), (BASE_TS + 120_000, 50_200.0)],
+    })
+    scheduler = _make_scheduler(
+        tmp_path, log_root, clock, {"main": sim_main}, FakeTrader(), recent_price_provider=price_provider,
+    )
+
+    result = scheduler.run_risk_check_cycle("main")
+    assert result["triggered"] == []
+    assert "BTC/USDT:USDT" in sim_main.positions  # 仓位没动
+
+
+def test_risk_check_skipped_gracefully_when_no_provider_injected(tmp_path, log_root):
+    """recent_price_provider 是可选依赖(main.py 一贯的注入式设计)——没注入
+    时必须干净地跳过,不能抛异常炸掉调度循环。"""
+    clock = FakeClock(BASE_TS)
+    sim_main = _make_sim(tmp_path, log_root, "main")
+    _open_long(sim_main, log_root, "main", BASE_TS, price=50_000.0, pct=30.0, leverage=3)
+    scheduler = _make_scheduler(tmp_path, log_root, clock, {"main": sim_main}, FakeTrader())
+
+    result = scheduler.run_risk_check_cycle("main")
+    assert result["status"] == "skipped_no_recent_price_provider"
+    assert "BTC/USDT:USDT" in sim_main.positions
+
+
+def test_risk_check_only_queries_symbols_with_open_positions(tmp_path, log_root):
+    clock = FakeClock(BASE_TS)
+    sim_main = _make_sim(tmp_path, log_root, "main")
+    _open_long(sim_main, log_root, "main", BASE_TS, price=50_000.0, pct=30.0, leverage=3)
+
+    price_provider = FakeRecentPriceProvider({"BTC/USDT:USDT": [(BASE_TS, 50_000.0), (BASE_TS + 1000, 50_100.0)]})
+    scheduler = _make_scheduler(
+        tmp_path, log_root, clock, {"main": sim_main}, FakeTrader(), recent_price_provider=price_provider,
+    )
+    scheduler.run_risk_check_cycle("main")
+    assert price_provider.calls == ["BTC/USDT:USDT"]
+
+
+def test_risk_check_one_symbol_price_fetch_failure_does_not_abort_whole_cycle(tmp_path, log_root):
+    clock = FakeClock(BASE_TS)
+    sim_main = _make_sim(tmp_path, log_root, "main")
+    _open_long(sim_main, log_root, "main", BASE_TS, price=50_000.0, pct=30.0, leverage=3)
+
+    def failing_provider(symbol, ts):
+        raise ConnectionError("simulated feed outage")
+
+    scheduler = _make_scheduler(
+        tmp_path, log_root, clock, {"main": sim_main}, FakeTrader(), recent_price_provider=failing_provider,
+    )
+    result = scheduler.run_risk_check_cycle("main")  # must not raise
+    assert result["status"] == "checked"
+    assert result["triggered"] == []  # 数据不足 -> 不触发,不是假装触发
+    errors = log_writer.read_jsonl("scheduler_errors.jsonl", root=log_root)
+    assert any(e.get("event") == "risk_check_price_fetch_failed" for e in errors)
+
+
+def test_risk_check_is_purely_deterministic_no_llm_involvement_across_multiple_triggers(tmp_path, log_root):
+    """一次跑多个持仓、多次触发,Trader.call_count 全程必须是0——这是这个
+    功能存在的全部意义(紧急操作等不起agent签入)。"""
+    clock = FakeClock(BASE_TS)
+    sim_main = _make_sim(tmp_path, log_root, "main")
+    _open_long(sim_main, log_root, "main", BASE_TS, price=50_000.0, pct=30.0, leverage=3)
+
+    price_provider = FakeRecentPriceProvider({
+        "BTC/USDT:USDT": [(BASE_TS, 50_000.0), (BASE_TS + 60_000, 52_000.0), (BASE_TS + 120_000, 48_000.0)],
+    })
+    trader = FakeTrader()
+    scheduler = _make_scheduler(
+        tmp_path, log_root, clock, {"main": sim_main}, trader, recent_price_provider=price_provider,
+    )
+    scheduler.run_risk_check_cycle("main")
+    assert trader.call_count == 0

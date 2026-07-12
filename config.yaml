@@ -41,3 +41,16 @@ data:
   exchange: okx                # M5 shakedown 期间由 binance 改为 okx(见 universe_rule.source 注释)
   timeframe: 4h
   history_days: 730
+risk_check:                      # M5 点火过程中用户新增的一条护栏(不在原spec v1.2里):
+                                  # 正式决策仍然4小时一次(见cycle.decision_interval_hours),
+                                  # 但用户认为分钟级行情里可能出现4小时内来不及等正式决策
+                                  # 就已经把仓位打穿的情况,加一层更高频、但刻意做成"确定性
+                                  # 代码判断、不走LLM"的紧急哨兵(见LOCKED/position_risk_monitor.py
+                                  # 模块docstring:紧急操作等不起agent签入推理的延迟)。
+  interval_hours: 1              # 每小时跑一次
+  recent_window_minutes: 300     # 用最近5小时(300根1分钟K线,OKX单次调用上限
+                                  # 内,不需要分页)的分钟线判断"从最近高点/低点的回撤"
+  emergency_exit_drawdown_pct: 5 # 单个持仓从最近窗口内高点(多头)/低点(空头)反向
+                                  # 移动超过这个百分比 -> 立即提交close决策,不经过Trader。
+                                  # 比daily_loss_freeze_pct(8%,账户级)更紧,因为这是
+                                  # 单仓位级别的哨兵,不是替代circuit_breaker的组合熔断

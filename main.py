@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from LOCKED import log_writer
+from LOCKED.position_risk_monitor import check_all_positions
 from LOCKED.schemas import Decision
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -169,6 +170,7 @@ class AlphaLoopScheduler:
         mark_price_provider: Optional[Callable[[int], dict]] = None,
         funding_rate_lookup: Optional[Callable[[str, int], float]] = None,
         price_lookup: Optional[Callable[[str, int], float]] = None,
+        recent_price_provider: Optional[Callable[[str, int], list[tuple[int, float]]]] = None,
         benchmark_nav_provider: Optional[Callable[[int], float]] = None,
         random_nav_provider: Optional[Callable[[int], float]] = None,
         decisions_log_path: str = "decisions.jsonl",
@@ -198,6 +200,7 @@ class AlphaLoopScheduler:
         self.mark_price_provider = mark_price_provider
         self.funding_rate_lookup = funding_rate_lookup
         self.price_lookup = price_lookup
+        self.recent_price_provider = recent_price_provider
         self.benchmark_nav_provider = benchmark_nav_provider
         self.random_nav_provider = random_nav_provider
 
@@ -216,6 +219,15 @@ class AlphaLoopScheduler:
             (config.get("cycle", {}) or {}).get("decision_interval_hours", 4)
         )
         self._settle_hours_utc = list((config.get("funding", {}) or {}).get("settle_hours_utc", [0, 8, 16]))
+
+        # M5 用户新增护栏(不在原spec v1.2里,见 LOCKED/position_risk_monitor.py
+        # 模块docstring):每小时一次的确定性紧急风控检查,与4小时一次的正式
+        # Trader决策周期是两条独立的节拍。
+        risk_check_cfg = config.get("risk_check", {}) or {}
+        self._risk_check_interval_hours = int(risk_check_cfg.get("interval_hours", 1))
+        self._risk_check_emergency_exit_drawdown_pct = float(
+            risk_check_cfg.get("emergency_exit_drawdown_pct", 5.0)
+        )
 
         if state_path is not None:
             self.state_path = Path(state_path)
@@ -461,6 +473,84 @@ class AlphaLoopScheduler:
             self._persist_state()
 
         return {"missed_instants": missed, "settlements_by_instant": settlements_by_instant}
+
+    # ==================================================================
+    # M5 用户新增护栏:每小时确定性紧急风控检查(不在原spec v1.2里,详见
+    # LOCKED/position_risk_monitor.py 模块 docstring 记录的设计裁决)。
+    # 与硬要求1-6 并列,但不是复审提出的那六条,是点火过程中用户直接补充的。
+    # ==================================================================
+
+    _RISK_CHECK_FALSIFIER = (
+        "本决策由每小时确定性风控哨兵自动触发,不设证伪条件,"
+        "持仓已按预设阈值规则强制平仓,不接受人工/LLM复核延迟"
+    )
+
+    def run_risk_check_cycle(self, branch: str = "main") -> dict:
+        """每小时跑一次(硬性节拍与4小时一次的 run_decision_cycle 独立)。
+        确定性代码判断(LOCKED.position_risk_monitor,不经过 Trader/LLM),
+        触发时直接构造一条 close 决策提交给 Simulator——"紧急"两个字的含义
+        就是不能等 llm_bridge 那样的人工/agent签入响应延迟(见
+        scripts/llm_bridge.py),必须在这个调用内就能同步完成判断到执行。
+        """
+        if self.recent_price_provider is None:
+            return {"branch": branch, "status": "skipped_no_recent_price_provider", "triggered": []}
+
+        now = self.clock.now_ms()
+        sim = self.simulators[branch]
+        positions = sim.get_portfolio()["positions"]
+        # get_portfolio() 返回的是 dict 列表(每个持仓的字段展开),
+        # check_all_positions 要的是 dict[symbol, PerpPosition] -- 用真实持仓对象
+        # (sim.positions),不是 get_portfolio() 的展开视图,保持类型一致。
+        position_objs = sim.positions
+
+        recent_prices_by_symbol: dict[str, list[tuple[int, float]]] = {}
+        for symbol in position_objs:
+            try:
+                recent_prices_by_symbol[symbol] = self.recent_price_provider(symbol, now)
+            except Exception as exc:  # noqa: BLE001 -- 单个symbol行情拉取失败不该拖垮整轮检查
+                self._log_scheduler_event(
+                    "risk_check_price_fetch_failed", branch=branch, symbol=symbol, error=repr(exc)
+                )
+                recent_prices_by_symbol[symbol] = []
+
+        results = check_all_positions(
+            position_objs, recent_prices_by_symbol, self._risk_check_emergency_exit_drawdown_pct
+        )
+
+        triggered_closes = []
+        for result in results:
+            if not result.triggered:
+                continue
+            position = position_objs[result.symbol]
+            decision = Decision(
+                ts=now,
+                symbol=result.symbol,
+                action="close",
+                target_notional_pct=0.0,
+                leverage=position.leverage,
+                thesis=(
+                    f"确定性风控紧急平仓:{result.symbol} 最近窗口回撤 {result.drawdown_pct:.2f}% "
+                    f"触发 {self._risk_check_emergency_exit_drawdown_pct:.2f}% 阈值,非LLM判断,非Trader决策"
+                ),
+                falsifier=self._RISK_CHECK_FALSIFIER,
+                horizon="1h",
+                branch=branch,
+            )
+            sim.log_decision(decision)
+            next_bar = self.next_bar_provider(result.symbol, now) if self.next_bar_provider else {
+                "open_time": now + 1, "open": 0.0
+            }
+            execution_result = sim.execute(decision, next_bar)
+            triggered_closes.append({
+                "symbol": result.symbol, "drawdown_pct": result.drawdown_pct, "result": execution_result,
+            })
+            self._log_scheduler_event(
+                "risk_check_emergency_close",
+                branch=branch, symbol=result.symbol, drawdown_pct=result.drawdown_pct,
+                threshold_pct=self._risk_check_emergency_exit_drawdown_pct,
+            )
+
+        return {"branch": branch, "status": "checked", "ts": now, "results": results, "triggered": triggered_closes}
 
     # ==================================================================
     # 硬要求5(Researcher/Reflector部分): 失败跳过本次、记LOG、下周期自然重试
