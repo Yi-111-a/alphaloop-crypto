@@ -200,6 +200,49 @@ class FakeExchange:
         return self._tickers
 
 
+class FlakyExchange(FakeExchange):
+    """M5 回归测试用:load_markets() 前两次抛真实点火时遇到过的那类瞬时网络
+    异常,第三次才成功——模拟 fetch_candidates() 现在必须能扛过去的场景。"""
+
+    def __init__(self, fail_times: int = 2):
+        super().__init__()
+        self._load_markets_calls = 0
+        self._fail_times = fail_times
+
+    def load_markets(self):
+        self._load_markets_calls += 1
+        if self._load_markets_calls <= self._fail_times:
+            raise ConnectionError("simulated transient SSL/connection drop")
+        return self._markets
+
+
+def test_fetch_candidates_retries_transient_network_failure(monkeypatch):
+    """回归测试:真实点火时 load_markets() 遇到过一次瞬时 SSL 中断
+    (ccxt.NetworkError),把整个 COLD_START 进程打崩——fetch_candidates()
+    必须重试,不能让一次会自愈的网络抖动变成硬失败。"""
+    config = make_config()
+    flaky = FlakyExchange(fail_times=2)
+    uf = UniverseFilter(config=config, exchange=flaky, backoff_base_seconds=0.001)  # 加速测试,不真的等指数退避
+
+    candidates = uf.fetch_candidates()
+
+    assert flaky._load_markets_calls == 3  # 前两次失败,第三次成功
+    # fetch_candidates() 自己会跳过非 swap 市场(这里的 "SOL/USDT" 现货),
+    # 所以候选数比 _markets 总数少 1,不是简单的 1:1 映射。
+    non_swap_count = sum(1 for m in flaky._markets.values() if not m.get("swap"))
+    assert len(candidates) == len(flaky._markets) - non_swap_count
+
+
+def test_fetch_candidates_raises_after_exhausting_retries(monkeypatch):
+    config = make_config()
+    always_fails = FlakyExchange(fail_times=999)
+    uf = UniverseFilter(config=config, exchange=always_fails, max_retries=3, backoff_base_seconds=0.001)
+
+    with pytest.raises(ConnectionError):
+        uf.fetch_candidates()
+    assert always_fails._load_markets_calls == 3
+
+
 def test_refresh_writes_expected_json_shape(tmp_path):
     config = make_config()
     fake_exchange = FakeExchange()
