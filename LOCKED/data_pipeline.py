@@ -79,7 +79,7 @@ class DataPipeline:
 
     def __init__(
         self,
-        exchange_id: str = "binance",
+        exchange_id: str = "okx",
         cache_dir: Path | str | None = None,
         max_retries: int = 3,
         backoff_base_seconds: float = 0.5,
@@ -117,20 +117,38 @@ class DataPipeline:
     # ------------------------------------------------------------------
     # 构造 / 内部工具
     # ------------------------------------------------------------------
-    @staticmethod
-    def _build_exchange(exchange_id: str) -> Any:
+
+    # M5 shakedown 适配:不同交易所在 ccxt 里给"USDT本位永续合约"用的
+    # options.defaultType 术语不统一(币安用 "future",OKX/大多数其它交易所
+    # 用 "swap")。exchange_id 默认值也从 "binance" 改为 "okx"——本沙箱网络
+    # 环境下 api.binance.com/fapi.binance.com 对该出口IP返回 HTTP 451(见
+    # 模块 docstring 开头的联网适配记录),经用户确认后切换到 OKX。
+    _DEFAULT_TYPE_BY_EXCHANGE: dict[str, str] = {
+        "binance": "future",
+        "binanceusdm": "future",
+    }
+
+    @classmethod
+    def _build_exchange(cls, exchange_id: str) -> Any:
         import ccxt
 
         exchange_cls = getattr(ccxt, exchange_id)
+        default_type = cls._DEFAULT_TYPE_BY_EXCHANGE.get(exchange_id, "swap")
         # 仅公开数据模式:不设置 apiKey / secret。
         exchange = exchange_cls(
             {
                 "enableRateLimit": True,
                 "options": {
-                    "defaultType": "future",  # USDT 本位合约(swap)
+                    "defaultType": default_type,  # USDT 本位合约(swap)
                 },
             }
         )
+        # M5 适配:ccxt 的 requests.Session 默认 trust_env=False,不会自动读取
+        # HTTP_PROXY/HTTPS_PROXY 环境变量(与标准库 urllib/裸 requests 的默认
+        # 行为不同)。本沙箱的联网访问依赖一个已配置好的本地代理环境变量,不
+        # 显式打开 trust_env 的话 ccxt 侧的请求会直接尝试(失败的)直连。
+        if hasattr(exchange, "session"):
+            exchange.session.trust_env = True
         return exchange
 
     def _with_retry(self, fn: Callable[[], T], description: str) -> T:

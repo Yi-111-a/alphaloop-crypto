@@ -76,6 +76,31 @@ def test_normal_qualifying_coin_included(uf):
     assert result == ["BTC/USDT:USDT"]
 
 
+def test_apply_filters_tolerates_yaml_string_thresholds(uf):
+    """M5 shakedown 回归测试:PyYAML 对 "100e6" 这种没有小数点的科学计数法
+    按 YAML 1.1 规范会解析成字符串而不是 float(必须写成 "100.0e6" 才会被
+    识别成数字——这是 PyYAML 广为人知的坑)。首次用真实网络数据跑
+    refresh() 时才触发(离线单测过去传的都是手写 dict,天然是正确类型),
+    这里显式构造一个"config 里的阈值是字符串"的场景,防止这个类型问题
+    再次不经意间回归。"""
+    uf_with_string_config = UniverseFilter(
+        config={
+            "universe_rule": {
+                "min_24h_volume_usdt": "100e6",  # 字符串,不是 float —— 模拟真实YAML解析结果
+                "min_listing_days": "90",
+                "blacklist": [],
+            }
+        },
+        exchange=object(),
+    )
+    candidates = [
+        {"symbol": "BTC/USDT:USDT", "volume_24h_usdt": 500e6, "listing_days": 200},
+        {"symbol": "LOWVOL/USDT:USDT", "volume_24h_usdt": 50e6, "listing_days": 200},
+    ]
+    result = uf_with_string_config.apply_filters(candidates)
+    assert result == ["BTC/USDT:USDT"]
+
+
 def test_unknown_listing_date_treated_as_too_new(uf):
     """上市时间未知 -> 保守处理为太新,必须排除(见模块 docstring 的 fallback 策略)。"""
     candidates = [

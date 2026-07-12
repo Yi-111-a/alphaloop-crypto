@@ -2,7 +2,11 @@ capital_usdt: 100000
 mode: perp                     # USDT本位永续合约,支持双向(做多/做空)+杠杆
 benchmark: BTC_HOLD            # 基准:期初全仓买入BTC现货持有不动(1倍,无杠杆)
 universe_rule:                 # 币池不再是固定名单,而是LOCKED区代码强制的筛选规则
-  source: binance_usdt_perp    # 只允许币安USDT本位永续合约已上市交易对
+  source: okx_usdt_perp        # M5 shakedown 期间由 binance_usdt_perp 改为 okx_usdt_perp:
+                                # 本沙箱网络环境下 api.binance.com/fapi.binance.com 对该出口IP
+                                # 返回 HTTP 451(Binance 自身的地域限制,不是本地防火墙),经用户
+                                # 确认后切换到 OKX(USDT本位永续,ccxt统一接口验证可用、资金费率
+                                # 同为0/8/16 UTC三时点结算)。只允许OKX USDT本位永续合约已上市交易对
   min_24h_volume_usdt: 100e6   # 24h成交额 >= 1亿USDT(流动性门槛)
   min_listing_days: 90         # 上市不足90天的新币排除(防上线拉盘/土狗)
   refresh: weekly              # 每周一刷新一次合格名单,写入universe_active.json
@@ -11,10 +15,10 @@ leverage:
   max: 10                      # 硬上限10倍,LOCKED区强制,超过即Rejection
   default: 3                   # agent未指定时的默认杠杆
 fees:
-  taker_pct: 0.0005            # 币安USDT永续taker 0.05%
+  taker_pct: 0.0005            # OKX USDT永续taker 0.05%(实测与原先假设的币安费率数值相同,未改动)
   slippage_bps: 15             # 从严不从宽;若标的24h成交额<5亿,滑点自动加倍
 funding:
-  settle_hours_utc: [0, 8, 16] # 每8小时结算一次,币安标准时点
+  settle_hours_utc: [0, 8, 16] # 每8小时结算一次,OKX与币安一致的三时点
   source: real                 # 用ccxt拉取真实资金费率结算,不自己复现溢价公式
 constraints:
   max_position_notional_pct: 100   # 单币名义仓位上限:不超过净值的100%(即单币最多10倍杠杆下用10%保证金)
@@ -34,6 +38,6 @@ evolution:                       # M4 棘轮进化(§3.5)
                                   # 平局或微弱优势一律维持主线(多重比较问题:并行
                                   # 分支+高频判定,没有门槛棘轮会被运气缓慢填满)
 data:
-  exchange: binance
+  exchange: okx                # M5 shakedown 期间由 binance 改为 okx(见 universe_rule.source 注释)
   timeframe: 4h
   history_days: 730
