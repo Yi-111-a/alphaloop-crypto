@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>AlphaLoop-Crypto 监控面板(只读)</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #131a22; --border: #24303c; --text: #e6edf3;
+    --muted: #8b98a5; --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.5;
+  }
+  #disclaimer {
+    position: sticky; top: 0; z-index: 10;
+    background: #3d1e1e; color: #ffd7d7; border-bottom: 2px solid var(--red);
+    padding: 10px 16px; font-size: 14px; font-weight: 600; text-align: center;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 8px 0 16px; }
+  .status-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .badge {
+    padding: 6px 12px; border-radius: 999px; font-size: 13px; font-weight: 600;
+    border: 1px solid var(--border); background: var(--panel);
+  }
+  .badge.state-normal { border-color: var(--green); color: var(--green); }
+  .badge.state-cold { border-color: var(--yellow); color: var(--yellow); }
+  .badge.state-frozen { border-color: var(--red); color: var(--red); }
+  .badge.state-unknown { color: var(--muted); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 10px; color: var(--accent); }
+  .full { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .empty { color: var(--muted); font-style: italic; padding: 12px 0; }
+  .metric-row { display: flex; gap: 24px; flex-wrap: wrap; }
+  .metric { min-width: 140px; }
+  .metric .label { color: var(--muted); font-size: 12px; }
+  .metric .value { font-size: 20px; font-weight: 700; margin-top: 2px; }
+  .health-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .light { display: flex; align-items: center; gap: 6px; font-size: 13px; padding: 6px 10px;
+    border: 1px solid var(--border); border-radius: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .dot.green { background: var(--green); }
+  .dot.red { background: var(--red); }
+  .dot.unknown { background: var(--muted); }
+  .advice-box {
+    white-space: pre-wrap; font-size: 13px; background: #0d1319; border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; max-height: 420px; overflow-y: auto;
+  }
+  .verdict-PROMOTE { color: var(--green); font-weight: 700; }
+  .verdict-ARCHIVE { color: var(--muted); }
+  .verdict-FAIL { color: var(--red); font-weight: 700; }
+  .footer-note { color: var(--muted); font-size: 12px; margin-top: 20px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="disclaimer">本内容为AI模拟实验输出,非投资建议,不构成任何交易依据</div>
+
+<div class="wrap">
+  <h1>AlphaLoop-Crypto 监控面板<span style="color:var(--muted); font-weight:400; font-size:14px;">(只读)</span></h1>
+
+  <div class="status-row" id="statusRow">
+    <span class="badge state-unknown">状态加载中…</span>
+  </div>
+
+  <div class="panel full">
+    <h2>净值三线对比(agent / BTC_HOLD 基准 / 随机对照)</h2>
+    <canvas id="navChart" height="90"></canvas>
+    <div id="navEmpty" class="empty" style="display:none;">等待系统启动 —— 尚无净值数据</div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>当前持仓(main 分支)</h2>
+      <div id="positionsTableWrap">
+        <table id="positionsTable">
+          <thead><tr><th>币种</th><th>方向</th><th>杠杆</th><th>名义额</th><th>开仓价</th><th>未实现盈亏</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="positionsEmpty" class="empty" style="display:none;">等待系统启动 —— 尚无持仓数据</div>
+    </div>
+
+    <div class="panel">
+      <h2>累计成本</h2>
+      <div class="metric-row">
+        <div class="metric">
+          <div class="label">累计资金费率支出</div>
+          <div class="value" id="fundingTotal">--</div>
+        </div>
+        <div class="metric">
+          <div class="label">累计手续费</div>
+          <div class="value" id="feesTotal">--</div>
+        </div>
+      </div>
+      <div style="margin-top:18px;">
+        <h2>运行体征</h2>
+        <div class="health-row" id="healthRow"></div>
+      </div>
+    </div>
+
+    <div class="panel full">
+      <h2>最新建议(latest_advice.md 原文)</h2>
+      <div id="adviceBox" class="advice-box">等待系统启动 —— 尚无建议输出</div>
+    </div>
+
+    <div class="panel full">
+      <h2>棘轮判定日志(最近10条)</h2>
+      <table id="ratchetTable">
+        <thead><tr><th>时间</th><th>分支</th><th>判定</th><th>edge vs main</th><th>回撤</th><th>原因</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="ratchetEmpty" class="empty" style="display:none;">等待系统启动 —— 尚无棘轮判定记录</div>
+    </div>
+  </div>
+
+  <div class="footer-note">
+    面板每 15 秒自动刷新一次。数据直接来自 LOG/ 与 portfolio.db,不经过任何业务模块二次计算。
+  </div>
+</div>
+
+<script>
+const REFRESH_MS = 15000;
+let navChart = null;
+
+function fmt(n, digits = 2) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "--";
+  return Number(n).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function stateBadgeClass(state) {
+  if (state === "NORMAL") return "state-normal";
+  if (state === "COLD_START") return "state-cold";
+  if (state === "FROZEN_FULL" || state === "FROZEN_24H") return "state-frozen";
+  return "state-unknown";
+}
+
+async function fetchJSON(url) {
+  const res = await fetch(url);
+  return res.json();
+}
+
+async function refreshStatus() {
+  const data = await fetchJSON("/api/status");
+  const row = document.getElementById("statusRow");
+  row.innerHTML = "";
+  const coldState = data.cold_start_state || "未知";
+  const coldBadge = document.createElement("span");
+  coldBadge.className = "badge " + stateBadgeClass(data.cold_start_state);
+  coldBadge.textContent = "冷启动状态: " + coldState;
+  row.appendChild(coldBadge);
+
+  const circuitState = data.circuit_state || "未知";
+  const circuitBadge = document.createElement("span");
+  circuitBadge.className = "badge " + stateBadgeClass(data.circuit_state);
+  circuitBadge.textContent = "熔断状态: " + circuitState;
+  row.appendChild(circuitBadge);
+}
+
+async function refreshNav() {
+  const data = await fetchJSON("/api/nav");
+  const emptyEl = document.getElementById("navEmpty");
+  const canvas = document.getElementById("navChart");
+  if (!data.has_data) {
+    emptyEl.style.display = "block";
+    canvas.style.display = "none";
+    return;
+  }
+  emptyEl.style.display = "none";
+  canvas.style.display = "block";
+
+  const labels = data.rows.map(r => r.date);
+  const agent = data.rows.map(r => r.nav_agent);
+  const benchmark = data.rows.map(r => r.nav_benchmark);
+  const random = data.rows.map(r => r.nav_random);
+
+  if (navChart) {
+    navChart.data.labels = labels;
+    navChart.data.datasets[0].data = agent;
+    navChart.data.datasets[1].data = benchmark;
+    navChart.data.datasets[2].data = random;
+    navChart.update();
+    return;
+  }
+  navChart = new Chart(canvas.getContext("2d"), {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        { label: "Agent", data: agent, borderColor: "#58a6ff", tension: 0.1, pointRadius: 0 },
+        { label: "BTC_HOLD 基准", data: benchmark, borderColor: "#d29922", tension: 0.1, pointRadius: 0 },
+        { label: "随机对照", data: random, borderColor: "#8b98a5", tension: 0.1, pointRadius: 0 },
+      ],
+    },
+    options: {
+      responsive: true,
+      scales: { y: { ticks: { color: "#8b98a5" } }, x: { ticks: { color: "#8b98a5" } } },
+      plugins: { legend: { labels: { color: "#e6edf3" } } },
+    },
+  });
+}
+
+async function refreshPositions() {
+  const data = await fetchJSON("/api/positions");
+  const tbody = document.querySelector("#positionsTable tbody");
+  const emptyEl = document.getElementById("positionsEmpty");
+  const wrapEl = document.getElementById("positionsTableWrap");
+  tbody.innerHTML = "";
+  if (!data.has_data || !data.positions || data.positions.length === 0) {
+    emptyEl.style.display = "block";
+    wrapEl.style.display = "none";
+    return;
+  }
+  emptyEl.style.display = "none";
+  wrapEl.style.display = "block";
+  for (const p of data.positions) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${p.symbol}</td><td>${p.side}</td><td>${p.leverage}x</td>` +
+      `<td>${fmt(p.notional)}</td><td>${fmt(p.entry_price)}</td><td>--</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+async function refreshAdvice() {
+  const data = await fetchJSON("/api/latest_advice");
+  const box = document.getElementById("adviceBox");
+  box.textContent = data.has_data ? data.content : "等待系统启动 —— 尚无建议输出";
+}
+
+async function refreshCosts() {
+  const funding = await fetchJSON("/api/funding_summary");
+  const fees = await fetchJSON("/api/fees_summary");
+  document.getElementById("fundingTotal").textContent = funding.has_data ? fmt(funding.total_amount) + " USDT" : "--";
+  document.getElementById("feesTotal").textContent = fees.has_data ? fmt(fees.total_fee) + " USDT" : "--";
+}
+
+async function refreshRatchet() {
+  const data = await fetchJSON("/api/ratchet_log");
+  const tbody = document.querySelector("#ratchetTable tbody");
+  const emptyEl = document.getElementById("ratchetEmpty");
+  tbody.innerHTML = "";
+  if (!data.has_data || data.verdicts.length === 0) {
+    emptyEl.style.display = "block";
+    return;
+  }
+  emptyEl.style.display = "none";
+  for (const v of data.verdicts) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${v.now_date || ""}</td><td>${v.branch || ""}</td>` +
+      `<td class="verdict-${v.decision}">${v.decision || ""}</td>` +
+      `<td>${fmt(v.edge_vs_main_pct)}%</td><td>${fmt(v.max_drawdown_pct)}%</td>` +
+      `<td style="max-width:340px; white-space:normal;">${v.reason || ""}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+async function refreshHealth() {
+  const data = await fetchJSON("/api/health");
+  const row = document.getElementById("healthRow");
+  row.innerHTML = "";
+  const items = [
+    ["决策周期", data.decision_gap],
+    ["资金费率结算", data.funding_completeness],
+    ["进程心跳", data.heartbeat],
+  ];
+  for (const [label, h] of items) {
+    const div = document.createElement("div");
+    div.className = "light";
+    const dotClass = h.status === "green" ? "green" : (h.status === "red" ? "red" : "unknown");
+    div.innerHTML = `<span class="dot ${dotClass}"></span><span>${label}: ${h.detail}</span>`;
+    row.appendChild(div);
+  }
+}
+
+async function refreshAll() {
+  try {
+    await Promise.all([
+      refreshStatus(), refreshNav(), refreshPositions(),
+      refreshAdvice(), refreshCosts(), refreshRatchet(), refreshHealth(),
+    ]);
+  } catch (e) {
+    console.error("refresh failed", e);
+  }
+}
+
+refreshAll();
+setInterval(refreshAll, REFRESH_MS);
+</script>
+</body>
+</html>

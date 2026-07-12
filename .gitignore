@@ -13,3 +13,4 @@ ASSET/research_notes/*.md
 !ASSET/research_notes/.gitkeep
 universe_active.json
 *.db
+scratch/

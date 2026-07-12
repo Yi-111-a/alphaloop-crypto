@@ -247,3 +247,178 @@ def test_pipeline_has_no_order_placement_methods_used():
             assert "apiKey\":" not in source and "apiKey =" not in source
         else:
             assert forbidden not in source
+
+
+# ----------------------------------------------------------------------
+# M5 联网 shakedown 适配:公开历史归档回退路径。全部离线(mock
+# urllib.request.urlopen,不碰真实的 data.binance.vision),与本文件
+# 一直以来的"测试不接触真实网络"纪律保持一致。
+# ----------------------------------------------------------------------
+import io
+import zipfile
+
+import LOCKED.data_pipeline as data_pipeline_module
+
+
+def _make_fake_klines_zip(rows: list[list]) -> bytes:
+    header = "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore"
+    lines = [header] + [",".join(str(v) for v in r) for r in rows]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("FAKE-4h-2024-06.csv", "\n".join(lines))
+    return buf.getvalue()
+
+
+def _make_fake_funding_zip(rows: list[list]) -> bytes:
+    header = "calc_time,funding_interval_hours,last_funding_rate"
+    lines = [header] + [",".join(str(v) for v in r) for r in rows]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("FAKE-fundingRate-2024-06.csv", "\n".join(lines))
+    return buf.getvalue()
+
+
+class _FakeHTTPResponse:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_archive_symbol_and_months_between_are_pure():
+    assert DataPipeline._archive_symbol("BTC/USDT:USDT") == "BTCUSDT"
+    months = DataPipeline._months_between(
+        since_ms=int(pd.Timestamp("2024-06-15", tz="UTC").timestamp() * 1000),
+        until_ms=int(pd.Timestamp("2024-08-03", tz="UTC").timestamp() * 1000),
+    )
+    assert months == [(2024, 6), (2024, 7), (2024, 8)]
+
+
+def test_fetch_ohlcv_archive_fallback_disabled_by_default_raises_immediately(tmp_path, monkeypatch):
+    """安全默认值:enable_public_archive_fallback=False 时,实时API失败必须
+    直接抛出,绝不触发任何网络下载(包括归档路径)——这就是修复"离线单测
+    意外触发真实网络请求"那次回归所加的护栏。"""
+    class AlwaysFailExchange:
+        def fetch_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
+            raise ConnectionError("simulated: live API unreachable")
+
+    calls = {"count": 0}
+
+    def _spy_urlopen(*args, **kwargs):
+        calls["count"] += 1
+        raise AssertionError("must not attempt any network call when fallback is disabled")
+
+    monkeypatch.setattr(data_pipeline_module.urllib.request, "urlopen", _spy_urlopen)
+
+    dp = DataPipeline(
+        cache_dir=tmp_path / "cache", exchange=AlwaysFailExchange(),
+        backoff_base_seconds=0.0, max_retries=1,
+        enable_public_archive_fallback=False,
+    )
+    with pytest.raises(ConnectionError):
+        dp.fetch_ohlcv("BTC/USDT:USDT", "4h", since=1_717_200_000_000)
+    assert calls["count"] == 0
+
+
+def test_fetch_ohlcv_falls_back_to_archive_when_enabled_and_live_api_fails(tmp_path, monkeypatch):
+    class AlwaysFailExchange:
+        def fetch_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
+            raise ConnectionError("simulated: live API unreachable")
+
+    fake_zip = _make_fake_klines_zip([
+        [1_717_200_000_000, 67577.9, 67800.7, 67480.0, 67749.9, 11203.855, 0, 0, 0, 0, 0, 0],
+        [1_717_214_400_000, 67750.0, 67857.5, 67608.6, 67677.9, 8158.758, 0, 0, 0, 0, 0, 0],
+    ])
+
+    def _fake_urlopen(req, timeout=None):
+        assert "data.binance.vision" in req.full_url
+        assert "BTCUSDT" in req.full_url
+        return _FakeHTTPResponse(fake_zip)
+
+    monkeypatch.setattr(data_pipeline_module.urllib.request, "urlopen", _fake_urlopen)
+
+    dp = DataPipeline(
+        cache_dir=tmp_path / "cache", exchange=AlwaysFailExchange(),
+        backoff_base_seconds=0.0, max_retries=1,
+        enable_public_archive_fallback=True,
+    )
+    result = dp.fetch_ohlcv("BTC/USDT:USDT", "4h", since=1_717_200_000_000, limit=10)
+    assert len(result) == 2
+    assert result.iloc[0]["open"] == pytest.approx(67577.9)
+    assert list(result.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_fetch_funding_rate_history_falls_back_to_archive_when_enabled(tmp_path, monkeypatch):
+    class AlwaysFailExchange:
+        def fetch_funding_rate_history(self, symbol, since=None, limit=1000):
+            raise ConnectionError("simulated: live API unreachable")
+
+    fake_zip = _make_fake_funding_zip([
+        [1_717_200_000_000, 8, 0.00010000],
+        [1_717_228_800_000, 8, -0.00005000],
+    ])
+
+    def _fake_urlopen(req, timeout=None):
+        assert "fundingRate" in req.full_url
+        return _FakeHTTPResponse(fake_zip)
+
+    monkeypatch.setattr(data_pipeline_module.urllib.request, "urlopen", _fake_urlopen)
+
+    dp = DataPipeline(
+        cache_dir=tmp_path / "cache", exchange=AlwaysFailExchange(),
+        backoff_base_seconds=0.0, max_retries=1,
+        enable_public_archive_fallback=True,
+    )
+    result = dp.fetch_funding_rate_history("BTC/USDT:USDT", since=1_717_200_000_000, limit=10)
+    assert len(result) == 2
+    assert result.iloc[1]["funding_rate"] == pytest.approx(-0.00005)
+
+
+def test_fetch_ohlcv_archive_fallback_not_attempted_when_since_is_none(tmp_path, monkeypatch):
+    """since=None 代表"要最新数据",归档回退不适用(它只处理纯历史区间),
+    即使 enable_public_archive_fallback=True 也必须直接抛出,不下载归档。"""
+    class AlwaysFailExchange:
+        def fetch_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
+            raise ConnectionError("simulated: live API unreachable")
+
+    calls = {"count": 0}
+
+    def _spy_urlopen(*args, **kwargs):
+        calls["count"] += 1
+        raise AssertionError("archive fallback must not trigger when since=None")
+
+    monkeypatch.setattr(data_pipeline_module.urllib.request, "urlopen", _spy_urlopen)
+
+    dp = DataPipeline(
+        cache_dir=tmp_path / "cache", exchange=AlwaysFailExchange(),
+        backoff_base_seconds=0.0, max_retries=1,
+        enable_public_archive_fallback=True,
+    )
+    with pytest.raises(ConnectionError):
+        dp.fetch_ohlcv("BTC/USDT:USDT", "4h", since=None)
+    assert calls["count"] == 0
+
+
+def test_download_archive_returns_none_on_404_not_treated_as_error(tmp_path, monkeypatch):
+    """归档还没被 Binance 发布(常见于"最近一个月")时返回 404,这是预期的
+    正常情况(历史缺口),不是需要重试/报错的网络故障。"""
+    import urllib.error
+
+    def _fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(data_pipeline_module.urllib.request, "urlopen", _fake_urlopen)
+
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=FakeExchange(), backoff_base_seconds=0.0)
+    result = dp.fetch_ohlcv_from_public_archive(
+        "BTC/USDT:USDT", "4h", since=1_717_200_000_000, until=1_717_300_000_000
+    )
+    assert result.empty
+    assert list(result.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
