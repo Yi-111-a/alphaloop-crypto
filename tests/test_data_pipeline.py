@@ -135,6 +135,73 @@ def test_fetch_ohlcv_merges_and_dedupes_new_range(pipeline):
     assert on_disk["timestamp"].duplicated().sum() == 0
 
 
+class PageCappedExchange(FakeExchange):
+    """M5 回归测试用:模拟真实点火时发现的 OKX 行为——单次 fetch_ohlcv 调用
+    无视传入的 limit,恒定只返回 per_call_limit 根K线,必须分页才能拿满一个
+    更长的区间。"""
+
+    def __init__(self, per_call_limit: int, total_available: int):
+        super().__init__()
+        self.per_call_limit = per_call_limit
+        self.total_available = total_available  # 交易所总共"有"这么多根K线可给
+        self.calls_log: list[tuple[int, int]] = []  # (since, limit) 每次实际收到的调用参数
+
+    def fetch_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
+        self.ohlcv_calls += 1
+        start = since if since is not None else 0
+        self.calls_log.append((start, limit))
+        step = 4 * 60 * 60 * 1000
+        bar_index_start = start // step
+        rows = []
+        for i in range(self.per_call_limit):
+            bar_index = bar_index_start + i
+            if bar_index >= self.total_available:
+                break  # 交易所自己也没有更多数据了
+            ts = bar_index * step
+            rows.append([ts, 100.0, 101.0, 99.0, 100.5, 1000.0])
+        return rows
+
+
+def test_fetch_ohlcv_paginates_past_single_call_cap(tmp_path):
+    """回归测试(真实点火时发现的bug):交易所单次调用恒定只返回300根K线,
+    请求2年4h数据(~4380根)时,不分页只能拿到最早的300根,离用户要求的
+    "COLD_START完整执行2年历史"差得很远。"""
+    fake = PageCappedExchange(per_call_limit=300, total_available=2000)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_ohlcv("BTC/USDT:USDT", timeframe="4h", since=0, limit=1500)
+
+    assert len(df) == 1500
+    assert fake.ohlcv_calls == 5  # 300 * 5 = 1500
+    assert df["timestamp"].is_monotonic_increasing
+    assert df["timestamp"].duplicated().sum() == 0
+    # 分页游标必须每次都正确前进(下一页的 since 紧接着上一页最后一根K线之后),
+    # 不是重复请求同一个区间。
+    step = 4 * 60 * 60 * 1000
+    for (since_a, _), (since_b, _) in zip(fake.calls_log, fake.calls_log[1:]):
+        assert since_b == since_a + fake.per_call_limit * step
+
+
+def test_fetch_ohlcv_pagination_stops_when_exchange_runs_out_of_data(tmp_path):
+    """请求的 limit 超过交易所实际能给的总量时,分页必须正常停在"交易所说
+    没有了"这一页,不无限循环、也不假装凑够了 limit 条。"""
+    fake = PageCappedExchange(per_call_limit=300, total_available=650)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_ohlcv("BTC/USDT:USDT", timeframe="4h", since=0, limit=100000)
+
+    assert len(df) == 650  # 拿到交易所实际能给的全部数据,不多不少
+    assert fake.ohlcv_calls == 3  # 300 + 300 + 50(最后一页不足per_call_limit,分页正确停止)
+
+
+def test_fetch_ohlcv_single_call_unchanged_when_since_is_none(pipeline):
+    """since=None(要"最近一批"数据,不是历史区间回放)时,不应该触发分页
+    循环——保持原来的单次调用行为。"""
+    dp, fake = pipeline
+    dp.fetch_ohlcv("BTC/USDT:USDT", timeframe="4h", since=None, limit=5)
+    assert fake.ohlcv_calls == 1
+
+
 # ----------------------------------------------------------------------
 # retry / backoff behavior
 # ----------------------------------------------------------------------

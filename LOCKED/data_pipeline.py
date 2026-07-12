@@ -69,6 +69,19 @@ _DEFAULT_CACHE_DIR = Path(__file__).resolve().parent.parent / "data_cache"
 # 历史区间回退",不用于任何"当前值"语义的接口。
 _BINANCE_VISION_BASE = "https://data.binance.vision"
 
+_TIMEFRAME_UNIT_MS = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
+
+
+def _timeframe_to_ms(timeframe: str) -> int:
+    """"4h" -> 14400000。支持 m/h/d 三种单位,ccxt 统一 timeframe 字符串的
+    子集(本项目只用到 "4h",其它单位一并支持是为了不把这个小工具函数写死
+    成只认一种格式)。"""
+    unit = timeframe[-1]
+    if unit not in _TIMEFRAME_UNIT_MS:
+        raise ValueError(f"unsupported timeframe unit in {timeframe!r}: expected one of m/h/d")
+    quantity = int(timeframe[:-1])
+    return quantity * _TIMEFRAME_UNIT_MS[unit]
+
 
 class DataPipeline:
     """封装 ccxt 公开行情端点 + 本地 parquet 缓存。
@@ -175,6 +188,48 @@ class DataPipeline:
     def _funding_cache_path(self, symbol: str) -> Path:
         safe_symbol = symbol.replace("/", "-").replace(":", "_")
         return self.cache_dir / f"funding_{safe_symbol}.parquet"
+
+    # ------------------------------------------------------------------
+    # M5 联网适配:OHLCV 分页拉取。真实点火时发现 OKX 单次 fetch_ohlcv 调用
+    # 恒定只返回 300 根K线,无视传入的 limit=100000——这是交易所单次请求的
+    # 硬上限,不是本项目能通过重试/加大limit绕开的东西。ccxt 自带的
+    # params={"paginate": True} 内部机制实测有一个不透明的总条数上限(实测
+    # 请求2年4h数据只拿回2000条,远不到期望的~4380条,且没有任何文档说明
+    # 这个上限从哪来),不如自己写一个透明、可测试的分页循环可靠。
+    # ------------------------------------------------------------------
+
+    def _fetch_ohlcv_live_paginated(
+        self, symbol: str, timeframe: str, since: int, limit: int, per_call_limit: int = 300
+    ) -> list[list]:
+        """从 since 开始,反复调用 self.exchange.fetch_ohlcv 向前翻页,直到
+        拿满 limit 条、追上"现在"、或交易所不再返回新数据为止。每一页都走
+        _with_retry,单页失败时的重试语义与非分页调用完全一致。"""
+        interval_ms = _timeframe_to_ms(timeframe)
+        all_rows: list[list] = []
+        current_since = since
+        now_ms = self.clock.now_ms()
+
+        while len(all_rows) < limit and current_since <= now_ms:
+            page = self._with_retry(
+                lambda s=current_since: self.exchange.fetch_ohlcv(
+                    symbol, timeframe=timeframe, since=s, limit=per_call_limit
+                ),
+                f"fetch_ohlcv({symbol}, {timeframe}, since={current_since})",
+            )
+            if not page:
+                break
+            all_rows.extend(page)
+            last_ts = page[-1][0]
+            if last_ts <= current_since:
+                # 交易所没有真正向前推进(比如恰好卡在同一个时间戳反复返回),
+                # 停止分页,避免死循环——这不是"正常拿满数据"的路径,是防御。
+                break
+            current_since = last_ts + interval_ms
+            if len(page) < per_call_limit:
+                # 交易所返回的条数不足单页上限,说明这已经是能拿到的最后一页了。
+                break
+
+        return all_rows[:limit]
 
     # ------------------------------------------------------------------
     # M5 联网 shakedown 适配:公开历史数据归档回退路径(见模块 docstring)
@@ -353,10 +408,18 @@ class DataPipeline:
 
         if need_fetch:
             try:
-                raw = self._with_retry(
-                    lambda: self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit),
-                    f"fetch_ohlcv({symbol}, {timeframe})",
-                )
+                if since is not None:
+                    # 分页拉取:交易所单次请求通常有硬上限(OKX实测300根/次,
+                    # 无视传入的limit),不分页就只能拿到区间起点附近的一小段
+                    # 数据,离"拿满since到现在"差得很远。since=None 时(调用方
+                    # 要"最近一批"数据,不关心从哪个起点开始)沿用原来的单次
+                    # 调用,不需要分页。
+                    raw = self._fetch_ohlcv_live_paginated(symbol, timeframe, since, limit)
+                else:
+                    raw = self._with_retry(
+                        lambda: self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit),
+                        f"fetch_ohlcv({symbol}, {timeframe})",
+                    )
                 fetched = pd.DataFrame(raw, columns=OHLCV_COLUMNS)
             except Exception as exc:  # noqa: BLE001 - 见下方回退路径说明
                 # M5 适配:实时API不可达时,对"纯历史区间"请求回退到
