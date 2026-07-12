@@ -1,0 +1,15 @@
+# 运行时产物 —— append-only 日志、账本、缓存、进程状态,都不是源代码,
+# 不应该被 git 追踪(且 LOG/ 里的内容按项目铁律只能追加、不能修改,和 git
+# 版本历史的语义天然冲突,不适合混在一起)。
+__pycache__/
+*.pyc
+.pytest_cache/
+
+LOG/
+data_cache/
+state/
+ASSET/memory/memory.db
+ASSET/research_notes/*.md
+!ASSET/research_notes/.gitkeep
+universe_active.json
+*.db
