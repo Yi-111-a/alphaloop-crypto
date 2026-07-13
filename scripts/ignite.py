@@ -161,9 +161,16 @@ def main() -> None:
     )
 
     def next_bar_provider(symbol: str, ts: int) -> dict:
-        ohlcv = dp.fetch_ohlcv(symbol, config["data"]["timeframe"], since=ts, limit=2)
-        row = ohlcv.iloc[0]
-        return {"open_time": int(row["timestamp"]), "open": float(row["open"])}
+        """实盘场景下"下一根K线"这个历史回放概念本身不成立——决策产生的时刻
+        就是实时前沿,还不存在时间戳晚于ts的已收盘K线(config.yaml的4h周期
+        要再等最多4小时才会收出下一根)。fetch_ohlcv(since=ts) 因此总是返回
+        空结果,这是COLD_START之后第一次真实决策周期就复现的真实bug,不是
+        假设性的边界情况。撮合价格改用当前真实ticker最新成交价(与
+        snapshot_provider同一路径),open_time 取 ts+1 只是为了满足
+        simulator.execute() 第1步"decision.ts 必须严格早于 open_time"的
+        防未来偷看校验,不代表真的存在一根时间戳为ts+1的K线。"""
+        ticker = dp.fetch_latest_snapshot([symbol])[symbol]
+        return {"open_time": ts + 1, "open": float(ticker["last"])}
 
     def snapshot_provider(ts: int) -> dict:
         universe_path = PROJECT_ROOT / "universe_active.json"
