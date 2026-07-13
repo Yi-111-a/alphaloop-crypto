@@ -307,6 +307,43 @@ def test_sentence_transformer_embedder_smoke_if_available(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 9b. M5 真实点火回归测试:MemoryStore 必须能跨线程使用
+# ---------------------------------------------------------------------------
+
+
+def test_retrieve_works_when_called_from_a_different_thread_than_construction(tmp_path):
+    """回归测试(真实点火时发现的bug):main.py 的 Trader 超时包装用
+    ThreadPoolExecutor 起一个 worker 线程调用 Trader.decide(),而
+    Trader.build_context() 内部会调 memory_store.retrieve()——这个调用发生
+    在"构造 MemoryStore 时所在线程"之外的另一个线程里。sqlite3 默认
+    check_same_thread=True 会在这种情况下直接抛
+    sqlite3.ProgrammingError,即使实际访问模式是顺序的、从不并发
+    (调度循环同步等 future.result() 完成才继续,不存在两个线程同时读写
+    同一个连接的场景)。"""
+    import threading
+
+    store = MemoryStore(db_path=tmp_path / "cross_thread.db", embedder=_make_word_overlap_embedder())
+    write_ts = 1_700_000_000_000
+    store.write("BTC funding rate spiked sharply positive overnight", ts=write_ts, layer="L1")
+
+    result_holder: dict = {}
+    error_holder: dict = {}
+
+    def call_from_worker_thread():
+        try:
+            result_holder["results"] = store.retrieve("BTC funding rate spike", query_ts=write_ts, top_k=5)
+        except Exception as exc:  # noqa: BLE001
+            error_holder["error"] = exc
+
+    thread = threading.Thread(target=call_from_worker_thread)
+    thread.start()
+    thread.join(timeout=5.0)
+
+    assert "error" not in error_holder, f"retrieve() raised when called from a different thread: {error_holder.get('error')!r}"
+    assert len(result_holder.get("results", [])) == 1
+
+
+# ---------------------------------------------------------------------------
 # 10. 静态防回归护栏:retrieve/write 所在源文件里不允许出现墙钟时间调用
 # ---------------------------------------------------------------------------
 

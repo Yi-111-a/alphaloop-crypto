@@ -171,7 +171,17 @@ class MemoryStore:
     ):
         self.db_path = Path(db_path) if db_path is not None else _DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        # M5 真实点火时发现的bug:main.py 的 _call_trader_with_timeout 用
+        # ThreadPoolExecutor 包一层超时,Trader.decide() -> build_context() ->
+        # memory_store.retrieve() 因此会在一个"和构造 MemoryStore 时不同"的
+        # 线程里跑——sqlite3 默认 check_same_thread=True 会直接拒绝跨线程使用
+        # 同一个连接对象,报 ProgrammingError。这里的实际访问模式是"顺序、
+        # 不同线程、但从不并发"(调度循环同步调用 run_decision_cycle,
+        # future.result(timeout=...) 会阻塞等那一个worker线程跑完才继续),
+        # 不存在真正的多线程同时写这个连接的场景,所以放开
+        # check_same_thread=False 是安全的,不需要换成更复杂的"每线程一个
+        # 连接"方案。
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
         self.embedder: Callable[[str], list[float]] = embedder or hashing_embedder
