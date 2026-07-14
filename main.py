@@ -92,13 +92,19 @@ _SCHEDULER_TIMEOUT_FALLBACK_SYMBOL = "BTC/USDT:USDT"
 # ---------------------------------------------------------------------------
 
 
-def decision_cycle_window(now_ms: int, interval_hours: int) -> tuple[int, int]:
+def decision_cycle_window(now_ms: int, interval_hours: float) -> tuple[int, int]:
     """给定"现在"和决策周期时长,返回该时刻所属周期的 [cycle_start, cycle_end)。
 
     用整数除法对齐到 UTC 纪元起点的整周期边界(与 circuit_breaker.py 用
     `ts_ms // _DAY_MS` 对齐 UTC 自然日同一手法,不使用 datetime 时区API)。
+
+    interval_hours 允许小数(如 0.5 = 30分钟,用户为快速验证阶段要求支持)——
+    这里先乘后取整(`int(interval_hours * _MS_PER_HOUR)`),不是先对
+    interval_hours 取整再乘,原实现是 `int(interval_hours) * _MS_PER_HOUR`,
+    会把 0.5 直接截断成 0 导致下面的 ValueError 永远触发,是真实发现的bug。
+    整数小时的既有行为不变(int(4)*_MS_PER_HOUR == int(4*_MS_PER_HOUR))。
     """
-    interval_ms = int(interval_hours) * _MS_PER_HOUR
+    interval_ms = int(interval_hours * _MS_PER_HOUR)
     if interval_ms <= 0:
         raise ValueError(f"interval_hours must be positive, got {interval_hours!r}")
     start = (now_ms // interval_ms) * interval_ms
@@ -215,7 +221,9 @@ class AlphaLoopScheduler:
         self.last_reflection_summary: Optional[str] = None
         self.program_tactics: Optional[str] = None
 
-        self._decision_interval_hours = int(
+        # float 而非 int:用户为"快速验证"要求支持30分钟(0.5h)决策周期
+        # (2026-07-14),int(0.5)会截断成0,是本次改造前发现的真实bug。
+        self._decision_interval_hours = float(
             (config.get("cycle", {}) or {}).get("decision_interval_hours", 4)
         )
         self._settle_hours_utc = list((config.get("funding", {}) or {}).get("settle_hours_utc", [0, 8, 16]))

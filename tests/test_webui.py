@@ -153,7 +153,8 @@ def test_empty_data_fallback_every_endpoint_returns_200_not_500(client):
     """铁律:系统还没跑起来、LOG目录里什么都没有时,面板不能报错。"""
     test_client, _log_root, _state_root = client
     endpoints = [
-        "/", "/api/status", "/api/nav", "/api/nav_intraday", "/api/positions", "/api/latest_advice",
+        "/", "/api/status", "/api/nav", "/api/nav_intraday", "/api/nav_intraday_branches",
+        "/api/branches", "/api/positions", "/api/latest_advice",
         "/api/funding_summary", "/api/fees_summary", "/api/ratchet_log", "/api/health",
     ]
     for ep in endpoints:
@@ -162,6 +163,10 @@ def test_empty_data_fallback_every_endpoint_returns_200_not_500(client):
 
     assert test_client.get("/api/nav").json()["has_data"] is False
     assert test_client.get("/api/nav_intraday").json()["has_data"] is False
+    assert test_client.get("/api/nav_intraday_branches").json()["has_data"] is False
+    branches_empty = test_client.get("/api/branches").json()
+    assert branches_empty["has_data"] is True  # main/random 是固定的,永远有
+    assert {b["branch"] for b in branches_empty["branches"]} == {"main", "random"}
     assert test_client.get("/api/positions").json()["has_data"] is False
     assert test_client.get("/api/latest_advice").json()["has_data"] is False
     status = test_client.get("/api/status").json()
@@ -211,6 +216,39 @@ def test_nav_intraday_endpoint_filters_by_hours_window(client):
 
     data_wide = test_client.get("/api/nav_intraday?hours=200").json()
     assert len(data_wide["rows"]) == 2
+
+
+def test_branches_endpoint_includes_registered_evo_branches(client):
+    """用户要求(2026-07-14)多分支并行,总面板要能列出所有分支。evo分支
+    来自scripts/ignite.py通过LOCKED.evolution_orchestrator.register_branch
+    写的LOG/branch_registrations.jsonl,面板只原样读回,不import LOCKED。"""
+    test_client, log_root, _state_root = client
+    with open(log_root / "branch_registrations.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"branch": "evo/20260714-aggressive", "created_date": "2026-07-14"}) + "\n")
+        f.write(json.dumps({"branch": "evo/20260714-conservative", "created_date": "2026-07-14"}) + "\n")
+
+    data = test_client.get("/api/branches").json()
+    branch_names = {b["branch"] for b in data["branches"]}
+    assert branch_names == {"main", "random", "evo/20260714-aggressive", "evo/20260714-conservative"}
+    evo_entry = next(b for b in data["branches"] if b["branch"] == "evo/20260714-aggressive")
+    assert evo_entry["kind"] == "evo"
+    assert evo_entry["created_date"] == "2026-07-14"
+
+
+def test_nav_intraday_branches_endpoint_filters_by_hours_window(client):
+    test_client, log_root, _state_root = client
+    now_ms = int(time.time() * 1000)
+    recent_ts = now_ms - 10 * 60_000
+    old_ts = now_ms - 100 * 3_600_000
+    with open(log_root / "nav_intraday_branches.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": old_ts, "branch": "evo/20260714-aggressive", "nav": 100000.0}) + "\n")
+        f.write(json.dumps({"ts": recent_ts, "branch": "evo/20260714-aggressive", "nav": 100500.0}) + "\n")
+
+    data = test_client.get("/api/nav_intraday_branches").json()  # default hours=72
+    assert data["has_data"] is True
+    assert len(data["rows"]) == 1
+    assert data["rows"][0]["branch"] == "evo/20260714-aggressive"
+    assert data["rows"][0]["nav"] == 100500.0
 
 
 def test_status_endpoint_reads_cold_start_and_circuit_state(client):

@@ -22,18 +22,29 @@ Researcher/Reflector的try/except)直接复用这条"迟迟没有响应就超时
 run_ratchet_judgment/mark_daily_nav/run_circuit_breaker_check 都是main.py
 暴露的"薄封装",本身不含任何cadence gating,main.py注释里明确写了这是
 调度层(本脚本)的职责,不是main.py该管的):
-    - 决策周期:4h(config.cycle.decision_interval_hours),硬要求1的幂等性
-      本身就在main.py里,这里只管"到点了就调"。
+    - 决策周期:30分钟(config.cycle.decision_interval_hours=0.5,用户为
+      "快速验证"主动要求从4小时收紧,2026-07-14),硬要求1的幂等性本身在
+      main.py里,这里只管"到点了就调"。
     - 结算追赶/风控哨兵:每小时(已有实现,未改动)。
-    - 反思(Reflector):每天 config.cycle.reflection_per_day 次,这里按
-      24h/次数 均匀分布节拍(默认2次/天=每12小时)。
-    - 研究(Researcher)+ 每日净值记录(nav.tsv 三线)+ 熔断检查:每个UTC
-      自然日一次。
-    - 棘轮判定(EvolutionOrchestrator):每 config.cycle.ratchet_interval_days
-      天一次;当前没有任何候选分支被注册(§4.1里"分支提案"机制本身是后续
-      迭代内容,不在本次点火范围内),因此每次调用预期都是空裁决(0条),这是
-      正确的空跑,不是bug——保留这个节拍是为了将来分支一旦被注册就自动生效,
-      不需要再改一次调度脚本。
+    - 反思(Reflector):每天 config.cycle.reflection_per_day 次(现为48次/天,
+      等价于每30分钟一次,与决策周期同步),这里按24h/次数均匀分布节拍。
+    - 研究(Researcher):每 config.cycle.research_interval_hours 小时一次
+      (现为1小时,原先是"每个UTC自然日一次",这次改造前没有独立配置项、
+      直接硬编码在本脚本里)。
+    - 每日净值记录(nav.tsv 三线)+ 熔断检查:仍是每个UTC自然日一次不变——
+      这条不能跟着决策周期一起收紧,因为nav.tsv本身是LOCKED区
+      scorer.daily_mark()维护的日粒度权威历史,棘轮评分(ratchet_score)
+      是按日历日对齐设计、已经审过的核心逻辑,不在这次改造范围内。
+    - 棘轮判定(EvolutionOrchestrator):每 config.cycle.ratchet_interval_hours
+      小时一次(现为2小时,原为3天)。用户要求棘轮判定加速到2小时一次时,
+      我们特意确认过"方案2"——不改nav.tsv/ratchet_score本身的日粒度语义,
+      因为那是已审过的LOCKED核心评分逻辑;这里改的只是"多久调一次
+      run_ratchet_judgment"这个调度频率,它读到的nav.tsv数据本身仍然是
+      每天才新增一行,所以在还没有任何候选分支被注册(§4.1"分支提案"机制
+      本身是后续迭代内容,不在本次点火范围内)之前,不管几小时调一次都是
+      "0条候选分支裁决"的空跑,这是正确的空跑,不是bug——真正需要小时级
+      粒度的"平行判定机制"(用本脚本已经在维护的nav_intraday.jsonl)要等
+      将来真的有候选分支时才有意义去建,现在建了也没有东西可比较。
     - benchmark(BTC_HOLD)通过 LOCKED.baseline_agents.BTCHoldAgent 解析计算
       (不经过Simulator/execute()九步校验链,见该模块docstring的人类裁决);
       random 通过独立的 "random" Simulator 分支,由 RandomAgent 按与主决策
@@ -129,6 +140,19 @@ def _utc_date_str(ts_ms: int) -> str:
     return datetime.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d")
 
 
+def _utc_research_label(ts_ms: int) -> str:
+    """研究改成每小时一次(cycle.research_interval_hours)之后,不能再拿
+    _utc_date_str 那种纯日期字符串当 Researcher.daily_research(date_str=...)
+    的参数——该方法内部按 f"{date_str}.md" 写文件(见 ASSET/strategy/
+    researcher.py::daily_research,open模式是覆盖写不是追加),一天24次
+    调用如果都传同一个日期字符串,后23次会依次覆盖掉前面的研究笔记,只留下
+    当天最后一小时那一份。这里改成"日期-小时"粒度的标签,让每小时的研究
+    笔记各自落到独立文件,不互相覆盖;daily_research本身不派生"今天"是
+    哪天,接受调用方传什么标签就用什么标签,所以这是纯调用方(本脚本)的
+    改动,不需要碰ASSET/researcher.py。"""
+    return datetime.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d-%H")
+
+
 def load_schedule_state() -> dict:
     if SCHEDULE_STATE_PATH.exists():
         try:
@@ -137,7 +161,9 @@ def load_schedule_state() -> dict:
             pass
     return {
         "last_reflection_ts": None,
-        "last_research_date": None,
+        # last_research_date 字段已废弃(研究改成每小时一次后,cadence 状态
+        # 挪到 main() 里的本地变量 last_research_ms,与 risk_check/settlement
+        # 用同一种"重启后立即补跑一次"的模式,不再需要跨重启持久化)。
         "last_daily_mark_date": None,
         "last_ratchet_ts": None,
         "btc_hold_entry_price": None,
@@ -196,6 +222,24 @@ def read_nav_tsv_series() -> dict[str, list[tuple[str, float]]]:
                 except (KeyError, ValueError):
                     pass
     return series
+
+
+def read_evo_branch_daily_nav_series() -> dict[str, list[tuple[str, float]]]:
+    """方案2(用户2026-07-14确认):不改nav.tsv/scorer.ratchet_score的日粒度
+    权威语义,而是把本脚本已经在维护的小时级 LOG/nav_intraday_branches.jsonl
+    降采样成"每个evo分支每天最后一次看到的净值"这种官方棘轮评分要求的
+    (date_str, nav) 序列格式——LOCKED的评分逻辑本身完全不变,只是ignite.py
+    侧多做一步聚合,让候选分支真的能被judge()评估,而不是因为branch_navs
+    里缺了对应entry而被(EvolutionOrchestrator.judge()内部本来就有的防御性
+    过滤)静默跳过。"""
+    records = log_writer.read_jsonl("nav_intraday_branches.jsonl", root=LOG_ROOT)
+    by_branch_date: dict[str, dict[str, float]] = {}
+    for r in records:
+        branch, ts, nav = r.get("branch"), r.get("ts"), r.get("nav")
+        if branch is None or ts is None or nav is None:
+            continue
+        by_branch_date.setdefault(branch, {})[_utc_date_str(ts)] = float(nav)  # 同一天多条 -> 保留最后一次(append-only,后写的在后面)
+    return {branch: sorted(date_nav.items()) for branch, date_nav in by_branch_date.items()}
 
 
 def run_cold_start(scheduler, dp: DataPipeline, uf: UniverseFilter, researcher: Researcher, clock, config: dict) -> None:
@@ -417,16 +461,59 @@ def main() -> None:
     scheduler.simulators["random"] = sim_random
     random_agent = RandomAgent(universe_symbols=symbols, seed=42, branch="random")
 
-    reflection_interval_ms = (24 * 3_600_000) // max(1, int(config["cycle"]["reflection_per_day"]))
-    ratchet_interval_ms = int(config["cycle"]["ratchet_interval_days"]) * 86_400_000
+    # 用户要求的多分支并行(2026-07-14,快速验证阶段):每个候选分支各自独立
+    # 仓位、各自走完整的 Trader/LLM 签入决策周期(与 random 对照组不同——
+    # random 刻意不经过 Trader,这几个 evo 分支的存在意义就是要真的比较不同
+    # 战术下 Trader 的表现,所以必须真的经过签入)。战术差异通过
+    # scheduler.program_tactics 这个既有的公开属性在每次调用前手动切换实现
+    # (main.py 的 _call_trader_with_timeout 本来就会把它转发给 Trader.decide(),
+    # 见 main.py:344 —— 这里只是从 ignite.py 侧按分支复用同一个已有机制,
+    # 不需要改 main.py 的接口)。分支名遵循 LOCKED 区"evo/YYYYMMDD-简述"命名
+    # 约定,一旦注册永不重用(见 evolution_orchestrator.register_branch
+    # docstring),日期写死在这里是有意的——它是这一批分支被创建的日期,不是
+    # "今天"的意思,不应该随进程重启的当天日期变化。
+    EVO_BRANCH_TACTICS = {
+        "evo/20260714-aggressive": (
+            "进取战术:在假设置信度足够(至少两条独立假设互相印证,或有真实"
+            "价格/资金费率数据强支撑)时,愿意用更高杠杆、更集中的仓位捕捉"
+            "机会,不要求像main分支那样保守分散;但仍必须为每笔非hold决策"
+            "写出明确的falsifier_condition并严格执行,进取不等于不设止损。"
+        ),
+        "evo/20260714-conservative": (
+            "保守战术:只在多条独立假设互相印证、且没有明显反向风险信号时"
+            "才建仓;仓位规模、杠杆都应明显低于main分支的对应决策,宁可错过"
+            "一部分机会也不放大不确定性下的敞口;对新标的(缺乏完整2年历史"
+            "或资金费率样本不足96天)一律用最小仓位或直接观望。"
+        ),
+    }
+    evo_simulators: dict[str, Simulator] = {}
+    for evo_branch, _tactics in EVO_BRANCH_TACTICS.items():
+        if evolution_orchestrator.branch_meta(evo_branch) is None:
+            registered = evolution_orchestrator.register_branch(evo_branch, _utc_date_str(clock.now_ms()))
+            print(f"注册候选分支: {evo_branch} (registered={registered})", flush=True)
+        evo_cb = CircuitBreaker(config, log_root=LOG_ROOT)
+        safe_evo = evo_branch.replace("/", "_").replace(":", "_")
+        evo_sim = Simulator(
+            config=config, circuit_breaker=evo_cb, cold_start_gate=cold_start_gate.is_cold_start,
+            universe_symbols=symbols, db_path=STATE_ROOT / f"portfolio_{safe_evo}.db",
+            log_root=LOG_ROOT, branch=evo_branch, resume=True,
+        )
+        evo_simulators[evo_branch] = evo_sim
+        scheduler.simulators[evo_branch] = evo_sim
+
+    reflection_interval_ms = int((24 * 3_600_000) // max(1, int(config["cycle"]["reflection_per_day"])))
+    ratchet_interval_ms = int(float(config["cycle"]["ratchet_interval_hours"]) * 3_600_000)
+    research_interval_ms = int(float(config["cycle"]["research_interval_hours"]) * 3_600_000)
 
     print("=== 进入常驻调度循环(每分钟轮询一次到期任务,Ctrl+C 停止)===", flush=True)
     last_settlement_check_ms = 0
     last_risk_check_ms = 0
+    last_research_ms = 0
     risk_check_interval_ms = scheduler._risk_check_interval_hours * 3_600_000
     while True:
         now = clock.now_ms()
         try:
+            scheduler.program_tactics = None  # main 分支不带任何战术偏置,重置掉上一轮evo循环可能残留的值
             result = scheduler.run_decision_cycle("main")
             if result["status"] == "decided":
                 print(f"[{now}] 决策周期完成: {[d.action for d in result['decisions']]}", flush=True)
@@ -441,6 +528,19 @@ def main() -> None:
                 print(f"[{now}] random对照组决策周期完成", flush=True)
         except Exception:  # noqa: BLE001
             print(f"[{now}] run_random_branch_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+
+        # 多分支并行:每个 evo 候选分支各自走一遍完整的 Trader/LLM 签入决策
+        # 周期,战术差异通过临时切换 scheduler.program_tactics 实现(见上面
+        # EVO_BRANCH_TACTICS 定义处的说明)。循环结束后不需要额外重置——
+        # 下一轮 while 顶部 main 分支调用前已经会重置一次。
+        for evo_branch, evo_tactics in EVO_BRANCH_TACTICS.items():
+            try:
+                scheduler.program_tactics = evo_tactics
+                evo_result = scheduler.run_decision_cycle(evo_branch)
+                if evo_result["status"] == "decided":
+                    print(f"[{now}] [{evo_branch}] 决策周期完成: {[d.action for d in evo_result['decisions']]}", flush=True)
+            except Exception:  # noqa: BLE001
+                print(f"[{now}] [{evo_branch}] run_decision_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
 
         if now - last_settlement_check_ms >= 3_600_000:
             try:
@@ -506,23 +606,47 @@ def main() -> None:
                 # 用 state/(而非LOG/)存,因为这是"当前最新标记价快照"而不是
                 # 需要保留全部历史的append-only事件,与ignite_heartbeat.json
                 # 是同一种性质。
-                positions_marked = {
-                    "ts": now,
-                    "branch": "main",
-                    "positions": [
-                        {
-                            "symbol": pos.symbol,
-                            "mark_price": live_price_snapshot.get(pos.symbol, pos.entry_price),
-                            "unrealized_pnl": Simulator._unrealized_pnl(
-                                pos, live_price_snapshot.get(pos.symbol, pos.entry_price)
-                            ),
-                        }
-                        for pos in scheduler.simulators["main"].positions.values()
-                    ],
-                }
+                def _mark_positions(sim: Simulator, branch_name: str) -> dict:
+                    return {
+                        "ts": now,
+                        "branch": branch_name,
+                        "positions": [
+                            {
+                                "symbol": pos.symbol,
+                                "mark_price": live_price_snapshot.get(pos.symbol, pos.entry_price),
+                                "unrealized_pnl": Simulator._unrealized_pnl(
+                                    pos, live_price_snapshot.get(pos.symbol, pos.entry_price)
+                                ),
+                            }
+                            for pos in sim.positions.values()
+                        ],
+                    }
+
+                positions_marked = _mark_positions(scheduler.simulators["main"], "main")
                 (STATE_ROOT / "positions_marked_main.json").write_text(
                     json.dumps(positions_marked, ensure_ascii=False), encoding="utf-8"
                 )
+
+                # 用户要求的多分支功能:"总面板可以看他们的对比,然后每个分支
+                # 又可以点进去看他们的仓位"——random对照组和每个evo候选分支
+                # 都按同样的方式各自落一份标记快照 + 一条小时级净值记录。
+                # nav_intraday.jsonl的既有三线schema(nav_agent/nav_benchmark/
+                # nav_random)保持不动,不动它的既有读者(webui默认图表);
+                # 这里新增一份独立的、long格式的 nav_intraday_branches.jsonl,
+                # 覆盖random和所有evo分支,webui侧再合并展示,不影响已经在跑
+                # 的旧代码路径。
+                for other_branch, other_sim in {"random": sim_random, **evo_simulators}.items():
+                    safe_other = other_branch.replace("/", "_").replace(":", "_")
+                    marked = _mark_positions(other_sim, other_branch)
+                    (STATE_ROOT / f"positions_marked_{safe_other}.json").write_text(
+                        json.dumps(marked, ensure_ascii=False), encoding="utf-8"
+                    )
+                    nav_now = other_sim.get_portfolio(snapshot=live_price_snapshot)["nav"]
+                    log_writer.append_jsonl(
+                        "nav_intraday_branches.jsonl",
+                        {"ts": now, "branch": other_branch, "nav": nav_now},
+                        root=LOG_ROOT,
+                    )
             except Exception:  # noqa: BLE001
                 print(f"[{now}] nav_intraday/持仓标记 记录异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
 
@@ -541,15 +665,17 @@ def main() -> None:
 
         today = _utc_date_str(now)
 
-        # 研究(Researcher):每个UTC自然日一次。
-        if schedule_state.get("last_research_date") != today:
+        # 研究(Researcher):每 research_interval_hours 小时一次(用户要求从
+        # "每UTC自然日一次"收紧到每小时一次)。标签改用日期-小时粒度(见
+        # _utc_research_label),避免同一天多次调用互相覆盖研究笔记文件。
+        if now - last_research_ms >= research_interval_ms:
+            research_label = _utc_research_label(now)
             try:
-                research_result = scheduler.run_daily_research(today)
-                print(f"[{now}] 每日研究{'完成: ' + str(research_result) if research_result is not None else '本轮失败(已记录),明天自然重试'}", flush=True)
+                research_result = scheduler.run_daily_research(research_label)
+                print(f"[{now}] 研究{'完成: ' + str(research_result) if research_result is not None else '本轮失败(已记录),下个节拍自然重试'}", flush=True)
             except Exception:  # noqa: BLE001
                 print(f"[{now}] run_daily_research 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
-            schedule_state["last_research_date"] = today
-            save_schedule_state(schedule_state)
+            last_research_ms = now
 
         # 每日净值记录(nav.tsv 三线)+ 熔断检查:每个UTC自然日一次。
         if schedule_state.get("last_daily_mark_date") != today:
@@ -577,18 +703,22 @@ def main() -> None:
             schedule_state["last_daily_mark_date"] = today
             save_schedule_state(schedule_state)
 
-        # 棘轮判定(EvolutionOrchestrator):每 ratchet_interval_days 天一次。
-        # 当前没有任何候选分支被注册(分支提案机制不在本次点火范围内),
-        # 因此预期每次都是空裁决(0条)——这是正确的空跑,保留这个节拍是
-        # 为了将来分支一旦被注册就自动生效。
+        # 棘轮判定(EvolutionOrchestrator):每 ratchet_interval_hours 小时一次
+        # (用户2026-07-14要求从3天收紧到2小时)。main的NAV仍然只读nav.tsv这份
+        # 日粒度权威历史(LOCKED评分逻辑没变);evo候选分支的NAV来自
+        # read_evo_branch_daily_nav_series()——按方案2从小时级nav_intraday_
+        # branches.jsonl聚合出的日粒度序列,不是nav.tsv的一部分。
         last_ratchet_ts = schedule_state.get("last_ratchet_ts")
         if last_ratchet_ts is None or now - last_ratchet_ts >= ratchet_interval_ms:
             try:
                 nav_series = read_nav_tsv_series()
+                evo_nav_series = read_evo_branch_daily_nav_series()
+                branch_navs = {"main": nav_series["main"]}
+                branch_navs.update({b: s for b, s in evo_nav_series.items() if b in EVO_BRANCH_TACTICS})
                 if len(nav_series["main"]) >= 2:
                     verdicts = scheduler.run_ratchet_judgment(
                         now_date=today,
-                        branch_navs={"main": nav_series["main"]},
+                        branch_navs=branch_navs,
                         benchmark_navs=nav_series["benchmark"],
                     )
                     print(f"[{now}] 棘轮判定完成: {len(verdicts)} 条候选分支裁决", flush=True)

@@ -95,8 +95,9 @@
   </div>
 
   <div class="grid">
-    <div class="panel">
-      <h2>当前持仓(main 分支)</h2>
+    <div class="panel full">
+      <h2>各分支持仓(点选分支切换)</h2>
+      <div class="nav-granularity" id="branchSelector"></div>
       <div id="positionsTableWrap">
         <table id="positionsTable">
           <thead><tr><th>币种</th><th>方向</th><th>杠杆</th><th>名义额</th><th>开仓价</th><th>标记价</th><th>未实现盈亏</th></tr></thead>
@@ -148,6 +149,9 @@
 const REFRESH_MS = 15000;
 let navChart = null;
 let navGranularity = "day"; // "day" -> /api/nav (nav.tsv 日线); "hour" -> /api/nav_intraday (小时级)
+let selectedBranch = "main";
+let knownBranches = [{ branch: "main", label: "main" }, { branch: "random", label: "随机对照" }];
+const EVO_LINE_COLORS = ["#f778ba", "#3fb950", "#a5a5ff", "#e3b341", "#79c0ff"];
 
 function fmtHourLabel(tsMs) {
   const d = new Date(tsMs);
@@ -208,28 +212,40 @@ async function refreshNav() {
   const labels = navGranularity === "hour"
     ? data.rows.map(r => fmtHourLabel(r.ts))
     : data.rows.map(r => r.date);
-  const agent = data.rows.map(r => r.nav_agent);
-  const benchmark = data.rows.map(r => r.nav_benchmark);
-  const random = data.rows.map(r => r.nav_random);
+  const datasets = [
+    { label: "Agent (main)", data: data.rows.map(r => r.nav_agent), borderColor: "#58a6ff", tension: 0.1, pointRadius: 0 },
+    { label: "BTC_HOLD 基准", data: data.rows.map(r => r.nav_benchmark), borderColor: "#d29922", tension: 0.1, pointRadius: 0 },
+    { label: "随机对照", data: data.rows.map(r => r.nav_random), borderColor: "#8b98a5", tension: 0.1, pointRadius: 0 },
+  ];
+
+  // 用户要求的多分支总面板对比:按小时粒度时,把每个已注册的evo候选分支
+  // 也叠加到同一张图上(用labels对齐时间戳做左连接,某个时间点某分支没有
+  // 数据就留空,Chart.js会自动跳过null点而不是画到0)。按天粒度时不叠加,
+  // 因为evo分支目前没有走scorer.daily_mark()那条日线记录路径。
+  if (navGranularity === "hour") {
+    const evoData = await fetchJSON("/api/nav_intraday_branches?hours=72");
+    if (evoData.has_data) {
+      const byBranch = {};
+      for (const r of evoData.rows) {
+        (byBranch[r.branch] = byBranch[r.branch] || {})[r.ts] = r.nav;
+      }
+      const branchNames = Object.keys(byBranch).sort();
+      branchNames.forEach((branch, i) => {
+        const points = data.rows.map(r => (byBranch[branch][r.ts] !== undefined ? byBranch[branch][r.ts] : null));
+        datasets.push({
+          label: branch, data: points, borderColor: EVO_LINE_COLORS[i % EVO_LINE_COLORS.length],
+          tension: 0.1, pointRadius: 0, spanGaps: true,
+        });
+      });
+    }
+  }
 
   if (navChart) {
-    navChart.data.labels = labels;
-    navChart.data.datasets[0].data = agent;
-    navChart.data.datasets[1].data = benchmark;
-    navChart.data.datasets[2].data = random;
-    navChart.update();
-    return;
+    navChart.destroy();
   }
   navChart = new Chart(canvas.getContext("2d"), {
     type: "line",
-    data: {
-      labels,
-      datasets: [
-        { label: "Agent", data: agent, borderColor: "#58a6ff", tension: 0.1, pointRadius: 0 },
-        { label: "BTC_HOLD 基准", data: benchmark, borderColor: "#d29922", tension: 0.1, pointRadius: 0 },
-        { label: "随机对照", data: random, borderColor: "#8b98a5", tension: 0.1, pointRadius: 0 },
-      ],
-    },
+    data: { labels, datasets },
     options: {
       responsive: true,
       scales: { y: { ticks: { color: "#8b98a5" } }, x: { ticks: { color: "#8b98a5" } } },
@@ -238,8 +254,27 @@ async function refreshNav() {
   });
 }
 
+async function refreshBranchSelector() {
+  const data = await fetchJSON("/api/branches");
+  if (!data.has_data) return;
+  knownBranches = data.branches;
+  const row = document.getElementById("branchSelector");
+  const currentButtons = [...row.querySelectorAll(".gran-btn")].map(b => b.dataset.branch);
+  const wantedButtons = knownBranches.map(b => b.branch);
+  if (JSON.stringify(currentButtons) === JSON.stringify(wantedButtons)) return; // 分支列表没变,不用重建按钮(避免每15秒闪一下)
+  row.innerHTML = "";
+  for (const b of knownBranches) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "gran-btn" + (b.branch === selectedBranch ? " active" : "");
+    btn.dataset.branch = b.branch;
+    btn.textContent = b.label;
+    row.appendChild(btn);
+  }
+}
+
 async function refreshPositions() {
-  const data = await fetchJSON("/api/positions");
+  const data = await fetchJSON("/api/positions?branch=" + encodeURIComponent(selectedBranch));
   const tbody = document.querySelector("#positionsTable tbody");
   const emptyEl = document.getElementById("positionsEmpty");
   const wrapEl = document.getElementById("positionsTableWrap");
@@ -326,7 +361,7 @@ async function refreshHealth() {
 async function refreshAll() {
   try {
     await Promise.all([
-      refreshStatus(), refreshNav(), refreshPositions(),
+      refreshStatus(), refreshNav(), refreshBranchSelector(), refreshPositions(),
       refreshAdvice(), refreshCosts(), refreshRatchet(), refreshHealth(),
     ]);
   } catch (e) {
@@ -338,8 +373,16 @@ document.getElementById("navGranularity").addEventListener("click", (e) => {
   const btn = e.target.closest(".gran-btn");
   if (!btn || btn.dataset.gran === navGranularity) return;
   navGranularity = btn.dataset.gran;
-  for (const b of document.querySelectorAll(".gran-btn")) b.classList.toggle("active", b === btn);
+  for (const b of document.querySelectorAll("#navGranularity .gran-btn")) b.classList.toggle("active", b === btn);
   refreshNav();
+});
+
+document.getElementById("branchSelector").addEventListener("click", (e) => {
+  const btn = e.target.closest(".gran-btn");
+  if (!btn || btn.dataset.branch === selectedBranch) return;
+  selectedBranch = btn.dataset.branch;
+  for (const b of document.querySelectorAll("#branchSelector .gran-btn")) b.classList.toggle("active", b === btn);
+  refreshPositions();
 });
 
 refreshAll();

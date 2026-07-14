@@ -340,13 +340,17 @@ def test_liquidation_not_triggered_if_wick_does_not_breach(tmp_path, log_root, m
 
 
 # ---------------------------------------------------------------------------
-# 4. leverage > 10 -> Rejection
+# 4. leverage > config leverage.max -> Rejection
 # ---------------------------------------------------------------------------
 
 
 def test_leverage_over_max_is_rejected(tmp_path, log_root, make_decision):
     sim = make_sim(tmp_path, log_root)
-    decision = md(make_decision, ts=1_700_000_000_000, leverage=11, target_notional_pct=10.0)
+    # 用 config.yaml 里真实的 leverage.max + 1,而不是硬编码某个数字——
+    # leverage.max 本身会随项目阶段变化(用户2026-07-14要求从10放宽到50,
+    # 快速验证阶段),这里只关心"高于当前上限一定被拒",不关心上限具体是几。
+    over_max_leverage = int(load_config()["leverage"]["max"]) + 1
+    decision = md(make_decision, ts=1_700_000_000_000, leverage=over_max_leverage, target_notional_pct=10.0)
     log_and_get(log_root, decision)
 
     next_bar = {"open_time": 1_700_000_100_000, "open": 50_000.0}

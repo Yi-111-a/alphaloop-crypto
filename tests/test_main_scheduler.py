@@ -227,6 +227,19 @@ class TestDecisionCycleWindow:
         with pytest.raises(ValueError):
             decision_cycle_window(BASE_TS, interval_hours=0)
 
+    def test_supports_fractional_hours_for_fast_iteration_mode(self):
+        """用户为快速验证要求30分钟(0.5h)决策周期(2026-07-14)——
+        int(0.5)==0 曾是真实bug(interval_hours 先被截断成0,导致下面的
+        ValueError永远触发)。这里验证0.5小时窗口切分是正确的30分钟边界,
+        且不影响既有整数小时(4h)配置的行为(上面几个测试保持不变)。"""
+        start, end = decision_cycle_window(BASE_TS + 45 * 60_000, interval_hours=0.5)
+        assert start == BASE_TS + 30 * 60_000
+        assert end == BASE_TS + 60 * 60_000
+
+    def test_rejects_fractional_interval_too_small_to_produce_a_window(self):
+        with pytest.raises(ValueError):
+            decision_cycle_window(BASE_TS, interval_hours=1e-7)  # rounds to 0ms
+
 
 class TestComputeMissedSettlementInstants:
     def test_none_last_settlement_means_nothing_missed(self):

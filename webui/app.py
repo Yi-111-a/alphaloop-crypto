@@ -132,6 +132,28 @@ def _read_nav_intraday(hours: int) -> list[dict]:
     return [r for r in records if isinstance(r.get("ts"), (int, float)) and r["ts"] >= cutoff]
 
 
+def _read_nav_intraday_branches(hours: int) -> list[dict]:
+    """LOG/nav_intraday_branches.jsonl 是random对照组+每个evo候选分支的小时级
+    净值(long格式:{ts, branch, nav}),与 nav_intraday.jsonl 的固定三线schema
+    是两份独立文件——见 scripts/ignite.py 里两者分别写入的说明。同样只原样
+    读回按 hours 窗口截断。"""
+    records = _read_jsonl("nav_intraday_branches.jsonl")
+    if not records:
+        return []
+    cutoff = _now_ms() - hours * 3_600_000
+    return [r for r in records if isinstance(r.get("ts"), (int, float)) and r["ts"] >= cutoff]
+
+
+def _read_registered_branches() -> list[dict]:
+    """LOG/branch_registrations.jsonl 是 LOCKED.evolution_orchestrator.
+    EvolutionOrchestrator.register_branch() 每次成功注册都追加的一条记录,
+    这里原样读回,用于面板"总面板对比+点进某个分支看仓位"的分支列表——
+    不去问orchestrator对象本身(面板不import LOCKED),直接读它自己维护的
+    这份LOG。main/random不在这份日志里(它们不是"候选分支",是固定的两条
+    对照线),前端会把它们和这里读到的evo分支合并成完整的可选分支列表。"""
+    return _read_jsonl("branch_registrations.jsonl")
+
+
 def _read_portfolio_db(branch: str) -> Optional[dict]:
     """只读打开 state/portfolio_{branch}.db。用 sqlite3 的 `mode=ro` URI 连接——
     这不是约定层面的"我们保证不写",而是驱动层面的强制:任何写操作在这个连接
@@ -280,6 +302,26 @@ def api_nav() -> dict:
 def api_nav_intraday(hours: int = 72) -> dict:
     rows = _read_nav_intraday(hours)
     return {"rows": rows, "has_data": bool(rows)}
+
+
+@app.get("/api/nav_intraday_branches")
+def api_nav_intraday_branches(hours: int = 72) -> dict:
+    rows = _read_nav_intraday_branches(hours)
+    return {"rows": rows, "has_data": bool(rows)}
+
+
+@app.get("/api/branches")
+def api_branches() -> dict:
+    evo = _read_registered_branches()
+    branches = [
+        {"branch": "main", "label": "main", "kind": "main"},
+        {"branch": "random", "label": "随机对照", "kind": "random"},
+    ] + [
+        {"branch": r["branch"], "label": r["branch"], "kind": "evo", "created_date": r.get("created_date")}
+        for r in evo
+        if "branch" in r
+    ]
+    return {"branches": branches, "has_data": True}
 
 
 @app.get("/api/positions")
