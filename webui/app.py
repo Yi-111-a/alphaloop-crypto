@@ -312,10 +312,11 @@ def api_nav_intraday_branches(hours: int = 72) -> dict:
 
 @app.get("/api/branches")
 def api_branches() -> dict:
+    # random对照组已按用户要求(2026-07-14)下线,不再出现在分支列表里——
+    # 见 scripts/ignite.py 模块docstring里对应的说明。
     evo = _read_registered_branches()
     branches = [
         {"branch": "main", "label": "main", "kind": "main"},
-        {"branch": "random", "label": "随机对照", "kind": "random"},
     ] + [
         {"branch": r["branch"], "label": r["branch"], "kind": "evo", "created_date": r.get("created_date")}
         for r in evo

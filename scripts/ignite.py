@@ -46,13 +46,12 @@ run_ratchet_judgment/mark_daily_nav/run_circuit_breaker_check 都是main.py
       粒度的"平行判定机制"(用本脚本已经在维护的nav_intraday.jsonl)要等
       将来真的有候选分支时才有意义去建,现在建了也没有东西可比较。
     - benchmark(BTC_HOLD)通过 LOCKED.baseline_agents.BTCHoldAgent 解析计算
-      (不经过Simulator/execute()九步校验链,见该模块docstring的人类裁决);
-      random 通过独立的 "random" Simulator 分支,由 RandomAgent 按与主决策
-      相同的4h节奏产出决策,但完全不经过Trader/LLM(它的存在意义就是"同样
-      规则下不用脑子能赚多少",混入LLM签入延迟毫无意义)。random分支使用
-      自己独立的 CircuitBreaker 实例(而不是与main共用),因为熔断器内部
-      跟踪的是"迄今见过的NAV峰值"这类分支自身状态,main和random是两条完全
-      独立的净值轨迹,共用一个实例会让二者互相污染彼此的冻结状态。
+      (不经过Simulator/execute()九步校验链,见该模块docstring的人类裁决)。
+    - random对照组(RandomAgent独立分支,不经过Trader/LLM)已按用户要求
+      (2026-07-14)下线,不再运行——nav.tsv的nav_random列是LOCKED区
+      scorer.daily_mark()的必填参数,这里改成传一个冻结常量(=期初资本)
+      占位,不是继续追踪一条真实的随机决策净值轨迹;webui面板侧也已经把
+      "随机对照"从图表/分支选择器里去掉。
 
 跑法:
     cd alphaloop
@@ -81,7 +80,7 @@ import yaml  # noqa: E402
 from llm_bridge import AgentBridgeLLMClient  # noqa: E402
 
 from LOCKED import log_writer  # noqa: E402
-from LOCKED.baseline_agents import BTCHoldAgent, RandomAgent  # noqa: E402
+from LOCKED.baseline_agents import BTCHoldAgent  # noqa: E402
 from LOCKED.circuit_breaker import CircuitBreaker  # noqa: E402
 from LOCKED.clock import SystemClock  # noqa: E402
 from LOCKED.cold_start import ColdStartGate  # noqa: E402
@@ -286,33 +285,6 @@ def run_cold_start(scheduler, dp: DataPipeline, uf: UniverseFilter, researcher: 
         raise SystemExit(f"COLD_START 未能切换到 NORMAL(当前: {state}),不继续点火")
 
 
-def run_random_branch_cycle(sim_random, random_agent, next_bar_provider, now: int, interval_hours: int) -> bool:
-    """随机对照组(RandomAgent)按与主策略相同的4h决策节奏产出+执行决策,
-    但完全不经过 Trader/LLM——它的存在意义就是回答"同样规则下不用脑子能
-    赚多少"(见 LOCKED/baseline_agents.py 模块docstring),混进LLM签入延迟
-    对它没有任何意义,反而会不必要地拖慢这条对照线。
-
-    幂等性检查直接照搬 main.py._decision_already_exists_for_cycle 同一套
-    "读 decisions.jsonl 按 branch+ts 窗口判断"的逻辑(读的是同一份权威
-    事实来源,不需要另外维护状态),只是这里没有复用那个私有方法,而是在
-    本脚本内独立实现一份同样简单的读回校验。返回 True 表示本次真的产出
-    并执行了一条新决策,False 表示这个周期已经决策过、本次是空转。
-    """
-    cycle_start, cycle_end = main_module.decision_cycle_window(now, interval_hours)
-    records = log_writer.read_jsonl("decisions.jsonl", root=LOG_ROOT)
-    already = any(
-        r.get("branch") == "random" and cycle_start <= r.get("ts", -1) < cycle_end
-        for r in records
-    )
-    if already:
-        return False
-
-    decision = random_agent.decide(now)
-    sim_random.log_decision(decision)
-    next_bar = next_bar_provider(decision.symbol, now)
-    sim_random.execute(decision, next_bar)
-    return True
-
 
 def main() -> None:
     config = load_config()
@@ -331,10 +303,6 @@ def main() -> None:
     scorer = Scorer(config, log_root=LOG_ROOT)
     cold_start_gate = ColdStartGate(genesis_path=GENESIS_PATH, min_hypothesis_count=10, log_root=LOG_ROOT)
     circuit_breaker = CircuitBreaker(config, log_root=LOG_ROOT)
-    # random 分支用独立的 CircuitBreaker 实例:熔断器内部跟踪的是"迄今见过
-    # 的NAV峰值"等分支自身状态,main/random是两条独立净值轨迹,共用一个
-    # 实例会让二者的回撤/冻结状态互相污染。
-    circuit_breaker_random = CircuitBreaker(config, log_root=LOG_ROOT)
     evolution_orchestrator = EvolutionOrchestrator(config, scorer=scorer, log_root=LOG_ROOT)
     git_merge_executor = GitMergeExecutor(repo_path=PROJECT_ROOT, log_root=LOG_ROOT)
 
@@ -404,9 +372,6 @@ def main() -> None:
         ticker = dp.fetch_latest_snapshot(["BTC/USDT:USDT"])["BTC/USDT:USDT"]
         return btc_hold_agent.nav(price=float(ticker["last"]))
 
-    def random_nav_provider(ts: int) -> float:
-        return scheduler.simulators["random"].get_portfolio()["nav"]
-
     risk_check_cfg = config.get("risk_check", {}) or {}
     _recent_window_minutes = int(risk_check_cfg.get("recent_window_minutes", 300))
 
@@ -426,7 +391,7 @@ def main() -> None:
         next_bar_provider=next_bar_provider, snapshot_provider=snapshot_provider,
         funding_rate_lookup=funding_rate_lookup, price_lookup=price_lookup,
         recent_price_provider=recent_price_provider,
-        benchmark_nav_provider=benchmark_nav_provider, random_nav_provider=random_nav_provider,
+        benchmark_nav_provider=benchmark_nav_provider,  # random_nav_provider 已按用户要求(2026-07-14)不再注入,random对照组下线
         log_root=LOG_ROOT, state_path=STATE_ROOT / "scheduler_state.json",
         # main.py 默认 trader_timeout_seconds=30.0,是为"真实API几秒内应该
         # 返回"这个假设设计的。llm_client 现在是要等一个人/agent签入并手动
@@ -451,27 +416,19 @@ def main() -> None:
     if symbols is None:
         raise SystemExit("universe_active.json 仍不存在,COLD_START 逻辑有误,无法继续点火")
 
-    # random 对照组:独立 Simulator 分支 + 独立 CircuitBreaker + RandomAgent
-    # (seed 固定=42,可复现)。
-    sim_random = Simulator(
-        config=config, circuit_breaker=circuit_breaker_random, cold_start_gate=cold_start_gate.is_cold_start,
-        universe_symbols=symbols, db_path=STATE_ROOT / "portfolio_random.db",
-        log_root=LOG_ROOT, branch="random", resume=True,
-    )
-    scheduler.simulators["random"] = sim_random
-    random_agent = RandomAgent(universe_symbols=symbols, seed=42, branch="random")
-
-    # 用户要求的多分支并行(2026-07-14,快速验证阶段):每个候选分支各自独立
-    # 仓位、各自走完整的 Trader/LLM 签入决策周期(与 random 对照组不同——
-    # random 刻意不经过 Trader,这几个 evo 分支的存在意义就是要真的比较不同
-    # 战术下 Trader 的表现,所以必须真的经过签入)。战术差异通过
-    # scheduler.program_tactics 这个既有的公开属性在每次调用前手动切换实现
-    # (main.py 的 _call_trader_with_timeout 本来就会把它转发给 Trader.decide(),
-    # 见 main.py:344 —— 这里只是从 ignite.py 侧按分支复用同一个已有机制,
-    # 不需要改 main.py 的接口)。分支名遵循 LOCKED 区"evo/YYYYMMDD-简述"命名
-    # 约定,一旦注册永不重用(见 evolution_orchestrator.register_branch
+    # 用户要求的多分支并行(2026-07-14,快速验证阶段,从2个分支扩到5个,
+    # random对照组同时下线):每个候选分支各自独立仓位、各自走完整的
+    # Trader/LLM 签入决策周期。战术差异通过 scheduler.program_tactics 这个
+    # 既有的公开属性在每次调用前手动切换实现(main.py 的
+    # _call_trader_with_timeout 本来就会把它转发给 Trader.decide(),见
+    # main.py:344 —— 这里只是从 ignite.py 侧按分支复用同一个已有机制,不需要
+    # 改 main.py 的接口)。分支名遵循 LOCKED 区"evo/YYYYMMDD-简述"命名约定,
+    # 一旦注册永不重用(见 evolution_orchestrator.register_branch
     # docstring),日期写死在这里是有意的——它是这一批分支被创建的日期,不是
-    # "今天"的意思,不应该随进程重启的当天日期变化。
+    # "今天"的意思,不应该随进程重启的当天日期变化。5个分支需要
+    # config.yaml的evolution.max_concurrent_branches同步从3提到5,否则
+    # register_branch()会在第4个分支开始静默返回False(LOCKED区强制的
+    # 并发上限,agent代码无法绕过)。
     EVO_BRANCH_TACTICS = {
         "evo/20260714-aggressive": (
             "进取战术:在假设置信度足够(至少两条独立假设互相印证,或有真实"
@@ -484,6 +441,28 @@ def main() -> None:
             "才建仓;仓位规模、杠杆都应明显低于main分支的对应决策,宁可错过"
             "一部分机会也不放大不确定性下的敞口;对新标的(缺乏完整2年历史"
             "或资金费率样本不足96天)一律用最小仓位或直接观望。"
+        ),
+        "evo/20260714-momentum": (
+            "动量战术:优先关注最近若干个决策周期内价格单方向变动幅度最大的"
+            "标的,顺势而非逆势——如果某标的近期出现明显的单边趋势(结合"
+            "genesis.md记录的趋势/波动率画像),倾向于跟随该趋势方向建仓,"
+            "而不是像main分支那样只押H1的BTC低波动锚定逻辑;必须为每笔"
+            "决策写清楚'趋势可能反转'的falsifier_condition,顺势不等于追高。"
+        ),
+        "evo/20260714-carry": (
+            "资金费率carry战术:优先寻找资金费率长期偏离零、且价格没有极端"
+            "单边趋势的标的做反向持仓吃资金费率(如H3描述的BEAT多头付费"
+            "场景);对资金费率样本不足96天或标准差明显偏高(如H4描述的LAB)"
+            "的标的保持谨慎小仓位;这个分支的核心假设是carry收益本身、不是"
+            "赌方向,仓位方向应该跟资金费率符号相反(资金费率为正->偏空吃"
+            "carry,为负->需要额外警惕H2描述的挤压反弹风险)。"
+        ),
+        "evo/20260714-diversified": (
+            "分散战术:每个决策周期尽量在universe内多个不相关标的上分别建立"
+            "小仓位,而不是像main分支那样长期只集中在BTC一个标的上;单个"
+            "标的的仓位规模应该明显小于main/aggressive分支的对应决策,用"
+            "'广撒网、小额验证多个假设'的方式积累各个标的的真实表现数据,"
+            "为后续Reflector反思和棘轮判定提供更丰富的样本。"
         ),
     }
     evo_simulators: dict[str, Simulator] = {}
@@ -520,15 +499,6 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             print(f"[{now}] run_decision_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
 
-        try:
-            acted = run_random_branch_cycle(
-                sim_random, random_agent, next_bar_provider, now, scheduler._decision_interval_hours
-            )
-            if acted:
-                print(f"[{now}] random对照组决策周期完成", flush=True)
-        except Exception:  # noqa: BLE001
-            print(f"[{now}] run_random_branch_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
-
         # 多分支并行:每个 evo 候选分支各自走一遍完整的 Trader/LLM 签入决策
         # 周期,战术差异通过临时切换 scheduler.program_tactics 实现(见上面
         # EVO_BRANCH_TACTICS 定义处的说明)。循环结束后不需要额外重置——
@@ -553,8 +523,8 @@ def main() -> None:
 
         # 用户新增护栏:每小时确定性风控检查,不经过Trader/LLM(见
         # LOCKED/position_risk_monitor.py + main.py.run_risk_check_cycle)。
-        # 故意只对main分支做——random对照组的存在意义是"同样规则+零额外
-        # 保护下瞎搞会怎样",给它加急停保护会不公平地美化这条对照线。
+        # 故意只对main分支做,不覆盖evo候选分支——每个分支自己的风险偏好
+        # 本身就是要被比较的对象之一,统一加急停保护会削弱这种比较意义。
         if now - last_risk_check_ms >= risk_check_interval_ms:
             try:
                 risk_result = scheduler.run_risk_check_cycle("main")
@@ -584,7 +554,6 @@ def main() -> None:
                     if ticker.get("last") is not None
                 }
                 nav_agent_now = scheduler.simulators["main"].get_portfolio(snapshot=live_price_snapshot)["nav"]
-                nav_random_now = scheduler.simulators["random"].get_portfolio(snapshot=live_price_snapshot)["nav"]
                 nav_benchmark_now = benchmark_nav_provider(now)
                 log_writer.append_jsonl(
                     "nav_intraday.jsonl",
@@ -592,7 +561,11 @@ def main() -> None:
                         "ts": now,
                         "nav_agent": nav_agent_now,
                         "nav_benchmark": nav_benchmark_now,
-                        "nav_random": nav_random_now,
+                        # random对照组已按用户要求(2026-07-14)下线,这个字段
+                        # 冻结在期初资本,不再追踪一条真实的随机决策净值——
+                        # 保留字段本身是为了不破坏nav_intraday.jsonl现有的三线
+                        # schema(webui侧已经把这条线从图表里去掉,不会渲染它)。
+                        "nav_random": config["capital_usdt"],
                     },
                     root=LOG_ROOT,
                 )
@@ -628,14 +601,13 @@ def main() -> None:
                 )
 
                 # 用户要求的多分支功能:"总面板可以看他们的对比,然后每个分支
-                # 又可以点进去看他们的仓位"——random对照组和每个evo候选分支
-                # 都按同样的方式各自落一份标记快照 + 一条小时级净值记录。
-                # nav_intraday.jsonl的既有三线schema(nav_agent/nav_benchmark/
-                # nav_random)保持不动,不动它的既有读者(webui默认图表);
-                # 这里新增一份独立的、long格式的 nav_intraday_branches.jsonl,
-                # 覆盖random和所有evo分支,webui侧再合并展示,不影响已经在跑
-                # 的旧代码路径。
-                for other_branch, other_sim in {"random": sim_random, **evo_simulators}.items():
+                # 又可以点进去看他们的仓位"——每个evo候选分支都按同样的方式
+                # 各自落一份标记快照 + 一条小时级净值记录。nav_intraday.jsonl
+                # 的既有三线schema(nav_agent/nav_benchmark/nav_random)保持
+                # 不动,不动它的既有读者(webui默认图表);这里新增一份独立的、
+                # long格式的 nav_intraday_branches.jsonl,覆盖所有evo分支,
+                # webui侧再合并展示,不影响已经在跑的旧代码路径。
+                for other_branch, other_sim in evo_simulators.items():
                     safe_other = other_branch.replace("/", "_").replace(":", "_")
                     marked = _mark_positions(other_sim, other_branch)
                     (STATE_ROOT / f"positions_marked_{safe_other}.json").write_text(
@@ -682,10 +654,13 @@ def main() -> None:
             try:
                 nav_agent = scheduler.simulators["main"].get_portfolio()["nav"]
                 nav_benchmark = benchmark_nav_provider(now)
-                nav_random = scheduler.simulators["random"].get_portfolio()["nav"]
+                # random对照组已按用户要求(2026-07-14)下线;nav_random是
+                # LOCKED区scorer.daily_mark()的必填参数,这里传期初资本常量
+                # 占位,不再追踪一条真实的随机决策净值轨迹。
+                nav_random = config["capital_usdt"]
                 scheduler.mark_daily_nav(today, nav_agent=nav_agent, nav_benchmark=nav_benchmark, nav_random=nav_random)
                 print(
-                    f"[{now}] 每日净值记录: agent={nav_agent:.2f} benchmark={nav_benchmark:.2f} random={nav_random:.2f}",
+                    f"[{now}] 每日净值记录: agent={nav_agent:.2f} benchmark={nav_benchmark:.2f}",
                     flush=True,
                 )
 
@@ -694,10 +669,6 @@ def main() -> None:
                     scheduler.run_circuit_breaker_check(_navs_to_ms_series(nav_series["main"]), now_ts=now)
                 except Exception:  # noqa: BLE001
                     print(f"[{now}] circuit_breaker(main) 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
-                try:
-                    circuit_breaker_random.check(_navs_to_ms_series(nav_series["random"]), now_ts=now)
-                except Exception:  # noqa: BLE001
-                    print(f"[{now}] circuit_breaker(random) 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
             except Exception:  # noqa: BLE001
                 print(f"[{now}] 每日净值记录/熔断检查 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
             schedule_state["last_daily_mark_date"] = today

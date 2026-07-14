@@ -85,7 +85,7 @@
   </div>
 
   <div class="panel full">
-    <h2>净值三线对比(agent / BTC_HOLD 基准 / 随机对照)</h2>
+    <h2>净值对比(main / BTC_HOLD 基准 / 各evo候选分支)</h2>
     <div class="nav-granularity" id="navGranularity">
       <button type="button" class="gran-btn active" data-gran="day">按天</button>
       <button type="button" class="gran-btn" data-gran="hour">按小时</button>
@@ -150,7 +150,7 @@ const REFRESH_MS = 15000;
 let navChart = null;
 let navGranularity = "day"; // "day" -> /api/nav (nav.tsv 日线); "hour" -> /api/nav_intraday (小时级)
 let selectedBranch = "main";
-let knownBranches = [{ branch: "main", label: "main" }, { branch: "random", label: "随机对照" }];
+let knownBranches = [{ branch: "main", label: "main" }];
 const EVO_LINE_COLORS = ["#f778ba", "#3fb950", "#a5a5ff", "#e3b341", "#79c0ff"];
 
 function fmtHourLabel(tsMs) {
@@ -215,7 +215,9 @@ async function refreshNav() {
   const datasets = [
     { label: "Agent (main)", data: data.rows.map(r => r.nav_agent), borderColor: "#58a6ff", tension: 0.1, pointRadius: 0 },
     { label: "BTC_HOLD 基准", data: data.rows.map(r => r.nav_benchmark), borderColor: "#d29922", tension: 0.1, pointRadius: 0 },
-    { label: "随机对照", data: data.rows.map(r => r.nav_random), borderColor: "#8b98a5", tension: 0.1, pointRadius: 0 },
+    // 随机对照组已按用户要求(2026-07-14)下线,不再渲染这条线(后端仍会
+    // 写一个冻结的nav_random占位值,纯粹是为了不破坏nav.tsv/nav_intraday.jsonl
+    // 既有schema,前端故意不读它)。
   ];
 
   // 用户要求的多分支总面板对比:按小时粒度时,把每个已注册的evo候选分支

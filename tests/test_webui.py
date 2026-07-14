@@ -165,8 +165,8 @@ def test_empty_data_fallback_every_endpoint_returns_200_not_500(client):
     assert test_client.get("/api/nav_intraday").json()["has_data"] is False
     assert test_client.get("/api/nav_intraday_branches").json()["has_data"] is False
     branches_empty = test_client.get("/api/branches").json()
-    assert branches_empty["has_data"] is True  # main/random 是固定的,永远有
-    assert {b["branch"] for b in branches_empty["branches"]} == {"main", "random"}
+    assert branches_empty["has_data"] is True  # main 是固定的,永远有(random对照组已下线)
+    assert {b["branch"] for b in branches_empty["branches"]} == {"main"}
     assert test_client.get("/api/positions").json()["has_data"] is False
     assert test_client.get("/api/latest_advice").json()["has_data"] is False
     status = test_client.get("/api/status").json()
@@ -229,7 +229,7 @@ def test_branches_endpoint_includes_registered_evo_branches(client):
 
     data = test_client.get("/api/branches").json()
     branch_names = {b["branch"] for b in data["branches"]}
-    assert branch_names == {"main", "random", "evo/20260714-aggressive", "evo/20260714-conservative"}
+    assert branch_names == {"main", "evo/20260714-aggressive", "evo/20260714-conservative"}
     evo_entry = next(b for b in data["branches"] if b["branch"] == "evo/20260714-aggressive")
     assert evo_entry["kind"] == "evo"
     assert evo_entry["created_date"] == "2026-07-14"
