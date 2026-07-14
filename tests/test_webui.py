@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -152,7 +153,7 @@ def test_empty_data_fallback_every_endpoint_returns_200_not_500(client):
     """铁律:系统还没跑起来、LOG目录里什么都没有时,面板不能报错。"""
     test_client, _log_root, _state_root = client
     endpoints = [
-        "/", "/api/status", "/api/nav", "/api/positions", "/api/latest_advice",
+        "/", "/api/status", "/api/nav", "/api/nav_intraday", "/api/positions", "/api/latest_advice",
         "/api/funding_summary", "/api/fees_summary", "/api/ratchet_log", "/api/health",
     ]
     for ep in endpoints:
@@ -160,6 +161,7 @@ def test_empty_data_fallback_every_endpoint_returns_200_not_500(client):
         assert resp.status_code == 200, f"{ep} returned {resp.status_code} on empty data"
 
     assert test_client.get("/api/nav").json()["has_data"] is False
+    assert test_client.get("/api/nav_intraday").json()["has_data"] is False
     assert test_client.get("/api/positions").json()["has_data"] is False
     assert test_client.get("/api/latest_advice").json()["has_data"] is False
     status = test_client.get("/api/status").json()
@@ -187,6 +189,28 @@ def test_nav_endpoint_renders_fake_nav_tsv(client):
     assert data["has_data"] is True
     assert len(data["rows"]) == 2
     assert data["rows"][1]["nav_agent"] == 101000.0
+
+
+def test_nav_intraday_endpoint_filters_by_hours_window(client):
+    """/api/nav_intraday 是 nav.tsv 之外独立的一份小时级净值记录(见
+    scripts/ignite.py 每小时随风控哨兵一起写的 LOG/nav_intraday.jsonl),
+    用户明确要求面板净值曲线要能看小时粒度,不是只有daily nav.tsv那一种。
+    这里验证 hours 窗口参数真的按时间截断,而不是把整份历史都塞回去。"""
+    test_client, log_root, _state_root = client
+    now_ms = int(time.time() * 1000)
+    recent_ts = now_ms - 30 * 60_000  # 30分钟前,在默认72h窗口内
+    old_ts = now_ms - 100 * 3_600_000  # 100小时前,超出默认72h窗口
+    with open(log_root / "nav_intraday.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": old_ts, "nav_agent": 100000.0, "nav_benchmark": 100000.0, "nav_random": 100000.0}) + "\n")
+        f.write(json.dumps({"ts": recent_ts, "nav_agent": 99990.0, "nav_benchmark": 99700.0, "nav_random": 100000.0}) + "\n")
+
+    data = test_client.get("/api/nav_intraday").json()  # default hours=72
+    assert data["has_data"] is True
+    assert len(data["rows"]) == 1
+    assert data["rows"][0]["ts"] == recent_ts
+
+    data_wide = test_client.get("/api/nav_intraday?hours=200").json()
+    assert len(data_wide["rows"]) == 2
 
 
 def test_status_endpoint_reads_cold_start_and_circuit_state(client):

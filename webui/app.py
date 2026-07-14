@@ -121,6 +121,17 @@ def _read_nav_tsv() -> list[dict]:
     return rows
 
 
+def _read_nav_intraday(hours: int) -> list[dict]:
+    """LOG/nav_intraday.jsonl 是每小时一笔的三线实时净值(见 scripts/ignite.py
+    的 nav_intraday 记录点),与 nav.tsv 的日线历史是两份独立、互不覆盖的数据——
+    这里只是原样读回、按 hours 窗口截断,不做任何插值/重采样等计算。"""
+    records = _read_jsonl("nav_intraday.jsonl")
+    if not records:
+        return []
+    cutoff = _now_ms() - hours * 3_600_000
+    return [r for r in records if isinstance(r.get("ts"), (int, float)) and r["ts"] >= cutoff]
+
+
 def _read_portfolio_db(branch: str) -> Optional[dict]:
     """只读打开 state/portfolio_{branch}.db。用 sqlite3 的 `mode=ro` URI 连接——
     这不是约定层面的"我们保证不写",而是驱动层面的强制:任何写操作在这个连接
@@ -249,6 +260,12 @@ def api_status() -> dict:
 @app.get("/api/nav")
 def api_nav() -> dict:
     rows = _read_nav_tsv()
+    return {"rows": rows, "has_data": bool(rows)}
+
+
+@app.get("/api/nav_intraday")
+def api_nav_intraday(hours: int = 72) -> dict:
+    rows = _read_nav_intraday(hours)
     return {"rows": rows, "has_data": bool(rows)}
 
 

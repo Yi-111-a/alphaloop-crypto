@@ -462,6 +462,43 @@ def main() -> None:
                     print(f"[{now}] 紧急风控平仓触发: {risk_result['triggered']}", flush=True)
             except Exception:  # noqa: BLE001
                 print(f"[{now}] run_risk_check_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+
+            # 用户要求:面板净值曲线要能看小时级粒度,不是只有nav.tsv那种
+            # 日线。这里不改scorer.daily_mark()/nav.tsv本身(那条线是LOCKED
+            # 棘轮判定用的权威日线历史,改它的语义有风险),而是另开一份
+            # 独立的、纯附加的 LOG/nav_intraday.jsonl,复用同一个已经在跑的
+            # 每小时节拍顺手记一笔三线实时净值(snapshot_provider本身就是
+            # 一次全universe ticker拉取,成本可忽略)。分钟级故意不做——
+            # 决策4h一次、风控哨兵1h一次,真拉到分钟级只是徒增每分钟一次的
+            # 交易所API调用,对这个研究系统没有实际信息增量。
+            try:
+                # snapshot_provider() 返回 {symbol: {"last":..,"bid":..,"ask":..,...}}
+                # (dp.fetch_latest_snapshot 的原始ticker结构),而
+                # Simulator.get_portfolio(snapshot=...) -> mark_to_market() 要的是
+                # {symbol: price} 这种扁平结构(_unrealized_pnl 直接拿 price 做算术)——
+                # 两者形状不同,这是刚才第一次重启后真实复现的bug,不是假设性边界情况。
+                live_ticker_snapshot = snapshot_provider(now)
+                live_price_snapshot = {
+                    symbol: float(ticker["last"])
+                    for symbol, ticker in live_ticker_snapshot.items()
+                    if ticker.get("last") is not None
+                }
+                nav_agent_now = scheduler.simulators["main"].get_portfolio(snapshot=live_price_snapshot)["nav"]
+                nav_random_now = scheduler.simulators["random"].get_portfolio(snapshot=live_price_snapshot)["nav"]
+                nav_benchmark_now = benchmark_nav_provider(now)
+                log_writer.append_jsonl(
+                    "nav_intraday.jsonl",
+                    {
+                        "ts": now,
+                        "nav_agent": nav_agent_now,
+                        "nav_benchmark": nav_benchmark_now,
+                        "nav_random": nav_random_now,
+                    },
+                    root=LOG_ROOT,
+                )
+            except Exception:  # noqa: BLE001
+                print(f"[{now}] nav_intraday 记录异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+
             last_risk_check_ms = now
 
         # 反思(Reflector):每天 reflection_per_day 次,均匀分布节拍。

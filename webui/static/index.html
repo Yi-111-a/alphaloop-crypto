@@ -63,6 +63,12 @@
   .verdict-ARCHIVE { color: var(--muted); }
   .verdict-FAIL { color: var(--red); font-weight: 700; }
   .footer-note { color: var(--muted); font-size: 12px; margin-top: 20px; text-align: center; }
+  .nav-granularity { display: flex; gap: 6px; margin-bottom: 10px; }
+  .gran-btn {
+    padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    border: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer;
+  }
+  .gran-btn.active { border-color: var(--accent); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -77,6 +83,10 @@
 
   <div class="panel full">
     <h2>净值三线对比(agent / BTC_HOLD 基准 / 随机对照)</h2>
+    <div class="nav-granularity" id="navGranularity">
+      <button type="button" class="gran-btn active" data-gran="day">按天</button>
+      <button type="button" class="gran-btn" data-gran="hour">按小时</button>
+    </div>
     <canvas id="navChart" height="90"></canvas>
     <div id="navEmpty" class="empty" style="display:none;">等待系统启动 —— 尚无净值数据</div>
   </div>
@@ -134,6 +144,13 @@
 <script>
 const REFRESH_MS = 15000;
 let navChart = null;
+let navGranularity = "day"; // "day" -> /api/nav (nav.tsv 日线); "hour" -> /api/nav_intraday (小时级)
+
+function fmtHourLabel(tsMs) {
+  const d = new Date(tsMs);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
+}
 
 function fmt(n, digits = 2) {
   if (n === null || n === undefined || Number.isNaN(n)) return "--";
@@ -170,18 +187,24 @@ async function refreshStatus() {
 }
 
 async function refreshNav() {
-  const data = await fetchJSON("/api/nav");
+  const url = navGranularity === "hour" ? "/api/nav_intraday?hours=72" : "/api/nav";
+  const data = await fetchJSON(url);
   const emptyEl = document.getElementById("navEmpty");
   const canvas = document.getElementById("navChart");
   if (!data.has_data) {
     emptyEl.style.display = "block";
     canvas.style.display = "none";
+    emptyEl.textContent = navGranularity === "hour"
+      ? "等待系统启动 —— 尚无小时级净值数据(每小时随风控哨兵一起记录,系统刚启动时需要等第一个整点)"
+      : "等待系统启动 —— 尚无净值数据";
     return;
   }
   emptyEl.style.display = "none";
   canvas.style.display = "block";
 
-  const labels = data.rows.map(r => r.date);
+  const labels = navGranularity === "hour"
+    ? data.rows.map(r => fmtHourLabel(r.ts))
+    : data.rows.map(r => r.date);
   const agent = data.rows.map(r => r.nav_agent);
   const benchmark = data.rows.map(r => r.nav_benchmark);
   const random = data.rows.map(r => r.nav_random);
@@ -294,6 +317,14 @@ async function refreshAll() {
     console.error("refresh failed", e);
   }
 }
+
+document.getElementById("navGranularity").addEventListener("click", (e) => {
+  const btn = e.target.closest(".gran-btn");
+  if (!btn || btn.dataset.gran === navGranularity) return;
+  navGranularity = btn.dataset.gran;
+  for (const b of document.querySelectorAll(".gran-btn")) b.classList.toggle("active", b === btn);
+  refreshNav();
+});
 
 refreshAll();
 setInterval(refreshAll, REFRESH_MS);
