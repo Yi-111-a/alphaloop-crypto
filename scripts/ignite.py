@@ -684,8 +684,14 @@ def main() -> None:
     print("=== 进入常驻调度循环(每分钟轮询一次到期任务,Ctrl+C 停止)===", flush=True)
     last_settlement_check_ms = 0
     last_risk_check_ms = 0
+    last_mark_ms = 0
     last_research_ms = 0
     risk_check_interval_ms = scheduler._risk_check_interval_hours * 3_600_000
+    # 用户要求(2026-07-14)面板"未实现盈亏"更实时:标记价/浮盈浮亏的刷新
+    # 节拍从原来跟哨兵共用的risk_check_interval_ms拆出来,独立走
+    # risk_check.mark_interval_minutes(默认5分钟),不影响哨兵判定本身
+    # 仍然是每小时一次。
+    mark_interval_ms = int(float((config.get("risk_check", {}) or {}).get("mark_interval_minutes", 5)) * 60_000)
     while True:
         now = clock.now_ms()
         try:
@@ -742,15 +748,15 @@ def main() -> None:
                     print(f"[{now}] 紧急风控平仓触发: {risk_result['triggered']}", flush=True)
             except Exception:  # noqa: BLE001
                 print(f"[{now}] run_risk_check_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+            last_risk_check_ms = now
 
-            # 用户要求:面板净值曲线要能看小时级粒度,不是只有nav.tsv那种
-            # 日线。这里不改scorer.daily_mark()/nav.tsv本身(那条线是LOCKED
-            # 棘轮判定用的权威日线历史,改它的语义有风险),而是另开一份
-            # 独立的、纯附加的 LOG/nav_intraday.jsonl,复用同一个已经在跑的
-            # 每小时节拍顺手记一笔三线实时净值(snapshot_provider本身就是
-            # 一次全universe ticker拉取,成本可忽略)。分钟级故意不做——
-            # 决策4h一次、风控哨兵1h一次,真拉到分钟级只是徒增每分钟一次的
-            # 交易所API调用,对这个研究系统没有实际信息增量。
+        # 用户要求(2026-07-14):面板"未实现盈亏"要更实时,不要跟风控哨兵
+        # 共用60分钟节拍——这里独立走 risk_check.mark_interval_minutes
+        # (默认5分钟)。同时也顺手记一笔净值曲线用的小时级(现在其实是
+        # 5分钟级)历史点:不改scorer.daily_mark()/nav.tsv本身(那条线是
+        # LOCKED棘轮判定用的权威日线历史,改它的语义有风险),而是另开一份
+        # 独立的、纯附加的 LOG/nav_intraday.jsonl。
+        if now - last_mark_ms >= mark_interval_ms:
             try:
                 # snapshot_provider() 返回 {symbol: {"last":..,"bid":..,"ask":..,...}}
                 # (dp.fetch_latest_snapshot 的原始ticker结构),而
@@ -831,8 +837,7 @@ def main() -> None:
                     )
             except Exception:  # noqa: BLE001
                 print(f"[{now}] nav_intraday/持仓标记 记录异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
-
-            last_risk_check_ms = now
+            last_mark_ms = now
 
         # 反思(Reflector):每天 reflection_per_day 次,均匀分布节拍。
         last_reflection_ts = schedule_state.get("last_reflection_ts")
