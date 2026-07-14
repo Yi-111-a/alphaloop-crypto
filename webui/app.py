@@ -172,6 +172,19 @@ def _read_portfolio_db(branch: str) -> Optional[dict]:
         conn.close()
 
 
+def _read_positions_marked(branch: str) -> dict[str, dict]:
+    """state/positions_marked_{branch}.json 是 scripts/ignite.py 每小时用
+    LOCKED.simulator.Simulator._unrealized_pnl(与真实结算同一套公式)算好、
+    落盘的"标记价+未实现盈亏"快照——本文件只原样读回按symbol建索引,不做
+    任何financial计算,遵守面板"零计算"的规矩。数据可能比当前时间落后最多
+    约1小时(下一次hourly tick之前),这是有意的权衡,不是bug。"""
+    safe_branch = branch.replace("/", "_").replace(":", "_").replace(" ", "_")
+    data = _read_json_state_file(STATE_ROOT / f"positions_marked_{safe_branch}.json")
+    if data is None:
+        return {}
+    return {p["symbol"]: p for p in data.get("positions", []) if "symbol" in p}
+
+
 def _read_cold_start_state() -> Optional[str]:
     data = _read_json_state_file(STATE_ROOT / "cold_start_state.json")
     if data is None:
@@ -274,6 +287,11 @@ def api_positions(branch: str = MAIN_BRANCH) -> dict:
     portfolio = _read_portfolio_db(branch)
     if portfolio is None:
         return {"has_data": False, "branch": branch, "positions": [], "wallet_balance": None, "branch_dead": None}
+    marks = _read_positions_marked(branch)
+    for p in portfolio["positions"]:
+        mark = marks.get(p["symbol"])
+        p["mark_price"] = mark["mark_price"] if mark else None
+        p["unrealized_pnl"] = mark["unrealized_pnl"] if mark else None
     return {"has_data": True, **portfolio}
 
 

@@ -252,6 +252,77 @@ def test_positions_endpoint_reads_real_readonly_sqlite(client):
     assert data["positions"][0]["leverage"] == 2
 
 
+def test_positions_endpoint_merges_unrealized_pnl_from_marked_state_file(client):
+    """用户指出面板的'未实现盈亏'一直是硬编码的'--'。修法是让scripts/ignite.py
+    每小时用LOCKED.simulator.Simulator._unrealized_pnl(与真实结算同一套公式)
+    算好后落盘到state/positions_marked_{branch}.json,面板只原样读回合并进
+    /api/positions,自己不做任何financial计算。这里验证合并逻辑本身。"""
+    test_client, _log_root, state_root = client
+    db_path = state_root / "portfolio_main.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE wallet (branch TEXT PRIMARY KEY, balance REAL NOT NULL, branch_dead INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        """CREATE TABLE positions (
+            branch TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
+            notional REAL NOT NULL, entry_price REAL NOT NULL, margin REAL NOT NULL, leverage INTEGER NOT NULL,
+            PRIMARY KEY (branch, symbol)
+        )"""
+    )
+    conn.execute("INSERT INTO wallet VALUES ('main', 95000.0, 0)")
+    conn.execute("INSERT INTO positions VALUES ('main', 'BTC/USDT:USDT', 'long', 30000.0, 50000.0, 15000.0, 2)")
+    conn.execute("INSERT INTO positions VALUES ('main', 'ETH/USDT:USDT', 'short', 10000.0, 2000.0, 5000.0, 2)")
+    conn.commit()
+    conn.close()
+
+    (state_root / "positions_marked_main.json").write_text(
+        json.dumps({
+            "ts": 123,
+            "branch": "main",
+            "positions": [
+                {"symbol": "BTC/USDT:USDT", "mark_price": 51000.0, "unrealized_pnl": 600.0},
+                # ETH intentionally omitted -- simulates a symbol not yet marked (e.g. first
+                # tick after opening, before the next hourly mark runs).
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    data = test_client.get("/api/positions").json()
+    positions_by_symbol = {p["symbol"]: p for p in data["positions"]}
+    assert positions_by_symbol["BTC/USDT:USDT"]["mark_price"] == 51000.0
+    assert positions_by_symbol["BTC/USDT:USDT"]["unrealized_pnl"] == 600.0
+    assert positions_by_symbol["ETH/USDT:USDT"]["mark_price"] is None
+    assert positions_by_symbol["ETH/USDT:USDT"]["unrealized_pnl"] is None
+
+
+def test_positions_endpoint_pnl_fields_are_none_without_marked_state_file(client):
+    """state/positions_marked_main.json 还没被ignite.py第一次写过之前(比如
+    系统刚重启、还没到下一次整点),端点必须优雅返回None而不是报错。"""
+    test_client, _log_root, state_root = client
+    db_path = state_root / "portfolio_main.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE wallet (branch TEXT PRIMARY KEY, balance REAL NOT NULL, branch_dead INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        """CREATE TABLE positions (
+            branch TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
+            notional REAL NOT NULL, entry_price REAL NOT NULL, margin REAL NOT NULL, leverage INTEGER NOT NULL,
+            PRIMARY KEY (branch, symbol)
+        )"""
+    )
+    conn.execute("INSERT INTO wallet VALUES ('main', 95000.0, 0)")
+    conn.execute("INSERT INTO positions VALUES ('main', 'BTC/USDT:USDT', 'long', 30000.0, 50000.0, 15000.0, 2)")
+    conn.commit()
+    conn.close()
+
+    data = test_client.get("/api/positions").json()
+    assert data["positions"][0]["mark_price"] is None
+    assert data["positions"][0]["unrealized_pnl"] is None
+
+
 def test_latest_advice_rendered_verbatim(client):
     test_client, log_root, _state_root = client
     content = (

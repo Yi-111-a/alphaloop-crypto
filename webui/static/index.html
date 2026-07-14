@@ -69,6 +69,9 @@
     border: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer;
   }
   .gran-btn.active { border-color: var(--accent); color: var(--accent); }
+  .pnl-pos { color: var(--green); font-weight: 600; }
+  .pnl-neg { color: var(--red); font-weight: 600; }
+  .pnl-roe { font-size: 11px; opacity: 0.85; margin-left: 4px; }
 </style>
 </head>
 <body>
@@ -96,7 +99,7 @@
       <h2>当前持仓(main 分支)</h2>
       <div id="positionsTableWrap">
         <table id="positionsTable">
-          <thead><tr><th>币种</th><th>方向</th><th>杠杆</th><th>名义额</th><th>开仓价</th><th>未实现盈亏</th></tr></thead>
+          <thead><tr><th>币种</th><th>方向</th><th>杠杆</th><th>名义额</th><th>开仓价</th><th>标记价</th><th>未实现盈亏</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -250,8 +253,21 @@ async function refreshPositions() {
   wrapEl.style.display = "block";
   for (const p of data.positions) {
     const tr = document.createElement("tr");
+    const markCell = p.mark_price !== null && p.mark_price !== undefined ? fmt(p.mark_price) : "--";
+    let pnlCell = "--";
+    if (p.unrealized_pnl !== null && p.unrealized_pnl !== undefined) {
+      const pnl = p.unrealized_pnl;
+      const margin = p.margin;
+      const roe = margin ? (pnl / margin * 100) : null;
+      const cls = pnl >= 0 ? "pnl-pos" : "pnl-neg";
+      const sign = pnl >= 0 ? "+" : "";
+      const roeSpan = roe !== null
+        ? `<span class="pnl-roe">(${sign}${fmt(roe, 2)}%)</span>`
+        : "";
+      pnlCell = `<span class="${cls}">${sign}${fmt(pnl)} USDT</span>${roeSpan}`;
+    }
     tr.innerHTML = `<td>${p.symbol}</td><td>${p.side}</td><td>${p.leverage}x</td>` +
-      `<td>${fmt(p.notional)}</td><td>${fmt(p.entry_price)}</td><td>--</td>`;
+      `<td>${fmt(p.notional)}</td><td>${fmt(p.entry_price)}</td><td>${markCell}</td><td>${pnlCell}</td>`;
     tbody.appendChild(tr);
   }
 }

@@ -496,8 +496,35 @@ def main() -> None:
                     },
                     root=LOG_ROOT,
                 )
+
+                # 用户指出面板持仓表里的"未实现盈亏"一直是硬编码的"--"(webui/
+                # static/index.html之前从没真正填过这一列)。webui/app.py 明确
+                # 立了"零计算"的规矩(不能自己重新算NAV/盈亏),所以修法不是在
+                # 面板里现算,而是让本脚本(允许调用LOCKED)复用
+                # Simulator._unrealized_pnl 这个和真实结算完全同一套公式的
+                # 方法,算出来直接落盘成"已经算好的数字"——面板照旧只读、不算。
+                # 用 state/(而非LOG/)存,因为这是"当前最新标记价快照"而不是
+                # 需要保留全部历史的append-only事件,与ignite_heartbeat.json
+                # 是同一种性质。
+                positions_marked = {
+                    "ts": now,
+                    "branch": "main",
+                    "positions": [
+                        {
+                            "symbol": pos.symbol,
+                            "mark_price": live_price_snapshot.get(pos.symbol, pos.entry_price),
+                            "unrealized_pnl": Simulator._unrealized_pnl(
+                                pos, live_price_snapshot.get(pos.symbol, pos.entry_price)
+                            ),
+                        }
+                        for pos in scheduler.simulators["main"].positions.values()
+                    ],
+                }
+                (STATE_ROOT / "positions_marked_main.json").write_text(
+                    json.dumps(positions_marked, ensure_ascii=False), encoding="utf-8"
+                )
             except Exception:  # noqa: BLE001
-                print(f"[{now}] nav_intraday 记录异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+                print(f"[{now}] nav_intraday/持仓标记 记录异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
 
             last_risk_check_ms = now
 
