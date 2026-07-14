@@ -35,16 +35,32 @@ run_ratchet_judgment/mark_daily_nav/run_circuit_breaker_check 都是main.py
       这条不能跟着决策周期一起收紧,因为nav.tsv本身是LOCKED区
       scorer.daily_mark()维护的日粒度权威历史,棘轮评分(ratchet_score)
       是按日历日对齐设计、已经审过的核心逻辑,不在这次改造范围内。
-    - 棘轮判定(EvolutionOrchestrator):每 config.cycle.ratchet_interval_hours
-      小时一次(现为2小时,原为3天)。用户要求棘轮判定加速到2小时一次时,
-      我们特意确认过"方案2"——不改nav.tsv/ratchet_score本身的日粒度语义,
-      因为那是已审过的LOCKED核心评分逻辑;这里改的只是"多久调一次
-      run_ratchet_judgment"这个调度频率,它读到的nav.tsv数据本身仍然是
-      每天才新增一行,所以在还没有任何候选分支被注册(§4.1"分支提案"机制
-      本身是后续迭代内容,不在本次点火范围内)之前,不管几小时调一次都是
-      "0条候选分支裁决"的空跑,这是正确的空跑,不是bug——真正需要小时级
-      粒度的"平行判定机制"(用本脚本已经在维护的nav_intraday.jsonl)要等
-      将来真的有候选分支时才有意义去建,现在建了也没有东西可比较。
+    - 棘轮判定(EvolutionOrchestrator,LOCKED官方评分):每
+      config.cycle.ratchet_interval_hours 小时一次(现为2小时,原为3天)。
+      只喂main自己的nav.tsv日粒度权威历史,不喂evo候选分支——见下面"战术
+      锦标赛"条目,evo分支的评估已经迁到一套独立机制,不再尝试塞进这个
+      本来是为"真实git分支候选"设计的judge()里。
+    - 战术锦标赛(用户2026-07-14要求"自动进化+晋升赢家"):与上面的官方
+      棘轮判定完全独立的一套并行机制,同样复用 ratchet_interval_hours 节拍
+      (见 evaluate_tactic_tournament())。用小时级的 nav_intraday.jsonl /
+      nav_intraday_branches.jsonl 数据比较每个active evo分支相对main的
+      净值表现:相对main的净值优势 >= tactic_tournament.promote_edge_pct
+      → 该分支的战术文字被写入 state/main_program_tactics.json,main分支
+      从下一个决策周期起就开始用这个"晋升"上来的战术(不需要重启进程,
+      也不走LOCKED区的GitMergeExecutor——这几个分支本来就不是真实git分支,
+      只是同一份代码下不同的提示词,没有代码可合并);分支自身净值从峰值
+      回撤超过 tactic_tournament.fail_drawdown_pct → 强制平仓退场。两种
+      情况都会把该分支从候选名册(state/tactic_tournament_roster.json)
+      标记为非active、腾出名额,并写一个 state/new_tactic_request.json
+      标记文件,提醒签入的agent(我)设计一个新战术填补空缺——这一步
+      刻意没有做成全自动:ignite.py本身是纯Python脚本,没有能力像
+      Claude Code会话一样调用子代理去"设计一个新战术"这种需要真正推理
+      的工作,只能负责"检测到需要新战术了"这个纯机械判断,创造性的部分
+      仍然交给agent,与全项目"所有AI操作都由agent发起"的既定原则一致。
+      没有达到PROMOTE/FAIL任一条件的分支保持active,不产出裁决,可以
+      无限期地继续被观察——这是与LOCKED官方judge()"每次调用都对所有
+      active分支强制产出终局裁决"最核心的行为差异,由evaluate_tactic_
+      tournament()的docstring详细说明。
     - benchmark(BTC_HOLD)通过 LOCKED.baseline_agents.BTCHoldAgent 解析计算
       (不经过Simulator/execute()九步校验链,见该模块docstring的人类裁决)。
     - random对照组(RandomAgent独立分支,不经过Trader/LLM)已按用户要求
@@ -70,6 +86,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -165,6 +182,7 @@ def load_schedule_state() -> dict:
         # 用同一种"重启后立即补跑一次"的模式,不再需要跨重启持久化)。
         "last_daily_mark_date": None,
         "last_ratchet_ts": None,
+        "last_tournament_ms": None,
         "btc_hold_entry_price": None,
     }
 
@@ -223,22 +241,166 @@ def read_nav_tsv_series() -> dict[str, list[tuple[str, float]]]:
     return series
 
 
-def read_evo_branch_daily_nav_series() -> dict[str, list[tuple[str, float]]]:
-    """方案2(用户2026-07-14确认):不改nav.tsv/scorer.ratchet_score的日粒度
-    权威语义,而是把本脚本已经在维护的小时级 LOG/nav_intraday_branches.jsonl
-    降采样成"每个evo分支每天最后一次看到的净值"这种官方棘轮评分要求的
-    (date_str, nav) 序列格式——LOCKED的评分逻辑本身完全不变,只是ignite.py
-    侧多做一步聚合,让候选分支真的能被judge()评估,而不是因为branch_navs
-    里缺了对应entry而被(EvolutionOrchestrator.judge()内部本来就有的防御性
-    过滤)静默跳过。"""
+# ---------------------------------------------------------------------------
+# 战术锦标赛("自动进化+晋升赢家",用户2026-07-14要求)——见模块docstring的
+# 完整设计说明。核心原则:与 LOCKED.evolution_orchestrator.judge() 完全独立、
+# 不共用同一套数据/裁决逻辑,因为 judge() 的"一次性裁决后永久退出候选池"
+# 语义(见其docstring步骤5)不适合这里"反复观察、允许长期不产生结论"的
+# 场景。这里的裁决结果不会,也不需要,写回 LOCKED 的 branch_registrations/
+# ratchet_verdicts 日志。
+# ---------------------------------------------------------------------------
+
+TOURNAMENT_ROSTER_PATH = STATE_ROOT / "tactic_tournament_roster.json"
+MAIN_TACTICS_PATH = STATE_ROOT / "main_program_tactics.json"
+NEW_TACTIC_REQUEST_PATH = STATE_ROOT / "new_tactic_request.json"
+
+
+def read_main_hourly_nav_series() -> list[tuple[int, float]]:
+    """main分支的小时级净值序列,来自本脚本已经在维护的 nav_intraday.jsonl
+    (nav_agent字段)——与锦标赛用同一套小时级数据源,口径一致才能公平比较。"""
+    records = log_writer.read_jsonl("nav_intraday.jsonl", root=LOG_ROOT)
+    return sorted(
+        (r["ts"], float(r["nav_agent"])) for r in records if "ts" in r and "nav_agent" in r
+    )
+
+
+def read_branch_hourly_nav_series(branch: str) -> list[tuple[int, float]]:
     records = log_writer.read_jsonl("nav_intraday_branches.jsonl", root=LOG_ROOT)
-    by_branch_date: dict[str, dict[str, float]] = {}
-    for r in records:
-        branch, ts, nav = r.get("branch"), r.get("ts"), r.get("nav")
-        if branch is None or ts is None or nav is None:
+    return sorted(
+        (r["ts"], float(r["nav"])) for r in records if r.get("branch") == branch and "ts" in r and "nav" in r
+    )
+
+
+def _return_pct(series: list[tuple[int, float]]) -> Optional[float]:
+    if len(series) < 2:
+        return None
+    first, last = series[0][1], series[-1][1]
+    if first == 0:
+        return None
+    return (last - first) / first * 100.0
+
+
+def _intraday_max_drawdown_pct(series: list[tuple[int, float]]) -> float:
+    """相对该序列自身历史滚动高点的最大回撤(不是相对期初资本),与
+    LOCKED.scorer._max_drawdown_pct 同样的定义,这里独立实现一份简单版本——
+    这是锦标赛自己的淘汰逻辑,不复用LOCKED的评分函数,避免误用一个为
+    "日粒度、git分支候选"场景设计的函数到"小时粒度、提示词候选"场景。"""
+    if not series:
+        return 0.0
+    peak = series[0][1]
+    max_dd = 0.0
+    for _, nav in series:
+        peak = max(peak, nav)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - nav) / peak * 100.0)
+    return max_dd
+
+
+def _slice_since(series: list[tuple[int, float]], since_ms: int) -> list[tuple[int, float]]:
+    return [(ts, nav) for ts, nav in series if ts >= since_ms]
+
+
+def load_tournament_roster(now_ms: int, defaults: dict[str, str]) -> dict:
+    """锦标赛的候选名册,持久化到 state/tactic_tournament_roster.json,重启后
+    不丢失。首次运行(文件不存在)时用 defaults 里的初始5个战术建档,
+    created_ms 记为本次首次建档的时刻——这是一个有意的简化:如果这5个分支
+    此前已经通过 EvolutionOrchestrator.register_branch() 注册过(本次改造前
+    的做法),它们在 LOCKED 那份注册日志里的创建日期不会跟这里的created_ms
+    完全一致,但两者是两套独立的簿记,不需要对齐;这里的created_ms只用于
+    锦标赛自己的min_hours_before_judgment门槛计算。"""
+    if TOURNAMENT_ROSTER_PATH.exists():
+        try:
+            return json.loads(TOURNAMENT_ROSTER_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    # 首次建档:必须立刻落盘,不能只留在内存里——本函数在同一次循环里会被
+    # 调用多次(决策周期那段、锦标赛评估那段),如果不在这里就写文件,
+    # created_ms会在每次调用时都被重新赋成"现在",min_hours_before_judgment
+    # 门槛永远也等不到,是刚才第一次重启后真实复现的bug,不是假设性边界情况。
+    roster = {
+        name: {"tactics": tactics, "status": "active", "created_ms": now_ms}
+        for name, tactics in defaults.items()
+    }
+    save_tournament_roster(roster)
+    return roster
+
+
+def save_tournament_roster(roster: dict) -> None:
+    TOURNAMENT_ROSTER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TOURNAMENT_ROSTER_PATH.write_text(json.dumps(roster, ensure_ascii=False), encoding="utf-8")
+
+
+def load_main_tactics() -> Optional[str]:
+    """main分支目前生效的战术文字——默认None(无偏置),一旦锦标赛判定某个
+    evo分支PROMOTE,这里会被更新成赢家的战术文字,并持久化到重启后依然生效。"""
+    if MAIN_TACTICS_PATH.exists():
+        try:
+            data = json.loads(MAIN_TACTICS_PATH.read_text(encoding="utf-8"))
+            return data.get("tactics")
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def save_main_tactics(tactics: str, source_branch: str, now_ms: int) -> None:
+    MAIN_TACTICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MAIN_TACTICS_PATH.write_text(
+        json.dumps({"tactics": tactics, "promoted_from": source_branch, "ts": now_ms}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def evaluate_tactic_tournament(roster: dict, now_ms: int, tournament_cfg: dict) -> list[dict]:
+    """对名册里每个status=='active'的分支做一次评估,返回本次新产生的裁决
+    事件列表(可能是空列表——这是正常情况,大多数分支大多数时候应该处于
+    "还没有明确结论,继续观察"这个中间状态,不是每次调用都必须产生裁决,
+    这正是与LOCKED.judge()"每次调用都对所有active分支强制产出裁决"最核心
+    的行为差异)。不修改roster的落盘,调用方负责在收到非空事件列表后落盘。"""
+    min_age_ms = int(float(tournament_cfg.get("min_hours_before_judgment", 4)) * 3_600_000)
+    promote_edge = float(tournament_cfg.get("promote_edge_pct", 0.5))
+    fail_dd = float(tournament_cfg.get("fail_drawdown_pct", 15))
+
+    main_series = read_main_hourly_nav_series()
+    events: list[dict] = []
+
+    for branch, meta in roster.items():
+        if meta.get("status") != "active":
             continue
-        by_branch_date.setdefault(branch, {})[_utc_date_str(ts)] = float(nav)  # 同一天多条 -> 保留最后一次(append-only,后写的在后面)
-    return {branch: sorted(date_nav.items()) for branch, date_nav in by_branch_date.items()}
+        created_ms = meta.get("created_ms", now_ms)
+        if now_ms - created_ms < min_age_ms:
+            continue
+
+        branch_series = _slice_since(read_branch_hourly_nav_series(branch), created_ms)
+        if len(branch_series) < 2:
+            continue
+        branch_return = _return_pct(branch_series)
+        if branch_return is None:
+            continue
+
+        main_window = _slice_since(main_series, created_ms)
+        main_return = _return_pct(main_window)
+        if main_return is None:
+            continue
+
+        edge = branch_return - main_return
+        drawdown = _intraday_max_drawdown_pct(branch_series)
+
+        if drawdown > fail_dd:
+            events.append({
+                "branch": branch, "decision": "FAIL", "edge_vs_main_pct": edge,
+                "max_drawdown_pct": drawdown,
+                "reason": f"intraday drawdown {drawdown:.2f}% > fail_drawdown_pct {fail_dd:.2f}%",
+            })
+        elif edge >= promote_edge:
+            events.append({
+                "branch": branch, "decision": "PROMOTE", "edge_vs_main_pct": edge,
+                "max_drawdown_pct": drawdown,
+                "reason": f"edge_vs_main {edge:.2f}% >= promote_edge_pct {promote_edge:.2f}%",
+            })
+        # 否则:既没有触发死刑条款也没有达到晋升门槛 -> 保持active,不产出
+        # 裁决,下一次锦标赛节拍再评估——这是有意的"允许长期没有结论"。
+
+    return events
 
 
 def run_cold_start(scheduler, dp: DataPipeline, uf: UniverseFilter, researcher: Researcher, clock, config: dict) -> None:
@@ -416,20 +578,19 @@ def main() -> None:
     if symbols is None:
         raise SystemExit("universe_active.json 仍不存在,COLD_START 逻辑有误,无法继续点火")
 
-    # 用户要求的多分支并行(2026-07-14,快速验证阶段,从2个分支扩到5个,
+    # 用户要求的多分支并行 + 战术锦标赛自动进化(2026-07-14,快速验证阶段,
     # random对照组同时下线):每个候选分支各自独立仓位、各自走完整的
     # Trader/LLM 签入决策周期。战术差异通过 scheduler.program_tactics 这个
     # 既有的公开属性在每次调用前手动切换实现(main.py 的
     # _call_trader_with_timeout 本来就会把它转发给 Trader.decide(),见
     # main.py:344 —— 这里只是从 ignite.py 侧按分支复用同一个已有机制,不需要
-    # 改 main.py 的接口)。分支名遵循 LOCKED 区"evo/YYYYMMDD-简述"命名约定,
-    # 一旦注册永不重用(见 evolution_orchestrator.register_branch
-    # docstring),日期写死在这里是有意的——它是这一批分支被创建的日期,不是
-    # "今天"的意思,不应该随进程重启的当天日期变化。5个分支需要
-    # config.yaml的evolution.max_concurrent_branches同步从3提到5,否则
-    # register_branch()会在第4个分支开始静默返回False(LOCKED区强制的
-    # 并发上限,agent代码无法绕过)。
-    EVO_BRANCH_TACTICS = {
+    # 改 main.py 的接口)。分支名遵循 LOCKED 区"evo/YYYYMMDD-简述"命名约定。
+    # 名册现在持久化在 state/tactic_tournament_roster.json(见
+    # load_tournament_roster),不再是这里的固定字典——锦标赛判定PROMOTE/
+    # FAIL后会把对应分支标记为非active、腾出名额,由签入的agent(我)之后
+    # 设计新战术填补空缺,详见下面主循环里"战术锦标赛"那一段。这里只是
+    # 提供"如果名册文件还不存在,首次建档用什么初始战术"的默认值。
+    _DEFAULT_EVO_TACTICS = {
         "evo/20260714-aggressive": (
             "进取战术:在假设置信度足够(至少两条独立假设互相印证,或有真实"
             "价格/资金费率数据强支撑)时,愿意用更高杠杆、更集中的仓位捕捉"
@@ -465,8 +626,16 @@ def main() -> None:
             "为后续Reflector反思和棘轮判定提供更丰富的样本。"
         ),
     }
+    tournament_roster = load_tournament_roster(clock.now_ms(), _DEFAULT_EVO_TACTICS)
     evo_simulators: dict[str, Simulator] = {}
-    for evo_branch, _tactics in EVO_BRANCH_TACTICS.items():
+
+    def _ensure_evo_simulator(evo_branch: str) -> Simulator:
+        """按需为名册里的分支(不论active/promoted/failed)构造/复用一个
+        Simulator——promoted/failed分支也需要能读回它们的历史持仓(比如生成
+        强制平仓决策、或面板上还能看到它们最后的仓位状态),不是构造完就
+        不再关心了。"""
+        if evo_branch in evo_simulators:
+            return evo_simulators[evo_branch]
         if evolution_orchestrator.branch_meta(evo_branch) is None:
             registered = evolution_orchestrator.register_branch(evo_branch, _utc_date_str(clock.now_ms()))
             print(f"注册候选分支: {evo_branch} (registered={registered})", flush=True)
@@ -479,6 +648,10 @@ def main() -> None:
         )
         evo_simulators[evo_branch] = evo_sim
         scheduler.simulators[evo_branch] = evo_sim
+        return evo_sim
+
+    for evo_branch in tournament_roster:
+        _ensure_evo_simulator(evo_branch)
 
     reflection_interval_ms = int((24 * 3_600_000) // max(1, int(config["cycle"]["reflection_per_day"])))
     ratchet_interval_ms = int(float(config["cycle"]["ratchet_interval_hours"]) * 3_600_000)
@@ -492,7 +665,12 @@ def main() -> None:
     while True:
         now = clock.now_ms()
         try:
-            scheduler.program_tactics = None  # main 分支不带任何战术偏置,重置掉上一轮evo循环可能残留的值
+            # main 分支的战术偏置默认是None(无偏置),但战术锦标赛一旦判定
+            # 某个evo分支PROMOTE,这里会改成从state/main_program_tactics.json
+            # 读回的赢家战术文字——每次循环都重新读一次文件(而不是缓存在
+            # 内存变量里),这样锦标赛在本轮循环后面判定出PROMOTE时,下一轮
+            # main决策就能立刻用上,不需要重启进程。
+            scheduler.program_tactics = load_main_tactics()
             result = scheduler.run_decision_cycle("main")
             if result["status"] == "decided":
                 print(f"[{now}] 决策周期完成: {[d.action for d in result['decisions']]}", flush=True)
@@ -501,11 +679,19 @@ def main() -> None:
 
         # 多分支并行:每个 evo 候选分支各自走一遍完整的 Trader/LLM 签入决策
         # 周期,战术差异通过临时切换 scheduler.program_tactics 实现(见上面
-        # EVO_BRANCH_TACTICS 定义处的说明)。循环结束后不需要额外重置——
-        # 下一轮 while 顶部 main 分支调用前已经会重置一次。
-        for evo_branch, evo_tactics in EVO_BRANCH_TACTICS.items():
+        # _DEFAULT_EVO_TACTICS 定义处的说明)。每轮循环都重新从磁盘加载名册
+        # (而不是只在main()启动时读一次),这样我(签入agent)在名册文件里
+        # 添加一个新战术、或战术锦标赛把某个分支标记为非active之后,不需要
+        # 重启ignite.py进程就能生效——只处理status=='active'的分支,循环
+        # 结束后不需要额外重置program_tactics,下一轮while顶部main分支调用
+        # 前已经会重新读一次。
+        tournament_roster = load_tournament_roster(now, _DEFAULT_EVO_TACTICS)
+        for evo_branch, meta in tournament_roster.items():
+            if meta.get("status") != "active":
+                continue
+            _ensure_evo_simulator(evo_branch)
             try:
-                scheduler.program_tactics = evo_tactics
+                scheduler.program_tactics = meta["tactics"]
                 evo_result = scheduler.run_decision_cycle(evo_branch)
                 if evo_result["status"] == "decided":
                     print(f"[{now}] [{evo_branch}] 决策周期完成: {[d.action for d in evo_result['decisions']]}", flush=True)
@@ -674,22 +860,19 @@ def main() -> None:
             schedule_state["last_daily_mark_date"] = today
             save_schedule_state(schedule_state)
 
-        # 棘轮判定(EvolutionOrchestrator):每 ratchet_interval_hours 小时一次
-        # (用户2026-07-14要求从3天收紧到2小时)。main的NAV仍然只读nav.tsv这份
-        # 日粒度权威历史(LOCKED评分逻辑没变);evo候选分支的NAV来自
-        # read_evo_branch_daily_nav_series()——按方案2从小时级nav_intraday_
-        # branches.jsonl聚合出的日粒度序列,不是nav.tsv的一部分。
+        # 棘轮判定(EvolutionOrchestrator,LOCKED官方评分):每 ratchet_interval_
+        # hours 小时一次(用户2026-07-14要求从3天收紧到2小时)。故意只喂main
+        # 自己的nav.tsv历史,不再把evo分支塞进来——见下面"战术锦标赛"那段
+        # 的说明,evo分支现在完全由一套独立的、不会"一次性裁决后永久退场"的
+        # 机制来评估,不适合LOCKED这套judge()语义。
         last_ratchet_ts = schedule_state.get("last_ratchet_ts")
         if last_ratchet_ts is None or now - last_ratchet_ts >= ratchet_interval_ms:
             try:
                 nav_series = read_nav_tsv_series()
-                evo_nav_series = read_evo_branch_daily_nav_series()
-                branch_navs = {"main": nav_series["main"]}
-                branch_navs.update({b: s for b, s in evo_nav_series.items() if b in EVO_BRANCH_TACTICS})
                 if len(nav_series["main"]) >= 2:
                     verdicts = scheduler.run_ratchet_judgment(
                         now_date=today,
-                        branch_navs=branch_navs,
+                        branch_navs={"main": nav_series["main"]},
                         benchmark_navs=nav_series["benchmark"],
                     )
                     print(f"[{now}] 棘轮判定完成: {len(verdicts)} 条候选分支裁决", flush=True)
@@ -698,6 +881,79 @@ def main() -> None:
             except Exception:  # noqa: BLE001
                 print(f"[{now}] run_ratchet_judgment 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
             schedule_state["last_ratchet_ts"] = now
+            save_schedule_state(schedule_state)
+
+        # 战术锦标赛(用户2026-07-14要求"自动进化+晋升赢家"):复用同一个
+        # ratchet_interval_ms节拍,评估每个active分支相对main的小时级净值
+        # 表现。与上面的官方棘轮判定完全独立、互不干扰——见
+        # evaluate_tactic_tournament()的docstring对两者语义差异的说明。
+        last_tournament_ms = schedule_state.get("last_tournament_ms")
+        if last_tournament_ms is None or now - last_tournament_ms >= ratchet_interval_ms:
+            try:
+                tournament_cfg = config.get("tactic_tournament", {}) or {}
+                roster = load_tournament_roster(now, _DEFAULT_EVO_TACTICS)
+                events = evaluate_tactic_tournament(roster, now, tournament_cfg)
+                open_slots: list[str] = []
+                for ev in events:
+                    branch = ev["branch"]
+                    log_writer.append_jsonl("tactic_promotions.jsonl", {**ev, "ts": now}, root=LOG_ROOT)
+                    print(
+                        f"[{now}] 战术锦标赛裁决: {branch} -> {ev['decision']} "
+                        f"(edge={ev['edge_vs_main_pct']:.2f}%, drawdown={ev['max_drawdown_pct']:.2f}%)",
+                        flush=True,
+                    )
+                    roster[branch]["status"] = ev["decision"].lower()  # "promoted" / "failed"
+                    roster[branch]["resolved_ms"] = now
+
+                    if ev["decision"] == "PROMOTE":
+                        winning_tactics = roster[branch]["tactics"]
+                        save_main_tactics(winning_tactics, branch, now)
+                        print(f"[{now}] main分支战术已更新为 {branch} 的战术(立即生效,不需要重启)", flush=True)
+                    elif ev["decision"] == "FAIL":
+                        # 确定性强制平仓,不经过Trader/子代理判断——这是锦标赛
+                        # 淘汰机制本身的动作,与main.py.run_risk_check_cycle
+                        # (LOCKED区确定性风控哨兵)同一种"不等agent推理"的设计
+                        # 理念,但这里的裁决逻辑是本脚本自己的锦标赛规则,不是
+                        # LOCKED区代码。
+                        failed_sim = evo_simulators.get(branch)
+                        if failed_sim is not None:
+                            for symbol, pos in list(failed_sim.positions.items()):
+                                close_decision = main_module.Decision(
+                                    ts=now, symbol=symbol, action="close", target_notional_pct=0.0,
+                                    leverage=pos.leverage,
+                                    thesis=(
+                                        f"战术锦标赛判定失败(分支自身净值回撤 {ev['max_drawdown_pct']:.2f}% "
+                                        f"超过fail_drawdown_pct阈值),强制平仓退场,不是Trader/子代理的主观判断。"
+                                    ),
+                                    falsifier="本决策为锦标赛淘汰机制触发,不设新的可证伪主张。",
+                                    horizon="0h", branch=branch,
+                                )
+                                failed_sim.log_decision(close_decision)
+                                next_bar = next_bar_provider(symbol, now)
+                                failed_sim.execute(close_decision, next_bar)
+                                print(f"[{now}] [{branch}] 锦标赛淘汰强制平仓: {symbol}", flush=True)
+
+                    open_slots.append(branch)
+
+                if events:
+                    save_tournament_roster(roster)
+                    NEW_TACTIC_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    NEW_TACTIC_REQUEST_PATH.write_text(
+                        json.dumps({
+                            "ts": now,
+                            "open_slots": open_slots,
+                            "roster_status": {b: m.get("status") for b, m in roster.items()},
+                        }, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(
+                        f"[{now}] 战术锦标赛出现 {len(open_slots)} 个空缺名额,已写"
+                        f"state/new_tactic_request.json,等待签入agent设计新战术",
+                        flush=True,
+                    )
+            except Exception:  # noqa: BLE001
+                print(f"[{now}] evaluate_tactic_tournament 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+            schedule_state["last_tournament_ms"] = now
             save_schedule_state(schedule_state)
 
         write_heartbeat(clock, {"status": "running"})
