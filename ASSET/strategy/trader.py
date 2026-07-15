@@ -318,6 +318,15 @@ class Trader:
             "position worth 15% of account value, NOT a 0-1 fraction. Open/adjust decisions "
             "below 5.0 (i.e. under 5% of NAV) are rejected as economically meaningless. "
             "Size positions to match conviction: capital that sits idle earns nothing. "
+            # 2026-07-15反做多偏见(真实观察:LAB 24h内-26%,6个分支全员做多它,
+            # 连"顺势"人设的momentum分支都在逆势抄底——LLM把"大波动"本能地
+            # 读成"买入机会"是已知系统性偏差,必须在prompt层显式对冲)。
+            "DIRECTION IS SYMMETRIC: this is a perpetual futures account -- open_short "
+            "profits from declines exactly as open_long profits from rises. LLM traders "
+            "have a documented long-only bias: check yourself. For a symbol in a clear "
+            "recent downtrend, the with-trend position is open_short; going LONG into a "
+            "steep recent decline is a counter-trend knife-catch and must be explicitly "
+            "justified as a mean-reversion thesis with a tight falsifier, never a default. "
             "For every decision whose action is NOT \"hold\", you MUST also include "
             "falsifier_condition: a machine-readable price clause in the exact format "
             "'price<NUMBER', 'price<=NUMBER', 'price>NUMBER', or 'price>=NUMBER' "
