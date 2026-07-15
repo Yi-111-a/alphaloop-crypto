@@ -98,6 +98,12 @@
     <div class="panel full">
       <h2>各分支持仓(点选分支切换)</h2>
       <div class="nav-granularity" id="branchSelector"></div>
+      <div class="metric-row">
+        <div class="metric">
+          <div class="label">总盈亏(已实现+未实现,对比初始资金)</div>
+          <div class="value" id="totalPnl">--</div>
+        </div>
+      </div>
       <div id="positionsTableWrap">
         <table id="positionsTable">
           <thead><tr><th>币种</th><th>方向</th><th>杠杆</th><th>名义额</th><th>开仓价</th><th>标记价</th><th>未实现盈亏</th></tr></thead>
@@ -105,6 +111,17 @@
         </table>
       </div>
       <div id="positionsEmpty" class="empty" style="display:none;">等待系统启动 —— 尚无持仓数据</div>
+    </div>
+
+    <div class="panel full">
+      <h2>成交记录(当前分支,最近50笔)</h2>
+      <div id="tradesTableWrap">
+        <table id="tradesTable">
+          <thead><tr><th>时间</th><th>币种</th><th>方向</th><th>操作</th><th>杠杆</th><th>名义额</th><th>成交价</th><th>手续费</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="tradesEmpty" class="empty" style="display:none;">等待系统启动 —— 尚无成交记录</div>
     </div>
 
     <div class="panel">
@@ -280,6 +297,16 @@ async function refreshPositions() {
   const tbody = document.querySelector("#positionsTable tbody");
   const emptyEl = document.getElementById("positionsEmpty");
   const wrapEl = document.getElementById("positionsTableWrap");
+  const totalPnlEl = document.getElementById("totalPnl");
+
+  if (data.total_pnl !== null && data.total_pnl !== undefined) {
+    const cls = data.total_pnl >= 0 ? "pnl-pos" : "pnl-neg";
+    const sign = data.total_pnl >= 0 ? "+" : "";
+    totalPnlEl.innerHTML = `<span class="${cls}">${sign}${fmt(data.total_pnl)} USDT</span>`;
+  } else {
+    totalPnlEl.textContent = "--";
+  }
+
   tbody.innerHTML = "";
   if (!data.has_data || !data.positions || data.positions.length === 0) {
     emptyEl.style.display = "block";
@@ -309,6 +336,28 @@ async function refreshPositions() {
   }
 }
 
+async function refreshTrades() {
+  const data = await fetchJSON("/api/trades?branch=" + encodeURIComponent(selectedBranch) + "&limit=50");
+  const tbody = document.querySelector("#tradesTable tbody");
+  const emptyEl = document.getElementById("tradesEmpty");
+  const wrapEl = document.getElementById("tradesTableWrap");
+  tbody.innerHTML = "";
+  if (!data.has_data || !data.trades || data.trades.length === 0) {
+    emptyEl.style.display = "block";
+    wrapEl.style.display = "none";
+    return;
+  }
+  emptyEl.style.display = "none";
+  wrapEl.style.display = "block";
+  for (const t of data.trades) {
+    const tr = document.createElement("tr");
+    const timeStr = t.ts ? new Date(t.ts).toLocaleString() : "--";
+    tr.innerHTML = `<td>${timeStr}</td><td>${t.symbol}</td><td>${t.side}</td><td>${t.action}</td>` +
+      `<td>${t.leverage}x</td><td>${fmt(t.notional)}</td><td>${fmt(t.price)}</td><td>${fmt(t.fee)}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
 async function refreshAdvice() {
   const data = await fetchJSON("/api/latest_advice");
   const box = document.getElementById("adviceBox");
@@ -316,8 +365,9 @@ async function refreshAdvice() {
 }
 
 async function refreshCosts() {
-  const funding = await fetchJSON("/api/funding_summary");
-  const fees = await fetchJSON("/api/fees_summary");
+  const branchParam = "?branch=" + encodeURIComponent(selectedBranch);
+  const funding = await fetchJSON("/api/funding_summary" + branchParam);
+  const fees = await fetchJSON("/api/fees_summary" + branchParam);
   document.getElementById("fundingTotal").textContent = funding.has_data ? fmt(funding.total_amount) + " USDT" : "--";
   document.getElementById("feesTotal").textContent = fees.has_data ? fmt(fees.total_fee) + " USDT" : "--";
 }
@@ -364,7 +414,7 @@ async function refreshAll() {
   try {
     await Promise.all([
       refreshStatus(), refreshNav(), refreshBranchSelector(), refreshPositions(),
-      refreshAdvice(), refreshCosts(), refreshRatchet(), refreshHealth(),
+      refreshTrades(), refreshAdvice(), refreshCosts(), refreshRatchet(), refreshHealth(),
     ]);
   } catch (e) {
     console.error("refresh failed", e);
@@ -385,6 +435,8 @@ document.getElementById("branchSelector").addEventListener("click", (e) => {
   selectedBranch = btn.dataset.branch;
   for (const b of document.querySelectorAll("#branchSelector .gran-btn")) b.classList.toggle("active", b === btn);
   refreshPositions();
+  refreshTrades();
+  refreshCosts();
 });
 
 refreshAll();

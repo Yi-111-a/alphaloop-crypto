@@ -379,3 +379,76 @@ def test_no_wallclock_calls_anywhere_in_engine_source():
                 offenders.append(f"call .{func.attr}(...) (line {node.lineno})")
 
     assert offenders == [], f"forbidden wall-clock references found in engine.py: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# 分支记忆隔离(2026-07-15,24h无人值守多分支并行进化的隔离要求):
+# L2/L3带branch标签=分支私有经验;branch=None=共享记忆(genesis/研究发现)。
+# ---------------------------------------------------------------------------
+
+
+def test_branch_scoped_retrieve_sees_shared_plus_own_only(tmp_path):
+    store = _make_store(tmp_path)
+    ts = 1_700_000_000_000
+    store.write(content="shared market fact about btc", ts=ts, layer="L1")
+    store.write(content="liangxi private lesson about btc", ts=ts, layer="L3", branch="evo/liangxi")
+    store.write(content="conservative private lesson about btc", ts=ts, layer="L3", branch="evo/conservative")
+
+    results = store.retrieve("btc", query_ts=ts, top_k=10, branch="evo/liangxi")
+    contents = [r.content for r, _ in results]
+    assert "shared market fact about btc" in contents
+    assert "liangxi private lesson about btc" in contents
+    assert "conservative private lesson about btc" not in contents
+
+
+def test_unscoped_retrieve_remains_backward_compatible_sees_all(tmp_path):
+    store = _make_store(tmp_path)
+    ts = 1_700_000_000_000
+    store.write(content="shared fact btc", ts=ts, layer="L1")
+    store.write(content="branch tagged btc lesson", ts=ts, layer="L3", branch="evo/x")
+
+    results = store.retrieve("btc", query_ts=ts, top_k=10)
+    contents = [r.content for r, _ in results]
+    assert "shared fact btc" in contents
+    assert "branch tagged btc lesson" in contents
+
+
+def test_get_latest_with_branch_only_returns_own_branch(tmp_path):
+    store = _make_store(tmp_path)
+    store.write(content="main summary", ts=1000, layer="L2", branch="main")
+    store.write(content="liangxi summary newer", ts=2000, layer="L2", branch="evo/liangxi")
+
+    latest_main = store.get_latest(layer="L2", before_ts=3000, branch="main")
+    assert latest_main is not None and latest_main.content == "main summary"
+
+    latest_liangxi = store.get_latest(layer="L2", before_ts=3000, branch="evo/liangxi")
+    assert latest_liangxi is not None and latest_liangxi.content == "liangxi summary newer"
+
+    assert store.get_latest(layer="L2", before_ts=3000, branch="evo/nonexistent") is None
+
+
+def test_existing_db_without_branch_column_migrates_in_place(tmp_path):
+    import sqlite3 as _sqlite3
+
+    db_path = tmp_path / "old_schema.db"
+    conn = _sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE memory_records (id TEXT PRIMARY KEY, ts INTEGER NOT NULL, "
+        "layer TEXT NOT NULL, content TEXT NOT NULL, importance REAL NOT NULL DEFAULT 1.0, "
+        "embedding TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO memory_records (id, ts, layer, content, importance, embedding) "
+        "VALUES ('old1', 500, 'L1', 'legacy shared record', 1.0, NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = _make_store(tmp_path, name="old_schema.db")
+    # 旧记录branch为NULL,应被任何分支视为共享记忆检索到
+    results = store.retrieve("legacy shared record", query_ts=1000, top_k=5, branch="evo/any")
+    assert any(r.content == "legacy shared record" for r, _ in results)
+    # 新写入带branch也应正常工作
+    store.write(content="new branch record", ts=600, layer="L3", branch="evo/any")
+    latest = store.get_latest(layer="L3", branch="evo/any")
+    assert latest is not None and latest.content == "new branch record"

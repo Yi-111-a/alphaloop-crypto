@@ -593,6 +593,7 @@ def test_reflector_failure_is_logged_skipped_and_next_cycle_succeeds(tmp_path, l
         simulators={"main": _make_sim(tmp_path, log_root, "main")},
         trader=FakeTrader(),
         reflector=reflector,
+        memory_store=memory_store,
         log_root=log_root,
         price_lookup=lambda symbol, ts: 50_000.0,
     )
@@ -600,6 +601,7 @@ def test_reflector_failure_is_logged_skipped_and_next_cycle_succeeds(tmp_path, l
     result1 = scheduler.run_reflection_cycle("main")
     assert result1 is None  # 本轮跳过,不崩溃
     assert llm.call_count == 1
+    assert scheduler.last_reflection_summary is None  # 本轮失败,不应该被污染
 
     events = log_writer.read_jsonl("scheduler_errors.jsonl", root=log_root)
     failures = [e for e in events if e.get("event") == "reflector_failure"]
@@ -610,6 +612,10 @@ def test_reflector_failure_is_logged_skipped_and_next_cycle_succeeds(tmp_path, l
     result2 = scheduler.run_reflection_cycle("main")
     assert result2 is not None
     assert llm.call_count == 2
+    # 反思摘要不是靠 reflect() 的返回值传出来的(那是 ThesisMark 列表)，
+    # 而是 reflect() 内部写进 memory_store 的 L2 记录，调度器读回来喂给
+    # 下一次 Trader.decide() 的"最近一次反思摘要"字段。
+    assert scheduler.last_reflection_summary == "经验摘要:模拟已恢复正常"
 
 
 def test_researcher_daily_research_failure_is_logged_skipped_and_next_cycle_succeeds(tmp_path, log_root):

@@ -310,10 +310,20 @@ class Reflector:
             if not isinstance(summary, str):
                 summary = str(summary)
             summary = summary[:_MAX_SUMMARY_CHARS]
-            self.memory_store.write(content=summary, ts=now_ts, layer="L2", importance=1.0)
+            # branch标签(2026-07-15,用户对多分支并行进化的隔离要求):反思
+            # 摘要/教训是该分支自己的主观经验,写入时打上分支标签,检索侧
+            # (ASSET/memory/engine.py)保证其他分支看不到——注意用duck-type
+            # 兼容旧的memory_store实现(测试里的Fake可能没有branch参数)。
+            try:
+                self.memory_store.write(content=summary, ts=now_ts, layer="L2", importance=1.0, branch=branch)
+            except TypeError:
+                self.memory_store.write(content=summary, ts=now_ts, layer="L2", importance=1.0)
 
         for decision, reason in falsified:
             lesson = self._build_l3_lesson_content(decision, reason)
-            self.memory_store.write(content=lesson, ts=now_ts, layer="L3", importance=1.0)
+            try:
+                self.memory_store.write(content=lesson, ts=now_ts, layer="L3", importance=1.0, branch=branch)
+            except TypeError:
+                self.memory_store.write(content=lesson, ts=now_ts, layer="L3", importance=1.0)
 
         return marks

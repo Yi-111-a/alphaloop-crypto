@@ -391,6 +391,97 @@ class TestValidationMirrorsSimulator:
 
 
 # ---------------------------------------------------------------------------
+# 5b. 语义级校验(2026-07-14新增):不只是"类型对不对",而是"这个值在这个
+# 业务场景下讲不讲得通"——都是本session里签入agent反复手动拦下过的真实
+# 错误类别,把人工审查的判断标准搬进自动重试校验里。
+# ---------------------------------------------------------------------------
+
+
+class TestSemanticValidationCatchesRealErrorClasses:
+    def test_shortened_symbol_not_in_snapshot_is_rejected_and_retried(self):
+        memory_store = FakeMemoryStore()
+        bad = valid_response_json(overrides={"symbol": "BTC"})  # 截断写法,不是"BTC/USDT:USDT"
+        good = valid_response_json()  # 第二次改用完整交易对
+        llm_client = make_llm_sequence([bad, good])
+        trader = Trader(llm_client=llm_client, memory_store=memory_store, max_retries=3)
+
+        decisions = trader.decide(
+            ts=1_700_000_000_000,
+            positions=[],
+            latest_snapshot={"BTC/USDT:USDT": {"last": 50_000.0}},
+            memory_query_text="q",
+        )
+        assert llm_client.calls["count"] == 2  # 第一次真的被拒绝、触发了重试
+        assert decisions[0].symbol == "BTC/USDT:USDT"
+
+    def test_symbol_outside_this_cycle_universe_is_rejected(self):
+        memory_store = FakeMemoryStore()
+        bad = valid_response_json(overrides={"symbol": "DOGE/USDT:USDT"})
+        good = valid_response_json()
+        llm_client = make_llm_sequence([bad, good])
+        trader = Trader(llm_client=llm_client, memory_store=memory_store, max_retries=3)
+
+        decisions = trader.decide(
+            ts=1_700_000_000_000,
+            positions=[],
+            # 本轮快照只覆盖 BTC,不覆盖 DOGE——即使 DOGE/USDT:USDT 格式完全
+            # 合法,也应该被拒绝,因为它不在"这一刻真实可交易"的集合里。
+            latest_snapshot={"BTC/USDT:USDT": {"last": 50_000.0}},
+            memory_query_text="q",
+        )
+        assert llm_client.calls["count"] == 2
+        assert decisions[0].symbol == "BTC/USDT:USDT"
+
+    def test_symbol_check_skipped_when_snapshot_empty(self):
+        """行情快照为空(比如数据源暂时拉不到)时不该把这个新校验变成
+        "全部拒绝"——应该退化为跳过symbol语义检查,只做类型/范围校验。"""
+        memory_store = FakeMemoryStore()
+        llm_client = make_llm_sequence([valid_response_json()])
+        trader = Trader(llm_client=llm_client, memory_store=memory_store)
+
+        decisions = trader.decide(
+            ts=1_700_000_000_000,
+            positions=[],
+            latest_snapshot={},
+            memory_query_text="q",
+        )
+        assert llm_client.calls["count"] == 1
+        assert decisions[0].symbol == "BTC/USDT:USDT"
+
+    def test_negative_target_notional_pct_is_rejected_and_retried(self):
+        memory_store = FakeMemoryStore()
+        bad = valid_response_json(overrides={"target_notional_pct": -16.0})
+        good = valid_response_json()
+        llm_client = make_llm_sequence([bad, good])
+        trader = Trader(llm_client=llm_client, memory_store=memory_store, max_retries=3)
+
+        decisions = trader.decide(
+            ts=1_700_000_000_000,
+            positions=[],
+            latest_snapshot={},
+            memory_query_text="q",
+        )
+        assert llm_client.calls["count"] == 2
+        assert decisions[0].target_notional_pct >= 0
+
+    def test_target_notional_pct_over_100_is_rejected(self):
+        memory_store = FakeMemoryStore()
+        bad = valid_response_json(overrides={"target_notional_pct": 500.0})
+        good = valid_response_json()
+        llm_client = make_llm_sequence([bad, good])
+        trader = Trader(llm_client=llm_client, memory_store=memory_store, max_retries=3)
+
+        decisions = trader.decide(
+            ts=1_700_000_000_000,
+            positions=[],
+            latest_snapshot={},
+            memory_query_text="q",
+        )
+        assert llm_client.calls["count"] == 2
+        assert decisions[0].target_notional_pct <= 100
+
+
+# ---------------------------------------------------------------------------
 # 6. references_hypothesis()
 # ---------------------------------------------------------------------------
 

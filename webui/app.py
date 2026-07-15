@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import yaml
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -49,6 +50,24 @@ MAIN_BRANCH = "main"
 DECISION_INTERVAL_MS = 4 * 3_600_000  # 与 config.yaml 的 cycle.decision_interval_hours 默认值一致
 SETTLE_INTERVAL_MS = 8 * 3_600_000  # 与 config.yaml 的 funding.settle_hours_utc 默认间隔一致
 STALE_MULTIPLE = 2.5  # 超过 STALE_MULTIPLE 倍的正常间隔没有新记录 -> 判红灯
+
+
+def _read_initial_capital_usdt() -> float:
+    """直接读 config.yaml 的顶层 capital_usdt——这是个静态配置常量,不是业务
+    模块,读它不违反本文件"不 import LOCKED/ASSET"的规矩。用于把已经算好的
+    NAV(见 _read_nav_intraday*)换算成"总盈亏"时做减法,这个减法本身不是
+    重新推导财务公式,只是拿两个已经落盘的/静态的数字做一次算术。"""
+    config_path = PROJECT_ROOT / "config.yaml"
+    if not config_path.exists():
+        return 100_000.0
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError:
+        return 100_000.0
+    return float((data or {}).get("capital_usdt", 100_000.0))
+
+
+INITIAL_CAPITAL_USDT = _read_initial_capital_usdt()
 
 
 def _now_ms() -> int:
@@ -207,6 +226,37 @@ def _read_positions_marked(branch: str) -> dict[str, dict]:
     return {p["symbol"]: p for p in data.get("positions", []) if "symbol" in p}
 
 
+def _read_latest_nav_for_branch(branch: str) -> Optional[float]:
+    """取某个分支最近一条已落盘的 NAV(总账户价值 = wallet_balance + Σ未实现
+    盈亏,由 LOCKED.simulator.Simulator.get_portfolio() 算好、由 ignite.py
+    落盘),不重新计算——main分支读 nav_intraday.jsonl 的 nav_agent 字段,
+    其余分支读 nav_intraday_branches.jsonl 里对应 branch 的 nav 字段,两份
+    文件都只取最后一条("取最后一条"是本文件docstring里明确允许的读取方式,
+    不是重新推导)。"""
+    if branch == MAIN_BRANCH:
+        records = _read_jsonl("nav_intraday.jsonl")
+        for record in reversed(records):
+            if isinstance(record.get("nav_agent"), (int, float)):
+                return float(record["nav_agent"])
+        return None
+    records = _read_jsonl("nav_intraday_branches.jsonl")
+    for record in reversed(records):
+        if record.get("branch") == branch and isinstance(record.get("nav"), (int, float)):
+            return float(record["nav"])
+    return None
+
+
+def _read_trades(branch: str, limit: int) -> list[dict]:
+    """LOG/trades.jsonl 是 LOCKED.simulator.Simulator.execute() 每笔真实成交
+    都会追加的记录(见该文件模块docstring),按 branch 过滤、按 ts 降序取最近
+    limit 条——原样读回,不做任何盈亏再计算(单笔成交的已实现盈亏不在 Trade
+    记录本身里,这是 LOCKED.schemas.Trade 的既有字段形状,面板不去凭 entry
+    price 反推,避免和 LOCKED 区的真实结算逻辑出现第二份、可能不一致的实现)。"""
+    records = [r for r in _read_jsonl("trades.jsonl") if r.get("branch", MAIN_BRANCH) == branch]
+    records.sort(key=lambda r: r.get("ts", 0), reverse=True)
+    return records[:limit]
+
+
 def _read_cold_start_state() -> Optional[str]:
     data = _read_json_state_file(STATE_ROOT / "cold_start_state.json")
     if data is None:
@@ -329,13 +379,24 @@ def api_branches() -> dict:
 def api_positions(branch: str = MAIN_BRANCH) -> dict:
     portfolio = _read_portfolio_db(branch)
     if portfolio is None:
-        return {"has_data": False, "branch": branch, "positions": [], "wallet_balance": None, "branch_dead": None}
+        return {
+            "has_data": False, "branch": branch, "positions": [], "wallet_balance": None,
+            "branch_dead": None, "total_pnl": None, "nav": None,
+        }
     marks = _read_positions_marked(branch)
     for p in portfolio["positions"]:
         mark = marks.get(p["symbol"])
         p["mark_price"] = mark["mark_price"] if mark else None
         p["unrealized_pnl"] = mark["unrealized_pnl"] if mark else None
-    return {"has_data": True, **portfolio}
+    nav = _read_latest_nav_for_branch(branch)
+    total_pnl = (nav - INITIAL_CAPITAL_USDT) if nav is not None else None
+    return {"has_data": True, "nav": nav, "total_pnl": total_pnl, **portfolio}
+
+
+@app.get("/api/trades")
+def api_trades(branch: str = MAIN_BRANCH, limit: int = 50) -> dict:
+    trades = _read_trades(branch, limit)
+    return {"has_data": bool(trades), "branch": branch, "trades": trades}
 
 
 @app.get("/api/latest_advice")

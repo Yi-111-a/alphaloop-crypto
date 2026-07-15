@@ -195,10 +195,18 @@ class MemoryStore:
                 layer TEXT NOT NULL,
                 content TEXT NOT NULL,
                 importance REAL NOT NULL DEFAULT 1.0,
-                embedding TEXT
+                embedding TEXT,
+                branch TEXT
             )
             """
         )
+        # 已存在的旧库(2026-07-15之前建的,没有branch列)做一次原位迁移——
+        # ALTER TABLE ADD COLUMN 对已有行填NULL,语义正好是"历史记录全部视为
+        # 共享记忆",不需要数据搬迁。
+        try:
+            self._conn.execute("ALTER TABLE memory_records ADD COLUMN branch TEXT")
+        except sqlite3.OperationalError:
+            pass  # 列已存在(新建库或已迁移过)
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_ts ON memory_records(ts)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_layer ON memory_records(layer)")
         self._conn.commit()
@@ -222,16 +230,22 @@ class MemoryStore:
         ts: int,
         layer: MemoryLayer,
         importance: float = 1.0,
+        branch: "Optional[str]" = None,
     ) -> MemoryRecord:
+        """branch=None 表示共享记忆(genesis假设、每小时研究发现这类客观市场
+        知识,所有分支都能检索到);branch='evo/xxx' 表示该分支的私有经验
+        (反思摘要L2、教训L3),只有它自己能检索到——用户2026-07-15对24h
+        无人值守多分支并行进化的明确要求:各分支的进化路线互相隔离,不许
+        一个分支的主观经验污染另一个分支的决策上下文。"""
         if layer not in MEMORY_TIME_CONSTANT_DAYS:
             raise ValueError(f"unknown memory layer: {layer!r}, expected one of {sorted(MEMORY_TIME_CONSTANT_DAYS)}")
 
         record_id = uuid.uuid4().hex
         embedding = self.embedder(content)
         self._conn.execute(
-            "INSERT INTO memory_records (id, ts, layer, content, importance, embedding) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (record_id, ts, layer, content, importance, json.dumps(embedding)),
+            "INSERT INTO memory_records (id, ts, layer, content, importance, embedding, branch) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (record_id, ts, layer, content, importance, json.dumps(embedding), branch),
         )
         self._conn.commit()
         return MemoryRecord(
@@ -296,12 +310,37 @@ class MemoryStore:
             embedding=embedding,
         )
 
+    def get_latest(
+        self, layer: str, before_ts: Optional[int] = None, branch: Optional[str] = None
+    ) -> Optional[MemoryRecord]:
+        """按 ts(同 ts 按插入顺序)返回指定 layer 最近写入的一条记录，没有则 None。
+
+        与 retrieve() 的语义打分检索不同：这里不做 embedding/相关度计算，只是
+        单纯"最近写了什么"，用于 Trader prompt 第4项"最近一次反思摘要"这种
+        不需要语义相关度、只需要时间最近的场景。
+        """
+        sql = "SELECT * FROM memory_records WHERE layer = ?"
+        params: list = [layer]
+        if before_ts is not None:
+            sql += " AND ts <= ?"
+            params.append(before_ts)
+        if branch is not None:
+            # 反思摘要是分支私有经验(见write()的branch说明),只取自己的。
+            sql += " AND branch = ?"
+            params.append(branch)
+        sql += " ORDER BY ts DESC, rowid DESC LIMIT 1"
+        row = self._conn.execute(sql, params).fetchone()
+        if row is None:
+            return None
+        return self._row_to_record(row)
+
     def retrieve(
         self,
         query: str,
         query_ts: int,
         top_k: int = 5,
         layers: Optional[list[str]] = None,
+        branch: Optional[str] = None,
     ) -> list[tuple[MemoryRecord, float]]:
         """检索 top_k 条记忆，按 §3.4 公式打分降序返回。
 
@@ -320,6 +359,13 @@ class MemoryStore:
             placeholders = ",".join("?" for _ in layers)
             sql += f" AND layer IN ({placeholders})"
             params.extend(layers)
+        if branch is not None:
+            # 分支隔离(2026-07-15):调用方声明了自己是哪个分支时,只能看到
+            # 共享记忆(branch IS NULL,如genesis/研究发现)+自己分支的私有
+            # 经验,绝不返回其他分支打了标签的记录。branch=None(不声明)时
+            # 保持全量可见,兼容旧调用方/测试。
+            sql += " AND (branch IS NULL OR branch = ?)"
+            params.append(branch)
 
         rows = self._conn.execute(sql, params).fetchall()
 

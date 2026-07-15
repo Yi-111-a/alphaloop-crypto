@@ -1,5 +1,15 @@
 capital_usdt: 100000
 mode: perp                     # USDT本位永续合约,支持双向(做多/做空)+杠杆
+llm:                           # LLM来源(2026-07-15新增,24h无人值守服务器模式)
+  mode: bridge                 # bridge=签入agent文件握手(本地开发/人工介入);
+                                # api=直连Anthropic API(服务器上改成这个)。
+                                # api模式需要环境变量 ANTHROPIC_API_KEY
+  api:
+    trader_model: claude-haiku-4-5-20251001   # 例行决策周期,量大用便宜模型
+    deep_model: claude-sonnet-5               # 反思/研究/替补战术设计,量小用强模型
+    max_daily_calls: 600       # 两档共用的每日总调用预算,超了当天剩余周期全部
+                                # 走安全降级(hold/skip),UTC零点自动恢复——防止
+                                # bug死循环烧账单的最后一道闸
 benchmark: BTC_HOLD            # 基准:期初全仓买入BTC现货持有不动(1倍,无杠杆)
 universe_rule:                 # 币池不再是固定名单,而是LOCKED区代码强制的筛选规则
   source: okx_usdt_perp        # M5 shakedown 期间由 binance_usdt_perp 改为 okx_usdt_perp:
@@ -46,8 +56,13 @@ constraints:
 cycle:                           # 用户明确要求"快速验证"改成的高频节拍(原为4h/
                                   # 2次天/3天),见 scripts/ignite.py 模块docstring
                                   # 的完整节拍说明
-  decision_interval_hours: 0.5   # 30分钟一次正式决策(原4小时)
-  reflection_per_day: 48         # 48次/天 = 每30分钟一次,与决策周期同步(原2次/天)
+  decision_interval_hours: 0.5   # 30分钟一次正式决策(原4小时)。2026-07-15起
+                                  # 所有分支(含凉兮)统一用这一个节拍,凉兮的
+                                  # 专属5分钟scheduler已按用户要求下线
+  reflection_per_day: 12         # 每2小时一轮反思(2026-07-15从48降下来:反思
+                                  # 现在覆盖main+全部active分支,一轮就是7-8次
+                                  # deep模型调用,48轮/天太贵且30分钟内几乎没有
+                                  # 新判定结果可反思,大多是重复噪声)
   research_interval_hours: 1     # 每小时一次(原本是"每个UTC自然日一次",新字段,
                                   # 之前没有独立配置项,直接硬编码在ignite.py里)
   ratchet_interval_hours: 2      # 每2小时一次(原ratchet_interval_days: 3天)。

@@ -69,6 +69,96 @@ class AgentBridgeLLMClient:
         )
 
 
+def _strip_code_fences(text: str) -> str:
+    """剥掉模型响应外层的 markdown 代码围栏(```json ... ``` / ``` ... ```)。
+
+    子代理/API模型都真实犯过"明明要求纯JSON却包了围栏"的错误(签入agent
+    人工审核时代靠手拦,无人值守后必须在客户端层统一兜住)。只剥最外层、
+    且只在整段响应确实以围栏开头结尾时才剥,不碰正文里合法出现的反引号。"""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return text
+    lines = stripped.splitlines()
+    if len(lines) < 2:
+        return text
+    # 第一行是 ``` 或 ```json 之类;找配对的结尾围栏(最后一个非空行)
+    if lines[-1].strip() != "```":
+        return text
+    return "\n".join(lines[1:-1])
+
+
+class AnthropicLLMClient:
+    """直连 Anthropic API 的 llm_client(用户2026-07-15要求,24h无人值守
+    服务器模式)。与 AgentBridgeLLMClient 完全同构:Callable[[str], str],
+    失败抛异常交给 main.py 既有的失败隔离层(Trader重试/兜底hold、
+    Researcher/Reflector的try-except-skip),自己不做业务级重试。
+
+    额外职责(桥模式不需要、无人值守必须有的):
+      - 每日调用预算熔断:state/llm_api_usage.json 记录当日调用数/税token,
+        超过 max_daily_calls 直接抛 RuntimeError,让当天剩余周期全部走安全
+        降级路径(hold/skip),第二天零点(UTC)自动恢复——防止代码bug导致
+        的死循环调用把账单烧穿。
+      - 响应围栏剥离:见 _strip_code_fences()。
+    API key 从环境变量 ANTHROPIC_API_KEY 读取,不进代码/配置文件。
+    """
+
+    def __init__(
+        self,
+        model: str,
+        max_tokens: int = 4096,
+        max_daily_calls: int = 600,
+        timeout_seconds: float = 180.0,
+        usage_path: Optional[Path] = None,
+    ):
+        import anthropic  # 延迟导入:桥模式/本地测试不需要装 anthropic SDK
+
+        self.model = model
+        self.max_tokens = max_tokens
+        self.max_daily_calls = max_daily_calls
+        self.usage_path = usage_path or (STATE_ROOT / "llm_api_usage.json")
+        self._client = anthropic.Anthropic(timeout=timeout_seconds, max_retries=2)
+        STATE_ROOT.mkdir(parents=True, exist_ok=True)
+
+    def _load_usage(self) -> dict:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        if self.usage_path.exists():
+            try:
+                usage = json.loads(self.usage_path.read_text(encoding="utf-8"))
+                if usage.get("date") == today:
+                    return usage
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {"date": today, "calls": 0, "input_tokens": 0, "output_tokens": 0}
+
+    def _save_usage(self, usage: dict) -> None:
+        self.usage_path.write_text(json.dumps(usage, ensure_ascii=False), encoding="utf-8")
+
+    def __call__(self, prompt: str) -> str:
+        usage = self._load_usage()
+        if usage["calls"] >= self.max_daily_calls:
+            raise RuntimeError(
+                f"llm_daily_budget_exhausted: {usage['calls']} calls today >= "
+                f"max_daily_calls {self.max_daily_calls}; degrading to safe fallback "
+                "until UTC midnight"
+            )
+
+        message = self._client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(
+            block.text for block in message.content if getattr(block, "type", None) == "text"
+        )
+
+        usage["calls"] += 1
+        usage["input_tokens"] += getattr(message.usage, "input_tokens", 0)
+        usage["output_tokens"] += getattr(message.usage, "output_tokens", 0)
+        self._save_usage(usage)
+
+        return _strip_code_fences(text)
+
+
 def read_pending_request() -> Optional[dict]:
     """我(Claude Code agent)签入时调用:有 pending request 就返回它的内容,
     没有就返回 None。只读,不消费/不删除——真正"回答"要调

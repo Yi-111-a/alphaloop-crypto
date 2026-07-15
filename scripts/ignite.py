@@ -51,12 +51,20 @@ run_ratchet_judgment/mark_daily_nav/run_circuit_breaker_check 都是main.py
       只是同一份代码下不同的提示词,没有代码可合并);分支自身净值从峰值
       回撤超过 tactic_tournament.fail_drawdown_pct → 强制平仓退场。两种
       情况都会把该分支从候选名册(state/tactic_tournament_roster.json)
-      标记为非active、腾出名额,并写一个 state/new_tactic_request.json
-      标记文件,提醒签入的agent(我)设计一个新战术填补空缺——这一步
-      刻意没有做成全自动:ignite.py本身是纯Python脚本,没有能力像
-      Claude Code会话一样调用子代理去"设计一个新战术"这种需要真正推理
-      的工作,只能负责"检测到需要新战术了"这个纯机械判断,创造性的部分
-      仍然交给agent,与全项目"所有AI操作都由agent发起"的既定原则一致。
+      标记为非active、腾出名额。用户2026-07-14要求把"腾出名额后谁来设计
+      替补战术"这一步也自动化(此前是写一个state/new_tactic_request.json
+      标记文件,靠签入agent自己想起来去看、再手写一次性scratch脚本填补)——
+      现在腾出名额后立刻通过同一条LLM签入通道(见generate_replacement_
+      tactic())主动发起一次"设计新战术"请求,校验失败自动重试(最多
+      _TACTIC_GENERATION_MAX_RETRIES次),通过后直接写回roster、立即生效,
+      全过程记录进LOG/tactic_generations.jsonl。用户明确要求保留"智能来自
+      agent"这一层(不换成直连模型API,见AgentBridgeLLMClient),这里自动化
+      的只是"要不要问、什么时候问、问完怎么落盘"这些调度性工作,创造性的
+      战术设计本身仍然经由LLM桥、由签入的agent(或它调用的子代理)完成,
+      与全项目"所有AI操作都由agent发起"的既定原则一致。全部重试都失败时
+      (比如agent连续几次给出无法解析的格式),名额保持空缺,不伪造一个
+      占位战术填进去——下一次锦标赛节拍(ratchet_interval_hours)会自动
+      重试,不需要人工干预去"救回"这个流程。
       没有达到PROMOTE/FAIL任一条件的分支保持active,不产出裁决,可以
       无限期地继续被观察——这是与LOCKED官方judge()"每次调用都对所有
       active分支强制产出终局裁决"最核心的行为差异,由evaluate_tactic_
@@ -80,6 +88,7 @@ run_ratchet_judgment/mark_daily_nav/run_circuit_breaker_check 都是main.py
 """
 from __future__ import annotations
 
+import copy
 import datetime
 import json
 import sys
@@ -125,15 +134,43 @@ UNIVERSE_PATH = PROJECT_ROOT / "universe_active.json"
 POLL_SECONDS = 60  # 主循环轮询间隔:每分钟检查一次是否有到期的周期任务
 
 
-def build_llm_client():
-    """见模块 docstring:llm_client 是"签入的 Claude Code agent"本身,通过
-    state/ 下的请求/响应文件握手,不调用任何外部 LLM API。
-    timeout_seconds 故意给得比 4h 决策周期短得多——agent 应该在合理时间内
-    (设计上以"分钟"为量级)签入响应,超时说明 agent 这一轮没有及时签入,
-    应该让这个具体周期走 main.py 已有的失败隔离路径(Trader的调度层超时
-    兜底 / Researcher-Reflector的try-except-skip),而不是让整个循环无限期
-    卡死等一个可能永远不会来的响应。"""
-    return AgentBridgeLLMClient(poll_seconds=2.0, timeout_seconds=1800.0)
+def build_llm_clients(config: dict):
+    """返回 (routine_llm, deep_llm) 两个 Callable[[str], str]。
+
+    llm.mode == "bridge"(默认,本地开发/人工介入模式):两个都是同一个
+    AgentBridgeLLMClient——签入的 Claude Code agent 通过 state/ 文件握手
+    应答,不调用外部API。timeout_seconds 故意给得比决策周期短,超时走
+    main.py 既有的失败隔离路径,不让循环无限期卡死。
+
+    llm.mode == "api"(服务器24h无人值守模式,用户2026-07-15要求):直连
+    Anthropic API。分两档控制成本——
+      routine_llm(便宜模型):例行的30分钟Trader决策周期,量大(7分支x48
+        周期/天),大多数输出是hold;
+      deep_llm(强模型):反思摘要、每小时研究、锦标赛替补战术设计,量小
+        (每天几十次)但真正需要思考质量。
+    两档共用同一个每日调用预算文件(见AnthropicLLMClient),超预算当天
+    全部降级为安全fallback。"""
+    llm_cfg = (config.get("llm", {}) or {})
+    mode = llm_cfg.get("mode", "bridge")
+    if mode == "bridge":
+        bridge = AgentBridgeLLMClient(poll_seconds=2.0, timeout_seconds=1800.0)
+        return bridge, bridge
+    if mode != "api":
+        raise SystemExit(f"config llm.mode 必须是 'bridge' 或 'api',得到: {mode!r}")
+
+    from llm_bridge import AnthropicLLMClient  # noqa: PLC0415
+
+    api_cfg = llm_cfg.get("api", {}) or {}
+    max_daily_calls = int(api_cfg.get("max_daily_calls", 600))
+    routine_llm = AnthropicLLMClient(
+        model=api_cfg.get("trader_model", "claude-haiku-4-5-20251001"),
+        max_daily_calls=max_daily_calls,
+    )
+    deep_llm = AnthropicLLMClient(
+        model=api_cfg.get("deep_model", "claude-sonnet-5"),
+        max_daily_calls=max_daily_calls,
+    )
+    return routine_llm, deep_llm
 
 
 def load_config() -> dict:
@@ -252,7 +289,6 @@ def read_nav_tsv_series() -> dict[str, list[tuple[str, float]]]:
 
 TOURNAMENT_ROSTER_PATH = STATE_ROOT / "tactic_tournament_roster.json"
 MAIN_TACTICS_PATH = STATE_ROOT / "main_program_tactics.json"
-NEW_TACTIC_REQUEST_PATH = STATE_ROOT / "new_tactic_request.json"
 
 
 def read_main_hourly_nav_series() -> list[tuple[int, float]]:
@@ -403,6 +439,97 @@ def evaluate_tactic_tournament(roster: dict, now_ms: int, tournament_cfg: dict) 
     return events
 
 
+_TACTIC_GENERATION_MAX_RETRIES = 3
+_MIN_GENERATED_TACTICS_LEN = 20
+
+
+def _build_tactic_generation_prompt(
+    event: dict, roster: dict, universe_symbols: list[str], retry_feedback: Optional[str] = None
+) -> str:
+    """用户要求(2026-07-14)补上锦标赛闭环里唯一还依赖人工的一步:分支被
+    淘汰/晋升腾出名额后,不再只是写一面旗子(state/new_tactic_request.json)
+    等签入agent自己想起来去手写一个scratch脚本,而是立刻通过同一条LLM签入
+    通道主动发起一次"设计新战术"的请求——用户明确选择保留"智能来自agent"
+    这一层(不换成直连模型API),这里只是把"要不要问、什么时候问、问完怎么
+    落盘"这些调度性工作自动化,创造性的战术设计本身仍然经由LLM桥完成。"""
+    active_tactics_lines = [
+        f"- {b}: {m['tactics'][:200]}..."
+        for b, m in roster.items()
+        if m.get("status") == "active"
+    ]
+    lines = [
+        "You are designing ONE new candidate trading-tactic branch for AlphaLoop-Crypto's "
+        "tactic tournament (paper-trading, no real money). A slot just opened because an "
+        "existing branch was resolved:",
+        f"  resolved_branch={event['branch']!r}, decision={event['decision']!r}, "
+        f"edge_vs_main_pct={event['edge_vs_main_pct']:.2f}%, max_drawdown_pct={event['max_drawdown_pct']:.2f}%, "
+        f"reason={event['reason']!r}",
+        "",
+        "Currently active tactics in the tournament (design something genuinely DIFFERENT "
+        "from all of these -- not a minor variation, a distinct trading idea):",
+        "\n".join(active_tactics_lines) if active_tactics_lines else "(none currently active)",
+        "",
+        f"Tradeable universe this cycle: {universe_symbols}",
+        "",
+        "Respond with ONLY a JSON object (no markdown fences, no prose outside the JSON): "
+        '{"branch_id": "evo/YYYYMMDD-<short-english-slug>", "tactics": "<tactic description in '
+        "Chinese, 2-5 sentences, genuinely differentiated from the active list above, grounded in "
+        "a concrete trading idea (momentum / funding-rate carry / mean-reversion / volatility-"
+        'targeting / event-driven / cross-asset correlation / etc, not a vague restatement)>"}. '
+        "Do NOT write any survival-stakes/tournament-rules text yourself -- the system appends "
+        "that automatically to every branch's tactics. branch_id must start with 'evo/' and use "
+        "today's UTC date.",
+    ]
+    if retry_feedback:
+        lines.append("")
+        lines.append(
+            f"Your previous response failed validation: {retry_feedback}. "
+            "Fix the issue and resubmit strictly as a JSON object."
+        )
+    return "\n".join(lines)
+
+
+def _validate_tactic_generation_response(raw: str, roster: dict) -> tuple[Optional[dict], Optional[str]]:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None, "response_not_valid_json"
+    if not isinstance(parsed, dict):
+        return None, "response_not_a_json_object"
+
+    branch_id = parsed.get("branch_id")
+    if not isinstance(branch_id, str) or not branch_id.strip().startswith("evo/") or len(branch_id.strip()) < len("evo/x"):
+        return None, "branch_id_invalid: must be a non-empty string starting with 'evo/'"
+    branch_id = branch_id.strip()
+    if branch_id in roster:
+        return None, f"branch_id_collision: {branch_id!r} already exists in the roster, pick a different slug"
+
+    tactics = parsed.get("tactics")
+    if not isinstance(tactics, str) or len(tactics.strip()) < _MIN_GENERATED_TACTICS_LEN:
+        return None, f"tactics_invalid: must be a string with len>={_MIN_GENERATED_TACTICS_LEN} after strip"
+
+    return {"branch_id": branch_id, "tactics": tactics.strip()}, None
+
+
+def generate_replacement_tactic(
+    llm_client, event: dict, roster: dict, universe_symbols: list[str],
+    max_retries: int = _TACTIC_GENERATION_MAX_RETRIES,
+) -> Optional[dict]:
+    """向签入的LLM/agent请求为刚腾出的名额设计一个全新战术,校验失败重试,
+    全部失败则返回None——调用方应该跳过这次自动生成、把名额留到下一次锦标赛
+    节拍再重试,而不是伪造一个占位战术填进去:一个"看起来合法但没有真实
+    差异化思考"的战术会污染锦标赛的比较意义,比"暂时空一个名额"更糟。"""
+    retry_feedback: Optional[str] = None
+    for _attempt in range(max_retries):
+        prompt = _build_tactic_generation_prompt(event, roster, universe_symbols, retry_feedback)
+        raw = llm_client(prompt)
+        result, error = _validate_tactic_generation_response(raw, roster)
+        if error is None:
+            return result
+        retry_feedback = error
+    return None
+
+
 def run_cold_start(scheduler, dp: DataPipeline, uf: UniverseFilter, researcher: Researcher, clock, config: dict) -> None:
     print("=== COLD_START: 拉取历史数据 + universe + genesis 研究 ===", flush=True)
 
@@ -451,7 +578,9 @@ def run_cold_start(scheduler, dp: DataPipeline, uf: UniverseFilter, researcher: 
 def main() -> None:
     config = load_config()
     clock = SystemClock()
-    llm_client = build_llm_client()
+    # routine_llm:量大的例行决策周期;deep_llm:反思/研究/战术设计。
+    # bridge模式下两者是同一个对象,api模式下分别对应便宜/强两档模型。
+    routine_llm, deep_llm = build_llm_clients(config)
 
     LOG_ROOT.mkdir(parents=True, exist_ok=True)
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -459,9 +588,13 @@ def main() -> None:
     dp = DataPipeline(exchange_id=config["data"]["exchange"], clock=clock)
     uf = UniverseFilter(config, clock=clock)
     memory_store = MemoryStore(db_path=PROJECT_ROOT / "ASSET" / "memory" / "memory.db")
-    researcher = Researcher(llm_client=llm_client, memory_store=memory_store, genesis_path=GENESIS_PATH)
-    trader = Trader(llm_client=llm_client, memory_store=memory_store)
-    reflector = Reflector(llm_client=llm_client, memory_store=memory_store, log_root=LOG_ROOT)
+    researcher = Researcher(llm_client=deep_llm, memory_store=memory_store, genesis_path=GENESIS_PATH)
+    trader = Trader(
+        llm_client=routine_llm,
+        memory_store=memory_store,
+        max_leverage=int((config.get("leverage", {}) or {}).get("max", 10)),
+    )
+    reflector = Reflector(llm_client=deep_llm, memory_store=memory_store, log_root=LOG_ROOT)
     scorer = Scorer(config, log_root=LOG_ROOT)
     cold_start_gate = ColdStartGate(genesis_path=GENESIS_PATH, min_hypothesis_count=10, log_root=LOG_ROOT)
     circuit_breaker = CircuitBreaker(config, log_root=LOG_ROOT)
@@ -597,6 +730,8 @@ def main() -> None:
     # 后缀直接写进每个分支的战术正文,拼进program_tactics,每次决策请求都
     # 会带给Trader/子代理看到。数值(15%/0.5%)与tactic_tournament配置项
     # 保持一致,如果以后改config记得同步改这里。
+    LIANGXI_BRANCH = "evo/20260714-liangxi-style"
+
     _TOURNAMENT_STAKES_SUFFIX = (
         "\n\n【锦标赛生存规则,请认真对待,这不是走过场】你正在和另外几个"
         "战术不同的分支实时竞争同一个位置。每隔几小时会用真实小时级净值"
@@ -657,18 +792,34 @@ def main() -> None:
         # 一个有据可查的真实"高杠杆滚仓最终爆仓"案例,不是虚构的稳健策略——
         # 用户在得知这个真实结局后,明确选择保留这个教训、仍然要求加入这个
         # 风格作为候选分支(而不是要求我发明一个更保守的替代版本)。
-        "evo/20260714-liangxi-style": (
-            "高频高杠杆滚仓战术(模仿公开报道的'凉兮'风格):优先高频进出、"
-            "尽量每个决策周期都重新评估仓位,不满足于长期一动不动地持有;"
-            "方向性博弈优先于传统技术分析,震荡行情下可以同时在同一标的"
-            "开多空双向仓位('多空双撸')捕捉双向波动;单笔仓位可以用远高于"
-            "其他分支的杠杆(系统硬上限已提到100倍,真实报道的凉兮本人就是"
-            "常年使用100倍杠杆)。但必须吸取凉兮真实爆仓的教训:2021年他在"
-            "BTC反转后仍然死扛100倍杠杆的方向性判断、拒绝止损,最终从4000"
-            "多万倒欠数百万——本分支每笔非hold决策仍然必须写出真实的"
-            "falsifier_condition并严格执行,不能因为'高频高杠杆'就省略止损"
-            "纪律;一旦某个方向的判断被falsifier_condition证伪,应该立即"
-            "反手或平仓,而不是像凉兮当年那样加仓死扛。"
+        # 用户2026-07-14二次反馈:实盘观察到第一版战术文字虽然提了"可以用
+        # 远高于其他分支的杠杆",但从没明确要求仓位规模也同样激进,导致
+        # 实际决策出现"杠杆写得很高、但只压极小一部分保证金"的自相矛盾
+        # 组合(首笔交易两个仓位合计保证金只占总资金约1.2%)——用户原话
+        # "感觉凉兮这个不敢梭哈啊,不像本尊的风格"。改写为明确要求仓位
+        # 集中度必须和杠杆倍数匹配,"梭哈"式集中下注才是这个人设的核心,
+        # 不是单纯堆杠杆数字;止损纪律(falsifier_condition)保持不变,这是
+        # 用户明确认可保留的、唯一刻意偏离真实凉兮的地方。
+        LIANGXI_BRANCH: (
+            "高频高杠杆滚仓战术(模仿公开报道的'凉兮'风格):高杠杆的数字本身"
+            "不是重点,真正的核心是'梭哈'式的仓位集中度——当方向性判断成型"
+            "时,应该把可用保证金的绝大部分甚至接近全部压在这一个方向上,"
+            "而不是像其他分支那样为了分散风险把小额仓位铺在多个标的上;"
+            "宁可只做一个高确信度的方向,也不要为了'看起来更稳健'而故意"
+            "缩小仓位规模——缩小仓位规模是conservative分支该做的事,不是"
+            "这个人设该有的行为。杠杆可以远高于其他分支(系统硬上限已提到"
+            "100倍,真实报道的凉兮本人就是常年使用100倍杠杆),仓位规模也"
+            "应该同样激进、与杠杆倍数相匹配,不能出现'杠杆很高但只压极小"
+            "一部分保证金'这种自相矛盾的组合。同时高频操作,尽量每个决策"
+            "周期都重新评估仓位;方向性博弈优先于传统技术分析,震荡行情下"
+            "可以同时在同一标的开多空双向仓位('多空双撸')捕捉双向波动。"
+            "但必须吸取凉兮真实爆仓的教训:2021年他在BTC反转后仍然死扛"
+            "100倍杠杆的方向性判断、拒绝止损,最终从4000多万倒欠数百万——"
+            "本分支每笔非hold决策仍然必须写出真实的falsifier_condition并"
+            "严格执行,不能因为'全仓高杠杆'就省略止损纪律;一旦某个方向的"
+            "判断被falsifier_condition证伪,应该立即反手或平仓,而不是像"
+            "凉兮当年那样加仓死扛。仓位集中+严格止损两者同时成立,才是这个"
+            "分支真正要验证的假设。"
             + _TOURNAMENT_STAKES_SUFFIX
         ),
     }
@@ -698,6 +849,11 @@ def main() -> None:
 
     for evo_branch in tournament_roster:
         _ensure_evo_simulator(evo_branch)
+
+    # 凉兮分支曾经有一个专属5分钟高频scheduler(2026-07-14加的)——用户
+    # 2026-07-15决定下线:24h无人值守API模式下,统一所有分支为30分钟节拍,
+    # 控制调用成本、简化调度结构。凉兮的"人设"(高杠杆、滚仓、确认即加码)
+    # 完整保留在它的战术文字里,与调用频率无关。
 
     reflection_interval_ms = int((24 * 3_600_000) // max(1, int(config["cycle"]["reflection_per_day"])))
     ratchet_interval_ms = int(float(config["cycle"]["ratchet_interval_hours"]) * 3_600_000)
@@ -862,13 +1018,21 @@ def main() -> None:
             last_mark_ms = now
 
         # 反思(Reflector):每天 reflection_per_day 次,均匀分布节拍。
+        # 2026-07-15起覆盖main+所有active evo分支——每个分支的反思写入自己
+        # 分支标签下的记忆(L2/L3按分支隔离,见ASSET/memory/engine.py),
+        # 进化路线互不污染,这是用户对24h无人值守模式的明确要求。
         last_reflection_ts = schedule_state.get("last_reflection_ts")
         if last_reflection_ts is None or now - last_reflection_ts >= reflection_interval_ms:
-            try:
-                marks = scheduler.run_reflection_cycle("main")
-                print(f"[{now}] 反思周期完成: {len(marks) if marks is not None else 0} 条", flush=True)
-            except Exception:  # noqa: BLE001
-                print(f"[{now}] run_reflection_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+            reflection_branches = ["main"] + [
+                b for b, m in load_tournament_roster(now, _DEFAULT_EVO_TACTICS).items()
+                if m.get("status") == "active"
+            ]
+            for reflection_branch in reflection_branches:
+                try:
+                    marks = scheduler.run_reflection_cycle(reflection_branch)
+                    print(f"[{now}] [{reflection_branch}] 反思周期完成: {len(marks) if marks is not None else 0} 条", flush=True)
+                except Exception:  # noqa: BLE001
+                    print(f"[{now}] [{reflection_branch}] run_reflection_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
             schedule_state["last_reflection_ts"] = now
             save_schedule_state(schedule_state)
 
@@ -944,7 +1108,6 @@ def main() -> None:
                 tournament_cfg = config.get("tactic_tournament", {}) or {}
                 roster = load_tournament_roster(now, _DEFAULT_EVO_TACTICS)
                 events = evaluate_tactic_tournament(roster, now, tournament_cfg)
-                open_slots: list[str] = []
                 for ev in events:
                     branch = ev["branch"]
                     log_writer.append_jsonl("tactic_promotions.jsonl", {**ev, "ts": now}, root=LOG_ROOT)
@@ -984,24 +1147,65 @@ def main() -> None:
                                 failed_sim.execute(close_decision, next_bar)
                                 print(f"[{now}] [{branch}] 锦标赛淘汰强制平仓: {symbol}", flush=True)
 
-                    open_slots.append(branch)
-
                 if events:
                     save_tournament_roster(roster)
-                    NEW_TACTIC_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    NEW_TACTIC_REQUEST_PATH.write_text(
-                        json.dumps({
-                            "ts": now,
-                            "open_slots": open_slots,
-                            "roster_status": {b: m.get("status") for b, m in roster.items()},
-                        }, ensure_ascii=False),
-                        encoding="utf-8",
+                    universe_symbols_now = (
+                        json.loads(UNIVERSE_PATH.read_text(encoding="utf-8"))["symbols"]
+                        if UNIVERSE_PATH.exists() else []
                     )
-                    print(
-                        f"[{now}] 战术锦标赛出现 {len(open_slots)} 个空缺名额,已写"
-                        f"state/new_tactic_request.json,等待签入agent设计新战术",
-                        flush=True,
-                    )
+                    for ev in events:
+                        resolved_branch = ev["branch"]
+                        try:
+                            generated = generate_replacement_tactic(
+                                deep_llm, ev, roster, universe_symbols_now
+                            )
+                        except Exception:  # noqa: BLE001
+                            generated = None
+                            print(
+                                f"[{now}] [{resolved_branch}] generate_replacement_tactic 异常"
+                                f"(已记录,继续循环):\n{traceback.format_exc()}",
+                                flush=True,
+                            )
+
+                        if generated is None:
+                            log_writer.append_jsonl(
+                                "tactic_generations.jsonl",
+                                {
+                                    "ts": now, "resolved_branch": resolved_branch,
+                                    "resolved_decision": ev["decision"],
+                                    "status": "generation_failed", "new_branch_id": None,
+                                },
+                                root=LOG_ROOT,
+                            )
+                            print(
+                                f"[{now}] [{resolved_branch}] 自动生成替补战术失败(连续"
+                                f"{_TACTIC_GENERATION_MAX_RETRIES}次校验不通过),名额暂时"
+                                f"空缺,下一次锦标赛节拍会自动重试",
+                                flush=True,
+                            )
+                            continue
+
+                        new_branch_id = generated["branch_id"]
+                        roster[new_branch_id] = {
+                            "tactics": generated["tactics"] + _TOURNAMENT_STAKES_SUFFIX,
+                            "status": "active",
+                            "created_ms": now,
+                        }
+                        save_tournament_roster(roster)
+                        log_writer.append_jsonl(
+                            "tactic_generations.jsonl",
+                            {
+                                "ts": now, "resolved_branch": resolved_branch,
+                                "resolved_decision": ev["decision"],
+                                "status": "generated", "new_branch_id": new_branch_id,
+                            },
+                            root=LOG_ROOT,
+                        )
+                        print(
+                            f"[{now}] 自动生成替补战术分支: {new_branch_id}"
+                            f"(替补 {resolved_branch} 腾出的名额,立即生效,不需要重启)",
+                            flush=True,
+                        )
             except Exception:  # noqa: BLE001
                 print(f"[{now}] evaluate_tactic_tournament 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
             schedule_state["last_tournament_ms"] = now

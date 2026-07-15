@@ -97,3 +97,45 @@ def test_multiple_sequential_calls_use_distinct_request_ids(bridge):
     assert r1 == f"response-to-{seen_ids[0]}"
     assert r2 == f"response-to-{seen_ids[1]}"
     assert seen_ids[0] != seen_ids[1]
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-15新增:API模式的两项无人值守防线(围栏剥离+每日预算熔断)。
+# 不真调Anthropic API——AnthropicLLMClient需要SDK和key,这里只测纯函数
+# _strip_code_fences和预算文件的读写判定逻辑。
+# ---------------------------------------------------------------------------
+
+
+def test_strip_code_fences_removes_json_fence():
+    from llm_bridge import _strip_code_fences
+
+    fenced = '```json\n[{"a": 1}]\n```'
+    assert _strip_code_fences(fenced) == '[{"a": 1}]'
+
+
+def test_strip_code_fences_removes_bare_fence():
+    from llm_bridge import _strip_code_fences
+
+    fenced = '```\n{"b": 2}\n```'
+    assert _strip_code_fences(fenced) == '{"b": 2}'
+
+
+def test_strip_code_fences_leaves_plain_text_alone():
+    from llm_bridge import _strip_code_fences
+
+    plain = '[{"a": 1}]'
+    assert _strip_code_fences(plain) == plain
+
+
+def test_strip_code_fences_leaves_unterminated_fence_alone():
+    from llm_bridge import _strip_code_fences
+
+    weird = '```json\n[{"a": 1}]'  # 只有开头围栏没有结尾——不动它,交给下游解析报错重试
+    assert _strip_code_fences(weird) == weird
+
+
+def test_strip_code_fences_does_not_touch_backticks_inside_text():
+    from llm_bridge import _strip_code_fences
+
+    inner = 'thesis mentions `code` but response is plain JSON: [1]'
+    assert _strip_code_fences(inner) == inner

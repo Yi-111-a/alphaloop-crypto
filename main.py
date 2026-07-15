@@ -218,7 +218,10 @@ class AlphaLoopScheduler:
         self.memory_query_text = memory_query_text
         self.top_k = top_k
 
-        self.last_reflection_summary: Optional[str] = None
+        # 2026-07-15改为按分支隔离(用户对多分支并行进化的要求):每个分支
+        # 只看到自己的反思摘要,不共享。旧的单值属性保留为main分支的别名,
+        # 兼容既有测试/调用方。
+        self.last_reflection_summaries: dict[str, Optional[str]] = {}
         self.program_tactics: Optional[str] = None
 
         # float 而非 int:用户为"快速验证"要求支持30分钟(0.5h)决策周期
@@ -340,7 +343,7 @@ class AlphaLoopScheduler:
             ts=ts,
             positions=positions,
             latest_snapshot=latest_snapshot,
-            last_reflection_summary=self.last_reflection_summary,
+            last_reflection_summary=self.last_reflection_summaries.get(branch),
             program_tactics=self.program_tactics,
             memory_query_text=self.memory_query_text,
             top_k=self.top_k,
@@ -584,7 +587,28 @@ class AlphaLoopScheduler:
                 ),
             )
             return None
+        # Reflector.reflect() 把本轮经验摘要直接写入 memory_store(L2 层)，
+        # 不通过返回值传出来(返回值是 ThesisMark 列表)。这里回读一次 memory_store
+        # 里最新的 L2 记录，喂给下一次 Trader.decide() 的"最近一次反思摘要"字段
+        # (build_context 顺序第4项)——否则该字段会一直是构造时的 None，
+        # Trader 永远看不到反思结论，只能靠 retrieve() 里 L2/L3 的语义检索
+        # 间接摸到,不是 spec 里明确要求的"最近一次"这个直给信号。
+        if self.memory_store is not None:
+            # 2026-07-15:摘要按分支隔离——只回读本分支自己的最新L2记录,
+            # 存进per-branch字典;branch过滤参数用duck-type兼容旧接口。
+            try:
+                latest = self.memory_store.get_latest(layer="L2", before_ts=now, branch=branch)
+            except TypeError:
+                latest = self.memory_store.get_latest(layer="L2", before_ts=now)
+            if latest is not None:
+                self.last_reflection_summaries[branch] = latest.content
         return marks
+
+    @property
+    def last_reflection_summary(self) -> Optional[str]:
+        """兼容别名:等价于 main 分支的最近反思摘要(2026-07-15按分支隔离
+        之前,这是一个全局单值属性;既有测试/调用方仍在用这个名字)。"""
+        return self.last_reflection_summaries.get("main")
 
     def run_daily_research(self, date_str: str, queries: Optional[list[str]] = None) -> Optional[Path]:
         if self.researcher is None:

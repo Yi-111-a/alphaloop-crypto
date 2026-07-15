@@ -52,8 +52,10 @@ from LOCKED.simulator import MIN_THESIS_LEN
 
 VALID_ACTIONS = {"open_long", "open_short", "close", "adjust", "hold"}
 MIN_LEVERAGE = 1
-MAX_LEVERAGE = 10  # 与 config.yaml leverage.max 默认值一致(§1)；生产环境应以
-                    # 注入的 config 为准，这里作为 Trader 自身兜底上限。
+MAX_LEVERAGE = 10  # 模块级兜底默认值，仅在 Trader 未显式传入 max_leverage 时
+                    # (如测试里的裸构造)生效。生产路径下 Trader(max_leverage=...)
+                    # 由调用方注入 config.yaml 的 leverage.max，实际校验以实例的
+                    # self.max_leverage 为准，而不是这个常量。
 
 _DECISION_FIELDS = {f.name for f in fields(Decision)}
 
@@ -79,8 +81,23 @@ def references_hypothesis(thesis: str) -> bool:
     return bool(_HYPOTHESIS_RE.search(thesis))
 
 
-def _validate_decision_dict(d: dict) -> list[str]:
-    """校验单条候选决策字典，返回错误原因列表(空列表 = 通过)。"""
+def _validate_decision_dict(
+    d: dict, max_leverage: int = MAX_LEVERAGE, valid_symbols: Optional[set] = None
+) -> list[str]:
+    """校验单条候选决策字典，返回错误原因列表(空列表 = 通过)。
+
+    2026-07-14 新增两条语义级校验(不只是"字段类型对不对",而是"这个值在
+    这个业务场景下讲不讲得通")——都是本session里签入agent反复手动拦下过的
+    真实错误类别,不是假设性边界情况:
+      - symbol 必须是本次决策时刻真实行情快照里存在的完整交易对(如
+        "BTC/USDT:USDT"),不能是"BTC"这种截断写法。子代理这一类错误出现过
+        不止一次,此前全靠人工审查发现。
+      - target_notional_pct 不能是负数——LOCKED.simulator.py 内部会对它取
+        abs(),所以负数不会导致仓位方向错误,但出现过at all说明子代理输出
+        本身有问题(比如把"减仓"错误地编码成负的目标仓位,而不是用
+        action="adjust"配合更小的正数),负数在这个字段里永远没有合理语义,
+        应该在这里就拒绝重试,而不是靠abs()悄悄"纠正"成看似正常的结果。
+    """
     errors: list[str] = []
 
     required = [
@@ -135,21 +152,33 @@ def _validate_decision_dict(d: dict) -> list[str]:
     if (
         not isinstance(leverage, int)
         or isinstance(leverage, bool)
-        or not (MIN_LEVERAGE <= leverage <= MAX_LEVERAGE)
+        or not (MIN_LEVERAGE <= leverage <= max_leverage)
     ):
         errors.append(
-            f"leverage_invalid: must be int in [{MIN_LEVERAGE},{MAX_LEVERAGE}], got {leverage!r}"
+            f"leverage_invalid: must be int in [{MIN_LEVERAGE},{max_leverage}], got {leverage!r}"
         )
 
     target_notional_pct = d.get("target_notional_pct")
-    if not isinstance(target_notional_pct, (int, float)) or isinstance(
-        target_notional_pct, bool
+    if (
+        not isinstance(target_notional_pct, (int, float))
+        or isinstance(target_notional_pct, bool)
     ):
         errors.append("target_notional_pct_invalid: must be int or float")
+    elif not (0 <= target_notional_pct <= 100):
+        errors.append(
+            f"target_notional_pct_invalid: must be in [0,100] (percent of NAV, "
+            f"never negative -- direction comes from action, not sign), got {target_notional_pct!r}"
+        )
 
     symbol = d.get("symbol")
     if not isinstance(symbol, str) or not symbol.strip():
         errors.append("symbol_invalid: must be non-empty str")
+    elif valid_symbols is not None and symbol not in valid_symbols:
+        errors.append(
+            f"symbol_invalid: {symbol!r} is not in this cycle's tradeable universe "
+            f"(must be the FULL pair form e.g. 'BTC/USDT:USDT', not a shortened ticker "
+            f"like 'BTC'); valid symbols: {sorted(valid_symbols)}"
+        )
 
     horizon = d.get("horizon")
     if not isinstance(horizon, str) or not horizon.strip():
@@ -170,10 +199,12 @@ class Trader:
         llm_client: Callable[[str], str],
         memory_store: Any,
         max_retries: int = 3,
+        max_leverage: int = MAX_LEVERAGE,
     ):
         self.llm_client = llm_client
         self.memory_store = memory_store
         self.max_retries = max_retries
+        self.max_leverage = max_leverage
 
     # ------------------------------------------------------------------
     # 记忆检索结果的防御性解包(duck-typing，见模块顶部docstring)
@@ -213,6 +244,7 @@ class Trader:
         program_tactics: Optional[str],
         memory_query_text: str,
         top_k: int = 5,
+        branch: str = "main",
     ) -> dict:
         """按 spec §3.2 规定的顺序拼装 Trader 的输入上下文。
 
@@ -221,9 +253,17 @@ class Trader:
         这是本模块防止"未来记忆泄漏进当下决策"的唯一防线所在 —— 记忆系统自身的
         时间边界闸门做得再好，只要这里传错一次时间戳，那个闸门就被绕过了。
         """
-        memory_results_raw = self.memory_store.retrieve(
-            memory_query_text, query_ts=ts, top_k=top_k
-        )
+        # branch参数(2026-07-15分支记忆隔离):声明自己是哪个分支,检索时
+        # 只拿共享记忆+本分支私有经验。旧的memory_store实现/测试Fake可能
+        # 没有branch参数,duck-type降级兼容。
+        try:
+            memory_results_raw = self.memory_store.retrieve(
+                memory_query_text, query_ts=ts, top_k=top_k, branch=branch
+            )
+        except TypeError:
+            memory_results_raw = self.memory_store.retrieve(
+                memory_query_text, query_ts=ts, top_k=top_k
+            )
         memory_results = self._normalize_memory_results(memory_results_raw)
 
         # 顺序显式声明为 list[(name, value)]，既是拼装 prompt 的数据源，也让
@@ -276,9 +316,15 @@ class Trader:
     # ------------------------------------------------------------------
 
     def _parse_and_validate(
-        self, raw_response: str, ts: int, branch: str
+        self, raw_response: str, ts: int, branch: str, valid_symbols: Optional[set] = None
     ) -> tuple[Optional[list[Decision]], Optional[str]]:
-        """返回 (decisions, error) —— 恰好一个为 None。"""
+        """返回 (decisions, error) —— 恰好一个为 None。
+
+        valid_symbols 是本次决策时刻真实行情快照里覆盖的完整交易对集合(见
+        decide() 里 set(latest_snapshot.keys())),用于语义级校验 symbol 字段
+        (见 _validate_decision_dict 的说明)——传 None 时跳过这项检查,保持
+        向后兼容(测试里裸调用不传快照的场景)。
+        """
         try:
             parsed = json.loads(raw_response)
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -295,7 +341,9 @@ class Trader:
             if not isinstance(item, dict):
                 all_errors.append(f"item_{i}_not_an_object")
                 continue
-            errs = _validate_decision_dict(item)
+            errs = _validate_decision_dict(
+                item, max_leverage=self.max_leverage, valid_symbols=valid_symbols
+            )
             if errs:
                 all_errors.append(f"item_{i}: {'; '.join(errs)}")
                 continue
@@ -344,13 +392,19 @@ class Trader:
             program_tactics=program_tactics,
             memory_query_text=memory_query_text,
             top_k=top_k,
+            branch=branch,
         )
+
+        # 空快照(比如数据源暂时拉不到行情)时不做symbol语义校验而不是把它当成
+        # "合法的空universe"去拒绝所有symbol——宁可退化成只做类型/范围校验,
+        # 也不要在真实网络故障期间把这个新校验变成额外一层全部拒绝。
+        valid_symbols = set(latest_snapshot.keys()) if latest_snapshot else None
 
         retry_feedback: Optional[str] = None
         for _attempt in range(1, self.max_retries + 1):
             prompt = self._format_prompt(context, retry_feedback)
             raw_response = self.llm_client(prompt)
-            decisions, error = self._parse_and_validate(raw_response, ts, branch)
+            decisions, error = self._parse_and_validate(raw_response, ts, branch, valid_symbols=valid_symbols)
             if error is None:
                 return decisions
             retry_feedback = error
