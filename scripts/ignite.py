@@ -641,6 +641,10 @@ def main() -> None:
 
     LOG_ROOT.mkdir(parents=True, exist_ok=True)
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    # 启动即写心跳(2026-07-15修复的真实bug):此前只在每轮循环结尾写,
+    # 思考模式API下一轮循环要十几分钟,清零后watchdog以"心跳文件不存在"
+    # 为由每5分钟杀一次进程,进程永远活不到第一次写心跳,无限重启循环。
+    write_heartbeat(clock, {"status": "starting"})
 
     dp = DataPipeline(exchange_id=config["data"]["exchange"], clock=clock)
     uf = UniverseFilter(config, clock=clock)
@@ -964,6 +968,9 @@ def main() -> None:
                     print(f"[{now}] [{evo_branch}] 决策周期完成: {[d.action for d in evo_result['decisions']]}", flush=True)
             except Exception:  # noqa: BLE001
                 print(f"[{now}] [{evo_branch}] run_decision_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+            # 每处理完一个分支就刷新心跳:思考模式API下单次决策可达1-3分钟,
+            # 一轮7个分支远超watchdog的stale阈值,只在循环结尾写会被误杀。
+            write_heartbeat(clock, {"status": "running"})
 
         if now - last_settlement_check_ms >= 3_600_000:
             try:
@@ -1092,6 +1099,7 @@ def main() -> None:
                     print(f"[{now}] [{reflection_branch}] 反思周期完成: {len(marks) if marks is not None else 0} 条", flush=True)
                 except Exception:  # noqa: BLE001
                     print(f"[{now}] [{reflection_branch}] run_reflection_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+                write_heartbeat(clock, {"status": "running"})  # 同上:长反思轮不饿死心跳
             schedule_state["last_reflection_ts"] = now
             save_schedule_state(schedule_state)
 
