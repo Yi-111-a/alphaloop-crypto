@@ -1,12 +1,17 @@
 """
 scripts/backfill_history.py —— M6 一次性历史数据回填脚本。
 
-背景:LOCKED/data_pipeline.py 的 fetch_funding_rate_history 在本次改造前
-存在分页缺陷(单次请求被交易所硬上限卡住,只能拿到约100天资金费率历史,
-详见该文件模块 docstring 里的 M6 记录),导致 data_cache/funding_*.parquet
-一直只有约96-99天数据,而 fetch_ohlcv 早就能拿到完整 730 天。分页缺陷已经
-在本次改造里修好,本脚本负责一次性把现有 universe 的历史缓存补齐到完整
-history_days(config.yaml data.history_days,当前 730 天)。
+背景:LOCKED/data_pipeline.py 在生产服务器真实点火时暴露了两个数据层缺陷
+(详见该文件模块 docstring 里的 M6 记录),都已在本次改造里修好:
+1. fetch_funding_rate_history 的分页在真实OKX上无效(since 正向推进对
+   OKX 无意义,永远拿到同一批最新记录),导致 data_cache/funding_*.parquet
+   一直只有约96-99天数据,而 fetch_ohlcv 早就能拿到完整 730 天。
+2. 上市晚于 since 的币种(CL/HYPE/LAB/MU/PUMP/SNDK/XAU/ZEC 等)OHLCV 拉到
+   0根——正向分页第一页为空被误判为"拉完了"。现在会自动收敛为"该币种
+   上市以来全部历史"。
+本脚本负责一次性把现有 universe 的历史缓存补齐到完整 history_days
+(config.yaml data.history_days,当前 730 天;上市不满 730 天的币种则补齐
+到"上市以来全部历史")。
 
 跑法(**本机网络时断时续,不要在本机跑这个脚本**——按用户/任务要求,这个
 脚本只负责"写出来",实际执行留到网络稳定的服务器上):

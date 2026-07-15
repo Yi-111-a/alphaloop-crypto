@@ -38,6 +38,25 @@ M5 联网 shakedown 适配记录(2026年真实联网环境下发现,授权范围
   给它们接一个历史数据当"当前值"用是伪造实时性,不属于本次授权的"适配层"
   修复范畴。这两个方法在实时API不可达的环境下会如实失败,而不是安静地返回
   一个不新鲜的数字。
+
+M6 生产实测缺陷修复记录(2026年真实点火/服务器实测发现,授权范围内的
+修改,只动本文件,LOCKED区其余业务逻辑一行未改):
+- 缺陷1:fetch_funding_rate_history 的分页在真实OKX上无效——实测请求
+  730天资金费率,始终只拿到最近92-99天(~277-320条,正好是旧的单次上限)。
+  根因:ccxt/okx.py 的 fetch_funding_rate_history 只把 since 映射成 OKX
+  的 before 参数(只圈下界,不圈上界),而 fetch_ohlcv 的实现把 since 同时
+  映射成 before+after(双边界)。只圈下界的请求,OKX 永远优先返回"满足下界
+  条件的最新一批"记录,把 since 游标继续向前推毫无意义。修法:改成反向
+  翻页,从"现在"开始用 params={"after": <上一页最早时间戳>} 向历史深处
+  推进,直到覆盖 since 或历史耗尽。详见 _fetch_funding_rate_history_live_paginated
+  的实现注释。
+- 缺陷2:since 早于币种上市日时 OHLCV 拉到0根——CL/HYPE/LAB/MU/PUMP/
+  SNDK/XAU/ZEC 这类上市不满 history_days 的币种,正向分页第一页(窗口
+  完全落在"上市前")如实返回空,原代码把这种"起点选早了"和"正常拿完了"
+  混为一谈直接终止。修法:仅当第一页为空时,用 params={"until": <上一页
+  最早时间戳>} 反向翻页探测并补齐"上市日→现在"的全部历史,等效于规格书
+  M6 验收标准"或该币种上市以来全部历史,以较短者为准"。详见
+  _fetch_ohlcv_backward_from_listing 的实现注释。
 """
 from __future__ import annotations
 
@@ -203,7 +222,17 @@ class DataPipeline:
     ) -> list[list]:
         """从 since 开始,反复调用 self.exchange.fetch_ohlcv 向前翻页,直到
         拿满 limit 条、追上"现在"、或交易所不再返回新数据为止。每一页都走
-        _with_retry,单页失败时的重试语义与非分页调用完全一致。"""
+        _with_retry,单页失败时的重试语义与非分页调用完全一致。
+
+        M6 缺陷2 修复(2026年真实点火时发现):CL/HYPE/LAB/MU/PUMP/SNDK/XAU/
+        ZEC 这类上市不满 history_days(730天)的币种,since 早于该币种真实
+        上市日,第一页请求(窗口完全落在"上市前")如实返回空——原代码把
+        "第一页就是空"和"交易所没有更多数据了(正常收尾)"当成同一件事处理,
+        直接 break,最终 0 根K线。这两种"空"含义不同:后者是"已经拿到一些
+        数据、现在追到头了",前者是"起点选早了,一根都还没拿到"。只有第一页
+        (all_rows 还是空的)才需要走下面的"探测上市日"分支;非第一页的空页
+        仍然按原逻辑正常结束分页,不受影响。
+        """
         interval_ms = _timeframe_to_ms(timeframe)
         all_rows: list[list] = []
         current_since = since
@@ -217,6 +246,14 @@ class DataPipeline:
                 f"fetch_ohlcv({symbol}, {timeframe}, since={current_since})",
             )
             if not page:
+                if not all_rows:
+                    # 第一页就是空的:since 很可能早于该币种的上市日(规格书
+                    # M6 验收标准:"或该币种上市以来全部历史,以较短者为准")。
+                    # 探测该币种是否真的有数据,有的话反向翻页补齐"上市日→
+                    # 现在"的完整历史。
+                    return self._fetch_ohlcv_backward_from_listing(
+                        symbol, timeframe, limit, per_call_limit
+                    )[:limit]
                 break
             all_rows.extend(page)
             last_ts = page[-1][0]
@@ -231,53 +268,141 @@ class DataPipeline:
 
         return all_rows[:limit]
 
-    # ------------------------------------------------------------------
-    # M6 缺陷修复:资金费率历史分页拉取。fetch_ohlcv 早在 M5 就补了
-    # _fetch_ohlcv_live_paginated,但 fetch_funding_rate_history 当时漏改,
-    # 一直只发一次请求——同样被 OKX 单次请求的硬上限卡住(实测约300条)。
-    # 资金费率每8小时结算一次,300条≈100天,而 fetch_ohlcv 能拿到完整
-    # history_days=730 天。现有缓存(data_cache/funding_*.parquet)全部
-    # 只有约96-99天就是这个缺陷的直接证据。修法与 OHLCV 同构:since 游标
-    # 按固定的8小时结算周期推进(资金费率没有"timeframe"概念,间隔是
-    # config.yaml funding.settle_hours_utc 隐含的常数,不是参数)。
-    # ------------------------------------------------------------------
+    def _fetch_ohlcv_backward_from_listing(
+        self, symbol: str, timeframe: str, limit: int, per_call_limit: int = 300
+    ) -> list[list]:
+        """M6 缺陷2 修复:当正向分页第一页就是空的(since 早于上市日)时,
+        从"现在"开始反向翻页,补齐"该币种上市以来的全部历史"。
 
-    _FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000  # 资金费率结算周期固定8小时
+        游标语义取自实测读到的 ccxt/okx.py fetch_ohlcv 源码(约2608-2622行):
+            if since is not None:
+                ...
+                request['before'] = startTime            # since-1,下界
+                request['after'] = self.sum(since, durationInMilliseconds * limit)  # 上界
+            until = self.safe_integer(params, 'until')
+            if until is not None:
+                request['after'] = until                  # 显式上界游标
+        也就是说 ccxt 把 since 同时映射成 before(下界)+ after(上界)两个
+        边界,没有单独暴露"只给上界、不给下界"的高层参数;但官方支持的
+        params.until 会直接覆盖 request['after'],语义正是"只拿这个时间戳
+        之前的K线"。这里固定传 since=None(不设下界),用 params={"until":
+        cursor} 把游标设到"上一页最早一根K线的时间戳",从"现在"向历史深处
+        反向翻页,直到交易所返回空页(说明已经翻过上市日,历史耗尽)为止。
+        """
+        all_rows: list[list] = []
+        cursor: int | None = None
+        seen_oldest: int | None = None
+
+        while len(all_rows) < limit:
+            params = {"until": cursor} if cursor is not None else {}
+            page = self._with_retry(
+                lambda p=params: self.exchange.fetch_ohlcv(
+                    symbol, timeframe=timeframe, since=None, limit=per_call_limit, params=p
+                ),
+                f"fetch_ohlcv({symbol}, {timeframe}, until={cursor}) [listing-date probe]",
+            )
+            if not page:
+                # 没有更早的数据了——翻过了上市日(或该币种本来就没有任何
+                # 数据),历史耗尽是预期的正常终止条件,不是错误。
+                break
+            all_rows.extend(page)
+            oldest_ts = min(row[0] for row in page)
+            if seen_oldest is not None and oldest_ts >= seen_oldest:
+                # 游标没有真正向历史深处推进,停止分页,避免死循环(与正向
+                # 分页同款防御)。
+                break
+            seen_oldest = oldest_ts
+            cursor = oldest_ts
+
+        if not all_rows:
+            return []
+        dedup: dict[int, list] = {row[0]: row for row in all_rows}
+        return sorted(dedup.values(), key=lambda row: row[0])
+
+    # ------------------------------------------------------------------
+    # M6 缺陷1 修复(2026年真实点火实测确认):资金费率历史分页拉取。
+    #
+    # 原实现(把 since 游标一路向前推、原样传给 ccxt 的 since= 形参)在真实
+    # OKX 上线后实测发现分页形同虚设:请求13个币种730天资金费率,返回的
+    # 全部仍然只有最近92-99天(~277-320条,正好是旧的单次上限)。
+    #
+    # 根因(读 ccxt/okx.py fetch_funding_rate_history 源码,约2683-2690行
+    # 确认):
+    #     request = {'instId': market['id']}
+    #     if since is not None:
+    #         request['before'] = max(since - 1, 0)
+    #     if limit is not None:
+    #         request['limit'] = limit
+    #     response = self.publicGetPublicFundingRateHistory(self.extend(request, params))
+    # ccxt 把 since 只映射成 OKX 的 before 参数——OKX 官方语义里 before 只
+    # 圈定"下界"(只返回比 before 更新的记录),不圈定上界。对比同一份源码
+    # 里 fetch_ohlcv 的实现(约2617-2619行):since 同时映射到 before(下界)
+    # 和 after(上界)两个参数,形成一个双边界窗口,这正是 fetch_ohlcv 分页
+    # 能生效、funding_rate_history 分页失效的关键差异。只圈下界不圈上界的
+    # 请求,OKX 服务端永远优先返回"满足下界条件的最新一批"记录——所以无论
+    # since 传得多早,只要早于"现在往前数 per_call_limit 条"这个窗口,拿到
+    # 的都是同一批最新记录;把 since 游标继续向前推、再发一次请求,拿到的
+    # 还是同一批"最新"——分页循环因此形同虚设,这与实测现象(始终卡在约
+    # 300条/92-99天)完全吻合。
+    #
+    # 修法:改成反向翻页——从"现在"开始,每页取回后用**本页最早一条记录的
+    # 时间戳**作为下一页的游标,向历史深处推进。OKX 没有给 fetch_funding_
+    # rate_history 暴露 fetch_ohlcv 那样的 params.until 高层封装,但 params
+    # 会被 self.extend(request, params) 直接合并进请求体,可以绕过 since=
+    # 形参,直接用 params={"after": <游标>}(OKX 语义:只返回早于该时间戳的
+    # 记录)把上界游标透传给交易所。翻页直到某一页最早时间戳已经 <= since
+    # (覆盖到请求起点)、或交易所返回空页(历史耗尽)、或游标未能真正推进
+    # (防御死循环)为止。
+    # ------------------------------------------------------------------
 
     def _fetch_funding_rate_history_live_paginated(
         self, symbol: str, since: int, limit: int, per_call_limit: int = 300
     ) -> list[dict]:
-        """从 since 开始,反复调用 self.exchange.fetch_funding_rate_history 向前
-        翻页,直到拿满 limit 条、追上"现在"、或交易所不再返回新数据为止。
-        与 _fetch_ohlcv_live_paginated 同构:每一页都走 _with_retry,单页失败时
-        的重试语义完全一致;翻页游标用"上一页最后一条记录的 timestamp + 固定
-        结算周期"前进,而不是简单地数条数——避免交易所某一页恰好不足
-        per_call_limit 但游标计算错误导致的空洞或重复。"""
+        """从"现在"开始反向翻页,直到覆盖 since 或交易所耗尽历史为止。
+        每一页都走 _with_retry,单页失败时的重试语义与非分页调用完全一致。
+        返回的记录不假设全局有序(见下方 dedupe+sort),调用方
+        fetch_funding_rate_history 里的 _merge_dedupe 也会再次按 timestamp
+        排序去重,双重保险。"""
         all_rows: list[dict] = []
-        current_since = since
-        now_ms = self.clock.now_ms()
+        cursor: int | None = None
+        seen_oldest: int | None = None
 
-        while len(all_rows) < limit and current_since <= now_ms:
+        while len(all_rows) < limit:
+            params = {"after": cursor} if cursor is not None else {}
             page = self._with_retry(
-                lambda s=current_since: self.exchange.fetch_funding_rate_history(
-                    symbol, since=s, limit=per_call_limit
+                lambda p=params: self.exchange.fetch_funding_rate_history(
+                    symbol, since=None, limit=per_call_limit, params=p
                 ),
-                f"fetch_funding_rate_history({symbol}, since={current_since})",
+                f"fetch_funding_rate_history({symbol}, after={cursor})",
             )
             if not page:
+                # 没有更早的数据了——可能是真的历史耗尽,也可能是该币种上市
+                # 不满 since 要求的天数(M6 缺陷2 同款场景),都是预期的正常
+                # 终止条件,不是错误。
                 break
             all_rows.extend(page)
-            last_ts = page[-1].get("timestamp")
-            if last_ts is None or last_ts <= current_since:
-                # 交易所没有真正向前推进,停止分页,避免死循环(与 OHLCV 分页
-                # 同款防御,理由见 _fetch_ohlcv_live_paginated)。
+            page_timestamps = [row.get("timestamp") for row in page if row.get("timestamp") is not None]
+            if not page_timestamps:
                 break
-            current_since = last_ts + self._FUNDING_INTERVAL_MS
-            if len(page) < per_call_limit:
-                # 交易所返回的条数不足单页上限,说明这已经是能拿到的最后一页。
+            oldest_ts = min(page_timestamps)
+            if seen_oldest is not None and oldest_ts >= seen_oldest:
+                # 游标没有真正向历史深处推进,停止分页,避免死循环(与
+                # OHLCV 分页同款防御)。
                 break
+            seen_oldest = oldest_ts
+            if oldest_ts <= since:
+                # 已经翻到覆盖 since 起点的一页,足够了——更早的数据不需要。
+                break
+            cursor = oldest_ts
 
-        return all_rows[:limit]
+        if not all_rows:
+            return []
+        dedup: dict[int, dict] = {}
+        for row in all_rows:
+            ts = row.get("timestamp")
+            if ts is not None:
+                dedup[ts] = row
+        return sorted(dedup.values(), key=lambda row: row["timestamp"])[:limit]
 
     # ------------------------------------------------------------------
     # M5 联网 shakedown 适配:公开历史数据归档回退路径(见模块 docstring)

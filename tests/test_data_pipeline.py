@@ -37,7 +37,10 @@ class FakeExchange:
         self.funding_rate_calls += 1
         return {"fundingRate": 0.0001, "symbol": symbol}
 
-    def fetch_funding_rate_history(self, symbol, since=None, limit=1000):
+    def fetch_funding_rate_history(self, symbol, since=None, limit=1000, params=None):
+        # params 形参是真实 ccxt 签名的一部分(M6 反向翻页会传 params=
+        # {"after": ...}),这里保留但不使用——这个假交易所本来就总共只有
+        # 3条确定性数据,不需要真的翻页。
         self.funding_history_calls += 1
         start = since if since is not None else 0
         step = 8 * 60 * 60 * 1000
@@ -194,6 +197,78 @@ def test_fetch_ohlcv_pagination_stops_when_exchange_runs_out_of_data(tmp_path):
     assert fake.ohlcv_calls == 3  # 300 + 300 + 50(最后一页不足per_call_limit,分页正确停止)
 
 
+class ListingDateOhlcvExchange(FakeExchange):
+    """M6 缺陷2 回归测试用:模拟"上市日晚于请求 since"的币种在真实OKX上的
+    行为(比如实测中的 CL/HYPE/LAB/MU/PUMP/SNDK/XAU/ZEC)——上市日之前
+    (bar 下标 < listing_bar_index)完全没有数据;不带游标的"探测"请求永远
+    返回紧贴"现在"的最新一页;带 params['until'] 游标时返回"早于该时间戳"
+    的一页(最多 per_call_limit 条),翻过上市日之后一律返回空。"""
+
+    def __init__(self, per_call_limit: int, listing_bar_index: int, bars_since_listing: int):
+        super().__init__()
+        self.per_call_limit = per_call_limit
+        self.listing_bar_index = listing_bar_index
+        self.total_available = listing_bar_index + bars_since_listing
+        self.calls_log: list[dict] = []
+
+    def fetch_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000, params=None):
+        self.ohlcv_calls += 1
+        params = params or {}
+        step = 4 * 60 * 60 * 1000
+        self.calls_log.append({"since": since, "limit": limit, "params": dict(params)})
+
+        def _bars(start_idx: int, end_idx: int) -> list[list]:
+            if start_idx >= end_idx:
+                return []
+            return [[i * step, 100.0, 101.0, 99.0, 100.5, 1000.0] for i in range(start_idx, end_idx)]
+
+        if "until" in params:
+            end_idx = min(params["until"] // step, self.total_available)
+            start_idx = max(self.listing_bar_index, end_idx - self.per_call_limit)
+            return _bars(start_idx, end_idx)
+
+        if since is not None:
+            # 正向请求(旧的、有缺陷的路径):since 早于上市日时,窗口完全
+            # 落在"上市前"就如实返回空——这正是缺陷2复现的关键。
+            start_idx = max(since // step, self.listing_bar_index)
+            end_idx = min(since // step + self.per_call_limit, self.total_available)
+            return _bars(start_idx, end_idx)
+
+        # 探测请求(since=None、无 until 游标):永远返回最新一页。
+        end_idx = self.total_available
+        start_idx = max(self.listing_bar_index, end_idx - self.per_call_limit)
+        return _bars(start_idx, end_idx)
+
+
+def test_fetch_ohlcv_since_before_listing_date_returns_full_history_since_listing(tmp_path):
+    """M6 缺陷2 回归测试:since=730天前 请求 CL/HYPE/LAB/MU/PUMP/SNDK/XAU/
+    ZEC 这类上市不满730天的币种时,正向分页第一页返回空,原代码把"空"误判
+    为"拉完了",最终0根K线。修复后应该自动收敛为"该币种上市以来的全部历史"
+    (M6规格书验收标准原话:"或该币种上市以来全部历史,以较短者为准")。"""
+    step = 4 * 60 * 60 * 1000
+    fake = ListingDateOhlcvExchange(per_call_limit=300, listing_bar_index=2000, bars_since_listing=650)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_ohlcv("HYPE/USDT:USDT", timeframe="4h", since=0, limit=100000)
+
+    assert len(df) == 650  # 上市日以来全部历史,不是0根
+    assert df["timestamp"].is_monotonic_increasing
+    assert df["timestamp"].duplicated().sum() == 0
+    assert int(df["timestamp"].min()) == 2000 * step  # 起点正好是"上市日"那根K线
+
+
+def test_fetch_ohlcv_symbol_with_absolutely_no_data_stays_empty_not_error(tmp_path):
+    """探测也拿不到任何数据(比如symbol写错/该合约从未有过K线)时,必须
+    安静地返回0根,而不是抛异常或者死循环。"""
+    fake = ListingDateOhlcvExchange(per_call_limit=300, listing_bar_index=0, bars_since_listing=0)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_ohlcv("NODATA/USDT:USDT", timeframe="4h", since=0, limit=100000)
+
+    assert len(df) == 0
+    assert list(df.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
 def test_fetch_ohlcv_single_call_unchanged_when_since_is_none(pipeline):
     """since=None(要"最近一批"数据,不是历史区间回放)时,不应该触发分页
     循环——保持原来的单次调用行为。"""
@@ -289,64 +364,105 @@ def test_fetch_funding_rate_history_cache_avoids_second_call(pipeline):
     assert fake.funding_history_calls == 1  # served from cache
 
 
-class PageCappedFundingExchange(FakeExchange):
-    """M6 回归测试用:模拟真实缓存中发现的 fetch_funding_rate_history 缺陷——
-    单次调用无视传入的 limit,恒定只返回 per_call_limit 条资金费率记录
-    (OKX实测约300条,资金费率每8小时结算一次,300条≈100天),必须分页才能
-    拿满 since→now 的完整区间(现有 data_cache/funding_*.parquet 全部只有
-    约96-99天,而 ohlcv 有完整730天,就是这个缺陷的直接证据)。"""
+class CursorPagedFundingExchange(FakeExchange):
+    """M6 缺陷1 修复后的回归测试用:模拟真实点火实测确认的 OKX
+    fetch_funding_rate_history 行为——
+
+    - 不带 params['after'] 游标时,永远返回"最新一页"(最多 per_call_limit
+      条,紧贴"现在"),**忽略 since**——这正是真实 OKX 的行为,ccxt/okx.py
+      里 since 只映射到 before(只圈下界,不圈上界),所以服务端永远优先给
+      满足下界条件的最新一批,不会因为 since 传得多早就给你更早的数据。
+    - 带 params['after']=X 时,返回"时间戳严格早于 X"的一页,同样最多
+      per_call_limit 条——这是 OKX 真正的向后翻页游标。
+
+    该币种总共有 total_available 条资金费率历史,时间戳从 idx=0(最早/
+    "上市日")到 idx=total_available-1("现在")。
+    """
 
     def __init__(self, per_call_limit: int, total_available: int):
         super().__init__()
         self.per_call_limit = per_call_limit
-        self.total_available = total_available  # 交易所总共"有"这么多条可给
-        self.calls_log: list[tuple[int, int]] = []  # (since, limit) 每次实际收到的调用参数
+        self.total_available = total_available
+        self.calls_log: list[dict] = []
 
-    def fetch_funding_rate_history(self, symbol, since=None, limit=1000):
+    def fetch_funding_rate_history(self, symbol, since=None, limit=1000, params=None):
         self.funding_history_calls += 1
-        start = since if since is not None else 0
-        self.calls_log.append((start, limit))
-        step = 8 * 60 * 60 * 1000  # 8小时结算周期
-        idx_start = start // step
-        rows = []
-        for i in range(self.per_call_limit):
-            idx = idx_start + i
-            if idx >= self.total_available:
-                break  # 交易所自己也没有更多数据了
-            ts = idx * step
-            rows.append({"timestamp": ts, "fundingRate": 0.0001})
-        return rows
+        params = params or {}
+        step = 8 * 60 * 60 * 1000
+        page_limit = min(limit or self.per_call_limit, self.per_call_limit)
+        self.calls_log.append({"since": since, "limit": limit, "params": dict(params)})
+
+        if "after" in params:
+            end_idx = min(params["after"] // step, self.total_available)
+            start_idx = max(0, end_idx - page_limit)
+        else:
+            end_idx = self.total_available
+            start_idx = max(0, end_idx - page_limit)
+
+        if start_idx >= end_idx:
+            return []
+        return [{"timestamp": i * step, "fundingRate": 0.0001} for i in range(start_idx, end_idx)]
 
 
-def test_fetch_funding_rate_history_paginates_past_single_call_cap(tmp_path):
-    """M6 回归测试:交易所单次调用恒定只返回300条资金费率,请求2年
-    (~2190条,每8小时一条)历史时,不分页只能拿到最早的300条(≈100天),
-    离用户要求的完整730天历史差得很远。"""
-    fake = PageCappedFundingExchange(per_call_limit=300, total_available=3000)
-    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
-
-    df = dp.fetch_funding_rate_history("BTC/USDT:USDT", since=0, limit=1500)
-
-    assert len(df) == 1500
-    assert fake.funding_history_calls == 5  # 300 * 5 = 1500
-    assert df["timestamp"].is_monotonic_increasing
-    assert df["timestamp"].duplicated().sum() == 0  # 多页拼接连续无空洞、无重复
-    # 分页游标必须每次都正确前进(下一页的 since 紧接着上一页最后一条记录之后)。
+def test_old_forward_since_style_would_only_ever_return_latest_page(tmp_path):
+    """回归写照(留档证明旧写法为什么在真实OKX语义下失效,不是测试当前
+    实现):旧代码把 since 游标一路向前推、原样传给 exchange.fetch_funding_
+    rate_history 的 since= 形参,从不使用 params['after']。在这个模拟真实
+    OKX 行为的 mock 下,无论 since 传多大,只要没有触及 after 游标,拿到的
+    永远是同一批"最新记录"——这正是生产实测"分页循环形同虚设"的根因。"""
+    fake = CursorPagedFundingExchange(per_call_limit=300, total_available=3000)
     step = 8 * 60 * 60 * 1000
-    for (since_a, _), (since_b, _) in zip(fake.calls_log, fake.calls_log[1:]):
-        assert since_b == since_a + fake.per_call_limit * step
+
+    page_at_since_0 = fake.fetch_funding_rate_history("BTC/USDT:USDT", since=0, limit=300)
+    page_at_since_far_later = fake.fetch_funding_rate_history(
+        "BTC/USDT:USDT", since=1000 * step, limit=300
+    )
+
+    assert page_at_since_0 == page_at_since_far_later
+    assert len(page_at_since_0) == 300
 
 
-def test_fetch_funding_rate_history_pagination_stops_when_exchange_runs_out_of_data(tmp_path):
-    """请求的 limit 超过交易所实际能给的总量时,分页必须正常停在"交易所说
-    没有了"这一页,不无限循环、也不假装凑够了 limit 条。"""
-    fake = PageCappedFundingExchange(per_call_limit=300, total_available=650)
+def test_fetch_funding_rate_history_paginates_backward_using_after_cursor(tmp_path):
+    """M6 缺陷1 修复验证:新实现改用 OKX 真实支持的向后翻页游标
+    (params['after']),应该能从"现在"往回拼出完整的历史(这里模拟约733天,
+    2200条×8h),不再被"since 正向推进对 OKX 无效"这个问题卡在约100天/300条。"""
+    fake = CursorPagedFundingExchange(per_call_limit=300, total_available=2200)
     dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
 
     df = dp.fetch_funding_rate_history("BTC/USDT:USDT", since=0, limit=100000)
 
-    assert len(df) == 650  # 拿到交易所实际能给的全部数据,不多不少
-    assert fake.funding_history_calls == 3  # 300 + 300 + 50(最后一页不足per_call_limit,分页正确停止)
+    assert len(df) == 2200  # 完整历史,不再卡在旧上限的~300条
+    assert df["timestamp"].is_monotonic_increasing
+    assert df["timestamp"].duplicated().sum() == 0  # 无重复无空洞
+    assert fake.funding_history_calls >= 8  # ceil(2200/300)=8,证明确实分了多页而非一次拿完
+
+
+def test_fetch_funding_rate_history_stops_when_history_exhausted(tmp_path):
+    """请求的区间超过该币种实际存在的历史时(比如 since 早于上市日),反向
+    翻页必须正常停在"交易所返回空页"这一页,不无限循环、也不假装凑够了。"""
+    fake = CursorPagedFundingExchange(per_call_limit=300, total_available=650)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_funding_rate_history("BTC/USDT:USDT", since=0, limit=100000)
+
+    assert len(df) == 650  # 拿到该币种实际存在的全部资金费率历史,不多不少
+
+
+def test_fetch_funding_rate_history_zero_network_calls_when_fully_cached(tmp_path):
+    """请求范围完全在缓存内时,不应该发起任何新的网络调用——现有缓存语义
+    (DataPipeline.fetch_funding_rate_history 顶部的 need_fetch 判断)不因为
+    分页实现从"前进"换成"后退"而回退。"""
+    fake = CursorPagedFundingExchange(per_call_limit=300, total_available=2200)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df1 = dp.fetch_funding_rate_history("BTC/USDT:USDT", since=0, limit=100000)
+    calls_after_first_fetch = fake.funding_history_calls
+    assert calls_after_first_fetch > 0
+    assert len(df1) == 2200
+
+    df2 = dp.fetch_funding_rate_history("BTC/USDT:USDT", since=0, limit=100000)
+    assert fake.funding_history_calls == calls_after_first_fetch  # 零新增网络调用
+    assert len(df2) == 2200
 
 
 def test_fetch_funding_rate_history_single_call_unchanged_when_since_is_none(pipeline):
@@ -492,7 +608,7 @@ def test_fetch_ohlcv_falls_back_to_archive_when_enabled_and_live_api_fails(tmp_p
 
 def test_fetch_funding_rate_history_falls_back_to_archive_when_enabled(tmp_path, monkeypatch):
     class AlwaysFailExchange:
-        def fetch_funding_rate_history(self, symbol, since=None, limit=1000):
+        def fetch_funding_rate_history(self, symbol, since=None, limit=1000, params=None):
             raise ConnectionError("simulated: live API unreachable")
 
     fake_zip = _make_fake_funding_zip([
