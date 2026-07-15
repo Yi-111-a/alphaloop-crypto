@@ -357,8 +357,11 @@ _TOURNAMENT_STAKES_SUFFIX = (
     "'平庸'和'亏损'一样致命:长期空仓观望零收益,大概率就是下一个被斩的。"
     "同理,仓位规模必须和信念匹配:target_notional_pct的单位是净值的百分点"
     "(15.0=拿净值的15%建仓),长期只动用个位数percent的资金,收益被锁死在"
-    "噪声量级,和空仓等价,一样是斩杀头号候选。有真实依据就配真实规模的"
-    "仓位,风险控制靠falsifier止损纪律,不靠把仓位缩到没有意义。"
+    "噪声量级,和空仓等价,一样是斩杀头号候选。本金只有100U,系统允许单仓"
+    "名义到净值100%、全组合总名义敞口到300%(即总杠杆3倍)——总敞口长期"
+    "连净值的100%都不到,意味着连1倍杠杆都不敢用满,数学上注定跑不出有意义"
+    "的收益,也逃不过斩杀。有真实依据就该用杠杆把仓位放大到有意义的量级,"
+    "风险控制靠falsifier止损纪律和杠杆选择,不靠把仓位缩到没有意义。"
     "你的每一笔决策都真实关系到这个战术能不能活下去。"
 )
 
@@ -1500,16 +1503,36 @@ def main() -> None:
 
         today = _utc_date_str(now)
 
-        # 研究(Researcher):每 research_interval_hours 小时一次(用户要求从
-        # "每UTC自然日一次"收紧到每小时一次)。标签改用日期-小时粒度(见
-        # _utc_research_label),避免同一天多次调用互相覆盖研究笔记文件。
+        # 研究(Researcher):每 research_interval_hours 小时一次。2026-07-15起
+        # 改为分支视角轮换制(用户要求):每个研究节拍轮到一个分支,用它自己
+        # 的人设视角做研究,产出写进它的私有记忆(L1+branch标签),其他分支
+        # 看不到——此前全局共读一份研究,实测导致7个分支全员同向押注同两个
+        # 币,种群观点趋同,锦标赛退化成比仓位大小。轮换制下调用量与原来
+        # 完全一致(每小时1次),每个分支约N小时轮到一次(N=活跃分支数)。
         if now - last_research_ms >= research_interval_ms:
             research_label = _utc_research_label(now)
+            research_roster = load_tournament_roster(now, _DEFAULT_EVO_TACTICS)
+            research_branches = ["main"] + [
+                b for b, m in research_roster.items() if m.get("status") == "active"
+            ]
+            research_idx = int(schedule_state.get("research_rotation_idx", 0)) % len(research_branches)
+            research_branch = research_branches[research_idx]
+            if research_branch == "main":
+                research_persona = load_main_tactics() or (
+                    "main主账户的稳健基线风格:低杠杆、分散、以可证伪假设驱动"
+                )
+            else:
+                research_persona = research_roster[research_branch]["tactics"]
             try:
-                research_result = scheduler.run_daily_research(research_label)
-                print(f"[{now}] 研究{'完成: ' + str(research_result) if research_result is not None else '本轮失败(已记录),下个节拍自然重试'}", flush=True)
+                research_result = researcher.daily_research(
+                    ts=now, date_str=research_label,
+                    branch=research_branch, persona=research_persona,
+                )
+                print(f"[{now}] [{research_branch}] 分支视角研究完成: {research_result}", flush=True)
             except Exception:  # noqa: BLE001
-                print(f"[{now}] run_daily_research 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+                print(f"[{now}] [{research_branch}] daily_research 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+            schedule_state["research_rotation_idx"] = research_idx + 1
+            save_schedule_state(schedule_state)
             last_research_ms = now
 
         # 每日净值记录(nav.tsv 三线)+ 熔断检查:每个UTC自然日一次。

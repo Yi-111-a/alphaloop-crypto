@@ -425,7 +425,8 @@ class Researcher:
     # ------------------------------------------------------------------
 
     def _build_daily_prompt(
-        self, date_str: str, search_results: list[dict], retry_feedback: Optional[str]
+        self, date_str: str, search_results: list[dict], retry_feedback: Optional[str],
+        persona: Optional[str] = None,
     ) -> str:
         lines = [
             "You are the Researcher agent for AlphaLoop-Crypto (§3.1), running daily "
@@ -435,6 +436,22 @@ class Researcher:
             "ideas for what KINDS of hypotheses a crypto trading research agent should produce "
             "(do not fabricate specific citations you cannot support).",
             "",
+        ]
+        if persona:
+            # 分支视角研究(2026-07-15,用户要求):同一份市场,不同人设的研究员
+            # 应该看到不同的机会。没有这一段时,所有分支共读一份研究产出,
+            # 实测导致7个分支全员同向押注同两个币——种群相关性过高,锦标赛
+            # 退化成"比仓位大小"而不是"比观点对错"。
+            lines += [
+                "IMPORTANT — RESEARCH THROUGH THIS SPECIFIC LENS: you are researching "
+                "exclusively for ONE trading style, described as follows:",
+                persona,
+                "Every hypothesis you produce must be the kind of opportunity THIS style "
+                "would act on (not generic market observations another style would equally "
+                "use). Findings are private to this branch and will not be shared.",
+                "",
+            ]
+        lines += [
             "Respond with a JSON list ONLY, each item shaped exactly as: "
             '{"source": str, "core_idea": str, "testable_hypothesis": str, '
             '"suggested_experiment": str}. All four fields are required non-empty strings.',
@@ -475,17 +492,25 @@ class Researcher:
         ts: int,
         date_str: str,
         queries: Optional[list[str]] = None,
+        branch: Optional[str] = None,
+        persona: Optional[str] = None,
     ) -> Path:
-        """稳态每日调研(§3.1)。ts 只用于潜在的记忆写入时间戳(当前实现不在
-        daily_research 里写memory——spec §3.1原文只规定输出research_notes文件；
-        往memory写只在§4.0冷启动步骤明确要求，见run_cold_start_research)，
-        date_str 由调用方显式传入,本方法内部不派生"今天"是哪天。
+        """稳态调研(§3.1)。date_str 由调用方显式传入,本方法内部不派生"今天"。
+
+        2026-07-15起支持分支视角研究(用户要求,见_build_daily_prompt里persona
+        段的说明):传入 branch+persona 时——
+          1. prompt 带上该分支的人设视角,产出"只有这种风格会用"的假设;
+          2. 每条假设写入 memory_store 并打上 branch 标签(L1层,分支私有,
+             检索侧保证其他分支看不到)——这是分支研究影响该分支后续决策的
+             通道,不打标签的旧行为(只写文件、Trader永远看不到)等于白研究;
+          3. 笔记文件名带分支后缀,避免同一小时多个分支互相覆盖。
+        不传 branch(旧调用方式)时行为完全不变:只写共享笔记文件,不进memory。
         """
         queries = queries if queries is not None else list(_DEFAULT_DAILY_QUERIES)
         search_results = self._run_searches(queries)
 
         def build_prompt(retry_feedback: Optional[str]) -> str:
-            return self._build_daily_prompt(date_str, search_results, retry_feedback)
+            return self._build_daily_prompt(date_str, search_results, retry_feedback, persona=persona)
 
         findings, _error = _call_llm_for_json_list(
             self.llm_client, build_prompt, _validate_finding, max_retries=self.max_retries
@@ -496,8 +521,28 @@ class Researcher:
         content = self._findings_to_markdown(date_str, findings)
 
         self.research_notes_dir.mkdir(parents=True, exist_ok=True)
-        out_path = self.research_notes_dir / f"{date_str}.md"
+        if branch is not None:
+            safe_branch = branch.replace("/", "_").replace(":", "_")
+            out_path = self.research_notes_dir / f"{date_str}-{safe_branch}.md"
+        else:
+            out_path = self.research_notes_dir / f"{date_str}.md"
         out_path.write_text(content, encoding="utf-8")
+
+        if branch is not None:
+            for finding in findings:
+                mem_content = (
+                    f"[研究发现/{branch}] {finding['core_idea']} || 可测试假设: "
+                    f"{finding['testable_hypothesis']}"
+                )
+                try:
+                    self.memory_store.write(
+                        content=mem_content, ts=ts, layer="L1", importance=1.0, branch=branch
+                    )
+                except TypeError:
+                    # 旧memory_store实现(测试Fake)可能没有branch参数,降级为
+                    # 共享写入——与trader.py/reflector.py同款duck-type兼容。
+                    self.memory_store.write(content=mem_content, ts=ts, layer="L1", importance=1.0)
+
         return out_path
 
     # ------------------------------------------------------------------

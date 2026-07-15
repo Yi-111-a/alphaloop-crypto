@@ -51,6 +51,9 @@ from LOCKED.simulator import MIN_THESIS_LEN
 # ---------------------------------------------------------------------------
 
 VALID_ACTIONS = {"open_long", "open_short", "close", "adjust", "hold"}
+MIN_OPEN_NOTIONAL_PCT = 5.0  # 开仓/调仓的最小名义仓位(净值百分点)。2026-07-15
+                              # 用户两次真实反馈后定为5%:先是LLM给出0.02%粉尘仓,
+                              # 后是全员仓位小到"很久都挣不了1U"。hold/close不受限。
 MIN_LEVERAGE = 1
 MAX_LEVERAGE = 10  # 模块级兜底默认值，仅在 Trader 未显式传入 max_leverage 时
                     # (如测试里的裸构造)生效。生产路径下 Trader(max_leverage=...)
@@ -169,16 +172,19 @@ def _validate_decision_dict(
             f"target_notional_pct_invalid: must be in [0,100] (percent of NAV, "
             f"never negative -- direction comes from action, not sign), got {target_notional_pct!r}"
         )
-    elif action in ("open_long", "open_short", "adjust") and target_notional_pct < 1.0:
+    elif action in ("open_long", "open_short", "adjust") and target_notional_pct < MIN_OPEN_NOTIONAL_PCT:
         # 2026-07-15新增语义校验:真实观察到LLM给出0.02%/0.1%这种"连手续费都
         # 跑不赢"的仓位——要么是把百分点误当成了0-1小数比例(0.1其实想表达
         # 10%),要么是无意义的过度胆小。两种情况都应该拒绝重试,并在反馈里
-        # 把单位讲清楚,而不是放行一笔毫无意义的决策。
+        # 把单位讲清楚,而不是放行一笔毫无意义的决策。同日用户观察到全员
+        # 仓位过小("别很久都挣不了1U"),底线从1%提到5%——100U本金下5%
+        # 仍然只是5U名义,这是"有意义仓位"的地板,不是天花板。
         errors.append(
-            f"target_notional_pct_invalid: {target_notional_pct!r} is below the 1.0 minimum "
-            "for open/adjust decisions. NOTE the unit is PERCENTAGE POINTS of NAV: 15.0 means "
-            "15% of account value, 0.1 means one-tenth of one percent (almost nothing). "
-            "If you intended a fraction (e.g. 0.15 = 15%), multiply by 100."
+            f"target_notional_pct_invalid: {target_notional_pct!r} is below the "
+            f"{MIN_OPEN_NOTIONAL_PCT} minimum for open/adjust decisions. NOTE the unit is "
+            "PERCENTAGE POINTS of NAV: 15.0 means 15% of account value, 0.1 means one-tenth "
+            "of one percent (almost nothing). If you intended a fraction (e.g. 0.15 = 15%), "
+            "multiply by 100."
         )
 
     symbol = d.get("symbol")
