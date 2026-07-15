@@ -301,14 +301,22 @@ class Trader:
     # prompt 格式化
     # ------------------------------------------------------------------
 
-    def _format_prompt(self, context: dict, retry_feedback: Optional[str] = None) -> str:
+    def _format_prompt(self, context: dict, retry_feedback: Optional[str] = None, ts: Optional[int] = None) -> str:
         lines = [
             "You are the Trader agent for AlphaLoop-Crypto (§3.2). "
             "Respond with a JSON list of decision objects only, matching the Decision schema "
             "(ts, symbol, action, target_notional_pct, leverage, thesis, falsifier, horizon). "
-            "UNITS: target_notional_pct is PERCENTAGE POINTS of account NAV -- 15.0 means a "
+            # 2026-07-15强化(API模式真实故障:flash模型带长战术文本时输出
+            # action:'open'和ISO字符串ts,6个分支连续3次校验失败全部兜底hold):
+            # ①action枚举逐字写死 ②ts直接给出权威整数值,不让模型发明时间戳
+            # (桥模式时代是签入agent人工算好的,API模式下模型无从知晓)。
+            f"STRICT FORMAT: \"action\" MUST be exactly one of: \"open_long\", \"open_short\", "
+            f"\"close\", \"adjust\", \"hold\" -- never \"open\"/\"buy\"/\"sell\"/\"long\"/\"short\". "
+            + (f"\"ts\" MUST be exactly the integer {ts} (epoch milliseconds, copy it verbatim, "
+               f"NOT an ISO date string). " if ts is not None else "")
+            + "UNITS: target_notional_pct is PERCENTAGE POINTS of account NAV -- 15.0 means a "
             "position worth 15% of account value, NOT a 0-1 fraction. Open/adjust decisions "
-            "below 1.0 (i.e. under 1% of NAV) are rejected as economically meaningless. "
+            "below 5.0 (i.e. under 5% of NAV) are rejected as economically meaningless. "
             "Size positions to match conviction: capital that sits idle earns nothing. "
             "For every decision whose action is NOT \"hold\", you MUST also include "
             "falsifier_condition: a machine-readable price clause in the exact format "
@@ -362,6 +370,11 @@ class Trader:
             if not isinstance(item, dict):
                 all_errors.append(f"item_{i}_not_an_object")
                 continue
+            # ts是基础设施字段(本决策周期的时间戳),不是交易判断——权威值
+            # 就是decide()的入参,模型输出什么都以系统值为准。2026-07-15
+            # API模式实测模型会编造ISO字符串/错误时间戳,与其反复重试教它
+            # 抄对一个它本来就不该负责的数字,不如直接覆盖。
+            item["ts"] = ts
             errs = _validate_decision_dict(
                 item, max_leverage=self.max_leverage, valid_symbols=valid_symbols
             )
@@ -423,7 +436,7 @@ class Trader:
 
         retry_feedback: Optional[str] = None
         for _attempt in range(1, self.max_retries + 1):
-            prompt = self._format_prompt(context, retry_feedback)
+            prompt = self._format_prompt(context, retry_feedback, ts=ts)
             raw_response = self.llm_client(prompt)
             decisions, error = self._parse_and_validate(raw_response, ts, branch, valid_symbols=valid_symbols)
             if error is None:
