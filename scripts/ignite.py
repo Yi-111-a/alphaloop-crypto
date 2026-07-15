@@ -162,13 +162,16 @@ def build_llm_clients(config: dict):
 
     api_cfg = llm_cfg.get("api", {}) or {}
     max_daily_calls = int(api_cfg.get("max_daily_calls", 600))
+    base_url = api_cfg.get("base_url")  # None=官方Anthropic;可指向任何Anthropic格式兼容端点
     routine_llm = AnthropicLLMClient(
         model=api_cfg.get("trader_model", "claude-haiku-4-5-20251001"),
         max_daily_calls=max_daily_calls,
+        base_url=base_url,
     )
     deep_llm = AnthropicLLMClient(
         model=api_cfg.get("deep_model", "claude-sonnet-5"),
         max_daily_calls=max_daily_calls,
+        base_url=base_url,
     )
     return routine_llm, deep_llm
 

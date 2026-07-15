@@ -109,6 +109,7 @@ class AnthropicLLMClient:
         max_daily_calls: int = 600,
         timeout_seconds: float = 180.0,
         usage_path: Optional[Path] = None,
+        base_url: Optional[str] = None,
     ):
         import anthropic  # 延迟导入:桥模式/本地测试不需要装 anthropic SDK
 
@@ -116,7 +117,13 @@ class AnthropicLLMClient:
         self.max_tokens = max_tokens
         self.max_daily_calls = max_daily_calls
         self.usage_path = usage_path or (STATE_ROOT / "llm_api_usage.json")
-        self._client = anthropic.Anthropic(timeout=timeout_seconds, max_retries=2)
+        # base_url:兼容Anthropic消息格式的第三方端点(用户2026-07-15选定
+        # DeepSeek,base_url=https://api.deepseek.com/anthropic,模型
+        # deepseek-v4-flash/pro)。None时走官方Anthropic端点。
+        client_kwargs: dict = {"timeout": timeout_seconds, "max_retries": 2}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self._client = anthropic.Anthropic(**client_kwargs)
         STATE_ROOT.mkdir(parents=True, exist_ok=True)
 
     def _load_usage(self) -> dict:
