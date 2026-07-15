@@ -6,6 +6,13 @@ scripts/backfill_history.py —— M6 一次性历史数据回填脚本。
 1. fetch_funding_rate_history 的分页在真实OKX上无效(since 正向推进对
    OKX 无意义,永远拿到同一批最新记录),导致 data_cache/funding_*.parquet
    一直只有约96-99天数据,而 fetch_ohlcv 早就能拿到完整 730 天。
+   ——2026-07-15 修复上线后在真实OKX上验证的补充真相:分页修好之后资金
+   费率依然只有~92天,直接探测确认(请求4个月前的记录返回0条)这是 OKX
+   公共 funding-rate-history 端点自身的【约3个月硬上限】,不是本侧代码
+   问题。所以回测里 92 天之前的资金费率查不到、按 0 处理(BacktestEngine
+   会记 funding-miss 计数)——这是一个已知且量化过的偏差(费率量级约
+   0.01%/8h),不是静默错误。想要更深的资金费率历史,唯一途径是换数据源
+   (如 Binance 公共归档做代理),留作未来选项,不在本次范围。
 2. 上市晚于 since 的币种(CL/HYPE/LAB/MU/PUMP/SNDK/XAU/ZEC 等)OHLCV 拉到
    0根——正向分页第一页为空被误判为"拉完了"。现在会自动收敛为"该币种
    上市以来全部历史"。
