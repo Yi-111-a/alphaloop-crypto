@@ -117,6 +117,17 @@ tactic_tournament:                # 用户要求"自动进化+晋升赢家"(2026
                                   # 斩杀——哪怕在盈利。惩罚"平庸",保证种群持续换血
   cull_min_age_hours: 12         # 新分支保护期:不满一个窗口不参与排名,否则新补位
                                   # 分支(空仓零收益)必然垫底秒死,进化变成死循环
+backtest:                          # M6 内环回测(改造规格书§5,2026-07-15)
+  scratch_root: ASSET/strategy/experiments   # 回测产物隔离目录,绝不碰生产LOG/state
+  windows:
+    train_days: 365
+    val_window_days: 90
+    val_window_count: 2            # 至少2个独立验证窗口(防过拟合:评分取最差窗口)
+    holdout_days: 90               # 时间上最新的一段,内环迭代期间不可见,
+                                    # 只在晋升评审报告里做事后一致性检验
+  min_history_days_required: 730   # 与 data.history_days 一致
+  max_experiments_per_night: 50    # 软上限,防内环失控刷屏(LLM预算另由llm.api.max_daily_calls管)
+
 data:
   exchange: okx                # M5 shakedown 期间由 binance 改为 okx(见 universe_rule.source 注释)
   timeframe: 4h

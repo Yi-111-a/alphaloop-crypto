@@ -232,6 +232,54 @@ class DataPipeline:
         return all_rows[:limit]
 
     # ------------------------------------------------------------------
+    # M6 缺陷修复:资金费率历史分页拉取。fetch_ohlcv 早在 M5 就补了
+    # _fetch_ohlcv_live_paginated,但 fetch_funding_rate_history 当时漏改,
+    # 一直只发一次请求——同样被 OKX 单次请求的硬上限卡住(实测约300条)。
+    # 资金费率每8小时结算一次,300条≈100天,而 fetch_ohlcv 能拿到完整
+    # history_days=730 天。现有缓存(data_cache/funding_*.parquet)全部
+    # 只有约96-99天就是这个缺陷的直接证据。修法与 OHLCV 同构:since 游标
+    # 按固定的8小时结算周期推进(资金费率没有"timeframe"概念,间隔是
+    # config.yaml funding.settle_hours_utc 隐含的常数,不是参数)。
+    # ------------------------------------------------------------------
+
+    _FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000  # 资金费率结算周期固定8小时
+
+    def _fetch_funding_rate_history_live_paginated(
+        self, symbol: str, since: int, limit: int, per_call_limit: int = 300
+    ) -> list[dict]:
+        """从 since 开始,反复调用 self.exchange.fetch_funding_rate_history 向前
+        翻页,直到拿满 limit 条、追上"现在"、或交易所不再返回新数据为止。
+        与 _fetch_ohlcv_live_paginated 同构:每一页都走 _with_retry,单页失败时
+        的重试语义完全一致;翻页游标用"上一页最后一条记录的 timestamp + 固定
+        结算周期"前进,而不是简单地数条数——避免交易所某一页恰好不足
+        per_call_limit 但游标计算错误导致的空洞或重复。"""
+        all_rows: list[dict] = []
+        current_since = since
+        now_ms = self.clock.now_ms()
+
+        while len(all_rows) < limit and current_since <= now_ms:
+            page = self._with_retry(
+                lambda s=current_since: self.exchange.fetch_funding_rate_history(
+                    symbol, since=s, limit=per_call_limit
+                ),
+                f"fetch_funding_rate_history({symbol}, since={current_since})",
+            )
+            if not page:
+                break
+            all_rows.extend(page)
+            last_ts = page[-1].get("timestamp")
+            if last_ts is None or last_ts <= current_since:
+                # 交易所没有真正向前推进,停止分页,避免死循环(与 OHLCV 分页
+                # 同款防御,理由见 _fetch_ohlcv_live_paginated)。
+                break
+            current_since = last_ts + self._FUNDING_INTERVAL_MS
+            if len(page) < per_call_limit:
+                # 交易所返回的条数不足单页上限,说明这已经是能拿到的最后一页。
+                break
+
+        return all_rows[:limit]
+
+    # ------------------------------------------------------------------
     # M5 联网 shakedown 适配:公开历史数据归档回退路径(见模块 docstring)
     # ------------------------------------------------------------------
 
@@ -517,10 +565,17 @@ class DataPipeline:
 
         if need_fetch:
             try:
-                raw = self._with_retry(
-                    lambda: self.exchange.fetch_funding_rate_history(symbol, since=since, limit=limit),
-                    f"fetch_funding_rate_history({symbol})",
-                )
+                if since is not None:
+                    # 分页拉取(M6修复):理由同 fetch_ohlcv——since 有值代表
+                    # 调用方要"从某个历史起点到现在"的完整区间,不分页只能拿到
+                    # 起点附近约300条(≈100天),覆盖不了 history_days=730 天。
+                    # since=None(要"最近一批")时沿用原来的单次调用。
+                    raw = self._fetch_funding_rate_history_live_paginated(symbol, since, limit)
+                else:
+                    raw = self._with_retry(
+                        lambda: self.exchange.fetch_funding_rate_history(symbol, since=since, limit=limit),
+                        f"fetch_funding_rate_history({symbol})",
+                    )
                 rows = [
                     {
                         "timestamp": entry.get("timestamp"),

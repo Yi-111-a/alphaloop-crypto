@@ -289,6 +289,74 @@ def test_fetch_funding_rate_history_cache_avoids_second_call(pipeline):
     assert fake.funding_history_calls == 1  # served from cache
 
 
+class PageCappedFundingExchange(FakeExchange):
+    """M6 回归测试用:模拟真实缓存中发现的 fetch_funding_rate_history 缺陷——
+    单次调用无视传入的 limit,恒定只返回 per_call_limit 条资金费率记录
+    (OKX实测约300条,资金费率每8小时结算一次,300条≈100天),必须分页才能
+    拿满 since→now 的完整区间(现有 data_cache/funding_*.parquet 全部只有
+    约96-99天,而 ohlcv 有完整730天,就是这个缺陷的直接证据)。"""
+
+    def __init__(self, per_call_limit: int, total_available: int):
+        super().__init__()
+        self.per_call_limit = per_call_limit
+        self.total_available = total_available  # 交易所总共"有"这么多条可给
+        self.calls_log: list[tuple[int, int]] = []  # (since, limit) 每次实际收到的调用参数
+
+    def fetch_funding_rate_history(self, symbol, since=None, limit=1000):
+        self.funding_history_calls += 1
+        start = since if since is not None else 0
+        self.calls_log.append((start, limit))
+        step = 8 * 60 * 60 * 1000  # 8小时结算周期
+        idx_start = start // step
+        rows = []
+        for i in range(self.per_call_limit):
+            idx = idx_start + i
+            if idx >= self.total_available:
+                break  # 交易所自己也没有更多数据了
+            ts = idx * step
+            rows.append({"timestamp": ts, "fundingRate": 0.0001})
+        return rows
+
+
+def test_fetch_funding_rate_history_paginates_past_single_call_cap(tmp_path):
+    """M6 回归测试:交易所单次调用恒定只返回300条资金费率,请求2年
+    (~2190条,每8小时一条)历史时,不分页只能拿到最早的300条(≈100天),
+    离用户要求的完整730天历史差得很远。"""
+    fake = PageCappedFundingExchange(per_call_limit=300, total_available=3000)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_funding_rate_history("BTC/USDT:USDT", since=0, limit=1500)
+
+    assert len(df) == 1500
+    assert fake.funding_history_calls == 5  # 300 * 5 = 1500
+    assert df["timestamp"].is_monotonic_increasing
+    assert df["timestamp"].duplicated().sum() == 0  # 多页拼接连续无空洞、无重复
+    # 分页游标必须每次都正确前进(下一页的 since 紧接着上一页最后一条记录之后)。
+    step = 8 * 60 * 60 * 1000
+    for (since_a, _), (since_b, _) in zip(fake.calls_log, fake.calls_log[1:]):
+        assert since_b == since_a + fake.per_call_limit * step
+
+
+def test_fetch_funding_rate_history_pagination_stops_when_exchange_runs_out_of_data(tmp_path):
+    """请求的 limit 超过交易所实际能给的总量时,分页必须正常停在"交易所说
+    没有了"这一页,不无限循环、也不假装凑够了 limit 条。"""
+    fake = PageCappedFundingExchange(per_call_limit=300, total_available=650)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_funding_rate_history("BTC/USDT:USDT", since=0, limit=100000)
+
+    assert len(df) == 650  # 拿到交易所实际能给的全部数据,不多不少
+    assert fake.funding_history_calls == 3  # 300 + 300 + 50(最后一页不足per_call_limit,分页正确停止)
+
+
+def test_fetch_funding_rate_history_single_call_unchanged_when_since_is_none(pipeline):
+    """since=None(要"最近一批"数据)时,不应该触发分页循环——保持原来的
+    单次调用行为,与 fetch_ohlcv 的同款约定一致。"""
+    dp, fake = pipeline
+    dp.fetch_funding_rate_history("BTC/USDT:USDT", since=None, limit=3)
+    assert fake.funding_history_calls == 1
+
+
 # ----------------------------------------------------------------------
 # no private/order-placement surface
 # ----------------------------------------------------------------------
