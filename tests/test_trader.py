@@ -593,3 +593,37 @@ class TestMinimumMeaningfulPositionSize:
         )
         assert llm_client.calls["count"] == 1
         assert decisions[0].action == "hold"
+
+
+class TestMarketRegimeLine:
+    """2026-07-15:快照带趋势字段时,prompt里必须出现大势判断行(API模式下
+    模型无状态,没有这行它不知道全场在跌还是在涨)。"""
+
+    def test_regime_line_appears_with_trend_fields(self):
+        from ASSET.strategy.trader import _market_regime_line
+
+        snap = {
+            "A/USDT:USDT": {"last": 1.0, "chg_24h_pct": -5.0, "chg_7d_pct": -12.0},
+            "B/USDT:USDT": {"last": 2.0, "chg_24h_pct": -3.0, "chg_7d_pct": -8.0},
+            "C/USDT:USDT": {"last": 3.0, "chg_24h_pct": 1.0, "chg_7d_pct": 2.0},
+        }
+        line = _market_regime_line(snap)
+        assert "2/3 symbols are DOWN" in line
+        assert "open_short" in line
+
+    def test_no_trend_fields_returns_empty(self):
+        from ASSET.strategy.trader import _market_regime_line
+
+        assert _market_regime_line({"A/USDT:USDT": {"last": 1.0}}) == ""
+        assert _market_regime_line({"A/USDT:USDT": 60000.0}) == ""  # 旧式标量快照不崩
+
+    def test_prompt_contains_regime_when_snapshot_enriched(self):
+        memory_store = FakeMemoryStore()
+        trader = Trader(llm_client=lambda p: "[]", memory_store=memory_store)
+        ctx = trader.build_context(
+            positions=[], ts=1,
+            latest_snapshot={"A/USDT:USDT": {"last": 1.0, "chg_24h_pct": -9.9}},
+            last_reflection_summary=None, program_tactics=None, memory_query_text="q",
+        )
+        prompt = trader._format_prompt(ctx, None, ts=1)
+        assert "MARKET REGIME" in prompt

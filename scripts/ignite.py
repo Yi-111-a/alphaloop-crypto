@@ -1099,9 +1099,40 @@ def main() -> None:
         ticker = dp.fetch_latest_snapshot([symbol])[symbol]
         return {"open_time": ts + 1, "open": float(ticker["last"])}
 
+    # 趋势上下文缓存:{symbol: (computed_at_ms, chg_24h_pct, chg_7d_pct)}。
+    # 2026-07-15用户指出的真实盲区:API模式下Trader是无状态的,快照里只有
+    # 当前价,模型根本不知道"LAB刚跌了26%"、更看不到"全场都在跌"的大势,
+    # 于是全员逆势做多。这里给每个symbol补上24h/7d涨跌幅(从4h K线算,
+    # 24h=6根、7d=42根),trader._format_prompt再基于这些字段生成大势
+    # 判断行。10分钟memo缓存:snapshot_provider每轮决策会被7个分支各调
+    # 一次,不缓存的话13个币x7次=91次K线拉取/30分钟,纯浪费。
+    _trend_cache: dict = {}
+    _TREND_CACHE_MS = 10 * 60_000
+
+    def _trend_fields(symbol: str, now_ms: int) -> dict:
+        cached = _trend_cache.get(symbol)
+        if cached and now_ms - cached[0] < _TREND_CACHE_MS:
+            return {"chg_24h_pct": cached[1], "chg_7d_pct": cached[2]}
+        try:
+            bars = dp.fetch_ohlcv(symbol, "4h", limit=43)
+            closes = bars["close"]
+            last = float(closes.iloc[-1])
+            chg24 = round((last / float(closes.iloc[-7]) - 1) * 100, 2) if len(closes) >= 7 else None
+            chg7d = round((last / float(closes.iloc[-43]) - 1) * 100, 2) if len(closes) >= 43 else None
+            _trend_cache[symbol] = (now_ms, chg24, chg7d)
+            return {"chg_24h_pct": chg24, "chg_7d_pct": chg7d}
+        except Exception:  # noqa: BLE001 -- 趋势字段是增强信息,拉不到不该毁掉整个快照
+            return {}
+
     def snapshot_provider(ts: int) -> dict:
         symbols_now = json.loads(UNIVERSE_PATH.read_text(encoding="utf-8"))["symbols"] if UNIVERSE_PATH.exists() else []
-        return dp.fetch_latest_snapshot(symbols_now) if symbols_now else {}
+        if not symbols_now:
+            return {}
+        snap = dp.fetch_latest_snapshot(symbols_now)
+        for symbol, ticker in snap.items():
+            if isinstance(ticker, dict):
+                ticker.update(_trend_fields(symbol, ts))
+        return snap
 
     def funding_rate_lookup(symbol: str, ts: int) -> float:
         history = dp.fetch_funding_rate_history(symbol, since=ts - 3_600_000, limit=5)

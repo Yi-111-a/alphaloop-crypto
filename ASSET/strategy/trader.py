@@ -70,6 +70,42 @@ _HOLD_FALLBACK_SYMBOL = "BTC/USDT:USDT"
 _HYPOTHESIS_RE = re.compile(r"H\d+")
 
 
+def _market_regime_line(latest_snapshot: dict) -> str:
+    """从快照的 chg_24h_pct/chg_7d_pct 字段(由 scripts/ignite.py 的
+    snapshot_provider 注入)汇总一行"大势"描述,直接放进 Trader prompt。
+
+    2026-07-15,用户观察:全场普跌的日子里全员做多——API模式下模型是无
+    状态的,快照里只有当前价,它根本不知道市场处于什么状态。这一行给它
+    宽度(几成币在跌)和均值(平均跌幅),让"顺势应该做空"成为模型能推出的
+    结论,而不是永远缺失的前提。快照里没有趋势字段时返回空串(测试/回退
+    场景),prompt保持旧形态。"""
+    changes_24h = [
+        t["chg_24h_pct"] for t in latest_snapshot.values()
+        if isinstance(t, dict) and isinstance(t.get("chg_24h_pct"), (int, float))
+    ]
+    if not changes_24h:
+        return ""
+    down = sum(1 for c in changes_24h if c < 0)
+    avg = sum(changes_24h) / len(changes_24h)
+    changes_7d = [
+        t["chg_7d_pct"] for t in latest_snapshot.values()
+        if isinstance(t, dict) and isinstance(t.get("chg_7d_pct"), (int, float))
+    ]
+    parts = [
+        f"MARKET REGIME (compute direction from this, not vibes): over the last 24h, "
+        f"{down}/{len(changes_24h)} symbols are DOWN, average 24h change {avg:+.1f}%."
+    ]
+    if changes_7d:
+        down7 = sum(1 for c in changes_7d if c < 0)
+        avg7 = sum(changes_7d) / len(changes_7d)
+        parts.append(f"Over 7d: {down7}/{len(changes_7d)} down, average {avg7:+.1f}%.")
+    parts.append(
+        "In a broad downtrend the with-trend trade is open_short; in a broad uptrend "
+        "it is open_long. Per-symbol chg_24h_pct/chg_7d_pct fields are in the snapshot."
+    )
+    return " ".join(parts)
+
+
 def references_hypothesis(thesis: str) -> bool:
     """True if thesis contains a hypothesis-number reference like H1, H12, etc.
 
@@ -341,6 +377,12 @@ class Trader:
             f"4. Most recent reflection summary: {context['last_reflection_summary']}",
             f"5. Tactical instructions (program.md): {context['program_tactics']}",
         ]
+        regime_line = _market_regime_line(context.get("latest_snapshot") or {})
+        if regime_line:
+            # 大势判断(2026-07-15用户要求):API模式下模型无状态,不给这行
+            # 它连"全场都在跌"都不知道,只能凭当前价瞎猜方向。
+            lines.append("")
+            lines.append(regime_line)
         if retry_feedback:
             lines.append("")
             lines.append(
