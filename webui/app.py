@@ -393,14 +393,23 @@ def api_nav_intraday_branches(hours: int = 72) -> dict:
 def api_branches() -> dict:
     # random对照组已按用户要求(2026-07-14)下线,不再出现在分支列表里——
     # 见 scripts/ignite.py 模块docstring里对应的说明。
-    evo = _read_registered_branches()
-    branches = [
-        {"branch": "main", "label": "main", "kind": "main"},
-    ] + [
-        {"branch": r["branch"], "label": r["branch"], "kind": "evo", "created_date": r.get("created_date")}
-        for r in evo
-        if "branch" in r
-    ]
+    # 2026-07-15:分支列表改为 branch_registrations.jsonl ∪ 锦标赛名册。
+    # M8把evolution.max_concurrent_branches收回到4之后,6个提示词分支里只有
+    # 前4个能在orchestrator注册成功(注册表是judge()晋升链路的簿记,不是
+    # 锦标赛的存活名单)——只读注册表会让面板漏掉后两个活着的分支。名册
+    # (state/tactic_tournament_roster.json)才是"谁真的在跑"的事实来源。
+    seen: dict[str, dict] = {}
+    for r in _read_registered_branches():
+        if "branch" in r:
+            seen[r["branch"]] = {"branch": r["branch"], "label": r["branch"], "kind": "evo",
+                                 "created_date": r.get("created_date")}
+    roster = _read_json_state_file(STATE_ROOT / "tactic_tournament_roster.json") or {}
+    for branch, meta in roster.items():
+        if isinstance(meta, dict) and meta.get("status") == "active" and branch not in seen:
+            seen[branch] = {"branch": branch, "label": branch, "kind": "evo", "created_date": None}
+    branches = [{"branch": "main", "label": "main", "kind": "main"}] + sorted(
+        seen.values(), key=lambda b: b["branch"]
+    )
     return {"branches": branches, "has_data": True}
 
 
