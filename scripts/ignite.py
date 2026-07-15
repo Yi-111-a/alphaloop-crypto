@@ -77,6 +77,38 @@ run_ratchet_judgment/mark_daily_nav/run_circuit_breaker_check 都是main.py
       占位,不是继续追踪一条真实的随机决策净值轨迹;webui面板侧也已经把
       "随机对照"从图表/分支选择器里去掉。
 
+M8 晋升闸门重构(改造规格书M8,2026-07-15):
+    - 诊断(规格书§0.1诊断2):本文件此前调 run_ratchet_judgment 时
+      branch_navs 永远只传 {"main": ...},EvolutionOrchestrator.judge() 的
+      "候选分支必须同时出现在 branch_navs 和 branch_created_dates 里"这条
+      交集过滤使 verdicts 恒为空,GitMergeExecutor 这条生产链路从未被真实
+      调用过——锦标赛"晋升"一个evo分支时,晋升的只是一段战术文字(见
+      save_main_tactics),不是真正的代码/分支晋升。
+    - 修复本体:scheduler.trader 现在不再直接是 ASSET/strategy/trader.py
+      的 Trader(纯LLM),而是包一层 ASSET/strategy/policy_trader.py::
+      DispatchingTrader——policy_resolver(branch) 能查到 policy_id(名册
+      条目/state/main_policy.json)的分支走 M7 确定性代码路径,零LLM;
+      查不到的分支(老式纯提示词evo分支、main默认状态)原样走LLM路径,
+      main.py.run_decision_cycle 完全不需要感知这层分发,零改动。
+    - "两级晋升":战术锦标赛(evaluate_tactic_tournament)的PROMOTE不再对
+      有policy_id的分支直接调用save_main_tactics"接管"main的提示词——那
+      只是"这个分支有资格去问真正的裁判"这一步,真正的晋升改走
+      promote_policy_branch():register_branch(若尚未注册)→ 构造真实的
+      日级branch_navs调 scheduler.run_ratchet_judgment()(内部调用
+      EvolutionOrchestrator.judge() + GitMergeExecutor.attempt_merge()，
+      两者都是LOCKED区已经各自测试过的真实实现,这里第一次让它们在
+      "代码化策略分支"上被真实触发)→ merge成功才更新
+      state/main_program_tactics.json + state/main_policy.json,main从
+      下一个决策周期起自动切换成该policy的纯代码路径,不需要重启进程。
+      无policy_id的老式提示词分支维持原有save_main_tactics行为不变。
+    - 日级序列(§4.2):锦标赛/末位斩杀的收益率/edge计算不再直接用小时级
+      nav_intraday(_branches).jsonl,而是先按UTC日边界降采样(每日取最后
+      一个点,见 read_main_daily_nav_series/read_branch_daily_nav_series)。
+      信噪比理由:小时级窗口下,正常的净值波动量级(尤其是高杠杆/高频
+      分支)经常超过真实优势的量级,窗口太短时棘轮会被噪声填满而不是被
+      真实alpha填满——回撤判定(_intraday_max_drawdown_pct)仍然用小时级
+      原始序列不变,盘中回撤本来就该看盘中,不应该被日级降采样抹平。
+
 跑法:
     cd alphaloop
     python scripts/ignite.py            # 前台运行,Ctrl+C 停止
@@ -91,11 +123,12 @@ from __future__ import annotations
 import copy
 import datetime
 import json
+import subprocess
 import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -119,6 +152,8 @@ from LOCKED.simulator import Simulator  # noqa: E402
 from LOCKED.universe_filter import UniverseFilter  # noqa: E402
 
 from ASSET.memory.engine import MemoryStore  # noqa: E402
+from ASSET.strategy.policies import load_policy  # noqa: E402
+from ASSET.strategy.policy_trader import DispatchingTrader  # noqa: E402
 from ASSET.strategy.researcher import Researcher  # noqa: E402
 from ASSET.strategy.trader import Trader  # noqa: E402
 
@@ -292,6 +327,36 @@ def read_nav_tsv_series() -> dict[str, list[tuple[str, float]]]:
 
 TOURNAMENT_ROSTER_PATH = STATE_ROOT / "tactic_tournament_roster.json"
 MAIN_TACTICS_PATH = STATE_ROOT / "main_program_tactics.json"
+# M8新增(改造规格书M8"两级晋升"):main分支当前生效的M7确定性策略代码
+# policy_id——DispatchingTrader 的 policy_resolver 对 "main" 分支查的就是
+# 这个文件(见 make_policy_resolver)。与 MAIN_TACTICS_PATH 并存而不是二选
+# 一:main_program_tactics.json 保留人类可读的战术描述文字(webui/人工巡检
+# 用),main_policy.json 才是决定main分支下一个决策周期是否真的走零LLM代码
+# 路径的权威开关。两份状态在 promote_policy_branch() 里总是同一次晋升
+# 一起更新,不会出现只更新其中一份的中间态。
+MAIN_POLICY_PATH = STATE_ROOT / "main_policy.json"
+
+_DAY_MS = 86_400_000
+
+# 锦标赛生存规则后缀(用户2026-07-14要求:生存后果必须写进每个分支的战术
+# 正文,让做决策的Trader/子代理真实看到,不能只留在注释里)。M8起从main()
+# 的局部变量提升为模块级常量——admit_policy_to_forward_pool()(模块级函数,
+# 供内环/手动调用,不经过main())拼接policy分支的tactics字段时也需要它,
+# 两处必须是同一份文字。数值(15%/0.5%)与tactic_tournament配置项保持一致,
+# 如果以后改config记得同步改这里。
+_TOURNAMENT_STAKES_SUFFIX = (
+    "\n\n【锦标赛生存规则,请认真对待,这不是走过场】你正在和另外几个"
+    "战术不同的分支实时竞争同一个位置。每隔几小时会用真实净值数据评估"
+    "一次:如果你自己的净值从历史峰值回撤超过15%,或任何一笔持仓被爆仓,"
+    "你会被立即强制平仓、永久淘汰出局,由全新设计的战术取代你,没有'再给"
+    "一次机会'这种说法;如果你的净值持续跑赢main分支0.5个百分点以上,你的"
+    "整套战术会被'扶正'成main分支新的打法,相当于赢家通吃、直接接管"
+    "主账户的决策权。此外还有末位斩杀(用户2026-07-15新增):每隔约12"
+    "小时,所有存活满一个考核窗口的分支按窗口内净值收益排名,收益最低的"
+    "那一个直接斩杀出局——哪怕它在小幅盈利、哪怕它没犯任何错。这意味着"
+    "'平庸'和'亏损'一样致命:长期空仓观望零收益,大概率就是下一个被斩的。"
+    "你的每一笔决策都真实关系到这个战术能不能活下去。"
+)
 
 
 def read_main_hourly_nav_series() -> list[tuple[int, float]]:
@@ -308,6 +373,51 @@ def read_branch_hourly_nav_series(branch: str) -> list[tuple[int, float]]:
     return sorted(
         (r["ts"], float(r["nav"])) for r in records if r.get("branch") == branch and "ts" in r and "nav" in r
     )
+
+
+def _downsample_daily_last(series: list[tuple[int, float]]) -> list[tuple[int, float]]:
+    """改造规格书M8§4.2"日级序列"的核心降采样:按UTC自然日边界,每天只保留
+    该日内最后一个(ts最大)点,用day_start_ms(该UTC日00:00的毫秒时间戳)
+    作为这个点的key,而不是原始ts本身——这样"今天"的这一个点在多次调用
+    之间是同一个key,可以被_slice_since/_return_pct这些既有的、按ms比较的
+    函数直接消费,不需要改动它们的接口。
+
+    要求输入序列已经按ts升序排列(read_main_hourly_nav_series/
+    read_branch_hourly_nav_series 的返回值本身就是sorted()过的)——同一天
+    内后出现的点(ts更大)覆盖同一天内先出现的点,直接覆盖写就能保证最终
+    保留的是"当日最后一个点",不需要额外排序或比较。
+    """
+    daily: dict[int, float] = {}
+    for ts, nav in series:
+        day_start = (ts // _DAY_MS) * _DAY_MS
+        daily[day_start] = nav
+    return sorted(daily.items())
+
+
+def read_main_daily_nav_series() -> list[tuple[int, float]]:
+    """main分支的日级净值序列:对 read_main_hourly_nav_series() 的结果按
+    UTC自然日边界降采样,每天只保留最后一个点。
+
+    改造规格书M8§4.2信噪比修正:原来的锦标赛/末位斩杀直接用小时级序列算
+    收益率/edge,窗口拉长之前(min_hours_before_judgment=4,
+    cull_interval_hours=12)这个窗口本身就短到"正常的净值波动量级(尤其是
+    高杠杆/高频分支)经常超过真实优势的量级"——评估噪声压过信号,棘轮/
+    末位斩杀被噪声填满而不是被真实alpha填满。改用日级序列后单点噪声被
+    摊薄,窗口拉长(见config.yaml tactic_tournament新数值)后信噪比进一步
+    改善。回撤判定(_intraday_max_drawdown_pct)刻意不做这个降采样,仍然吃
+    小时级原始序列——盘中回撤本来就该看盘中,不应该被日级降采样抹平掉
+    "日内曾经跌穿阈值"这个真实发生过的事实。
+    """
+    return _downsample_daily_last(read_main_hourly_nav_series())
+
+
+def read_branch_daily_nav_series(
+    branch: str, hourly_lookup: Optional[Callable[[str], list[tuple[int, float]]]] = None
+) -> list[tuple[int, float]]:
+    """candidate分支版本,同 read_main_daily_nav_series 的降采样逻辑。
+    hourly_lookup 可注入(测试用),默认 read_branch_hourly_nav_series。"""
+    lookup = hourly_lookup or read_branch_hourly_nav_series
+    return _downsample_daily_last(lookup(branch))
 
 
 def _return_pct(series: list[tuple[int, float]]) -> Optional[float]:
@@ -389,17 +499,282 @@ def save_main_tactics(tactics: str, source_branch: str, now_ms: int) -> None:
     )
 
 
-def evaluate_tactic_tournament(roster: dict, now_ms: int, tournament_cfg: dict) -> list[dict]:
+def load_main_policy_id() -> Optional[str]:
+    """main分支当前生效的M7确定性策略代码policy_id——默认None(main默认
+    走LLM路径,与load_main_tactics()默认None=无战术偏置是同一种"未晋升过
+    任何东西"的初始状态)。一旦 promote_policy_branch() 真正把某个policy
+    分支合并进main,这里会被更新,且持久化到重启后依然生效。"""
+    if MAIN_POLICY_PATH.exists():
+        try:
+            data = json.loads(MAIN_POLICY_PATH.read_text(encoding="utf-8"))
+            return data.get("policy_id")
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def save_main_policy_id(policy_id: str, source_branch: str, now_ms: int) -> None:
+    MAIN_POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MAIN_POLICY_PATH.write_text(
+        json.dumps({"policy_id": policy_id, "promoted_from": source_branch, "ts": now_ms}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def resolve_policy_id_for_branch(branch: str, roster: dict) -> Optional[str]:
+    """名册条目可选带 policy_id 字段(M8):有则返回该分支应该运行的
+    policy_id,老式纯提示词分支/不在名册里的分支返回None——
+    DispatchingTrader 收到None会原样委托LLM路径,老式分支的既有行为完全
+    不受影响。纯函数,不碰磁盘,方便独立单测。"""
+    meta = roster.get(branch)
+    if meta is None:
+        return None
+    return meta.get("policy_id")
+
+
+def make_policy_resolver(clock, defaults: dict[str, str]) -> Callable[[str], Optional[str]]:
+    """构造一个 branch -> Optional[policy_id] 的可调用对象,供
+    ASSET/strategy/policy_trader.py::DispatchingTrader 在每次 decide() 调用
+    时查询。
+
+    "main" 分支查 state/main_policy.json(load_main_policy_id);其它分支
+    查当前锦标赛名册(每次调用都从磁盘重新读取,不缓存——名册可能在上一次
+    锦标赛节拍被改写或有新分支通过 admit_policy_to_forward_pool 加进来,
+    这里必须总是看到最新版本,与主循环里"scheduler.program_tactics =
+    load_main_tactics()"每轮重读同一个理由)。
+    """
+
+    def _resolver(branch: str) -> Optional[str]:
+        if branch == "main":
+            return load_main_policy_id()
+        roster = load_tournament_roster(clock.now_ms(), defaults)
+        return resolve_policy_id_for_branch(branch, roster)
+
+    return _resolver
+
+
+def admit_policy_to_forward_pool(policy_id: str, roster: dict, now_ms: int) -> tuple[dict, str]:
+    """把一个M7确定性策略代码(ASSET/strategy/policies/{policy_id}.py)真正
+    接入前向锦标赛池(改造规格书M8)。供未来的M6内环(自动生成/迭代policy
+    代码之后,把回测里表现最好的一个送进前向验证)调用,也可以在开发/
+    验证阶段手动调用。
+
+    做两件事:
+      1. 往 roster 里新增一条 {"policy_id":..., "tactics": policy.DESCRIPTION
+         + 锦标赛生存规则后缀, "status":"active", "created_ms": now_ms},
+         立刻落盘(与 load_tournament_roster 首次建档同一条纪律:不能只留
+         在内存里)。tactics字段仍然携带人类可读的战术描述+生存后果
+         后缀——不是给 DispatchingTrader 看的(它走 policy_resolver ->
+         load_policy 的纯代码路径,压根不读这个字段),而是为了让这个
+         policy分支在名册schema上与老式纯提示词分支保持同构(webui展示/
+         人工巡检统一读同一个字段)。
+      2. 用 subprocess 在仓库里创建一个同名 git 分支(当前HEAD),已存在则
+         跳过——这是让 EvolutionOrchestrator.register_branch()/
+         GitMergeExecutor.attempt_merge() 后续操作成立的前提:如果这个
+         分支名在git里根本不存在,promote_policy_branch() 真正走到
+         attempt_merge() 时,会在第一步"分支是否存在"校验上就直接拒绝,
+         不管评分多好——这不是本函数负责判定的事,但本函数负责让这个
+         前提提前成立。
+
+    返回 (更新后的roster, 新分支名) 二元组。分支名格式
+    evo/{YYYYMMDD}-{policy_id},YYYYMMDD 来自 now_ms 对应的 UTC 日期。
+    """
+    date_compact = datetime.datetime.utcfromtimestamp(now_ms / 1000).strftime("%Y%m%d")
+    branch_name = f"evo/{date_compact}-{policy_id}"
+    if branch_name in roster:
+        raise ValueError(
+            f"branch {branch_name!r} already exists in the roster (policy already admitted today?)"
+        )
+
+    policy = load_policy(policy_id)
+    roster = dict(roster)
+    roster[branch_name] = {
+        "policy_id": policy_id,
+        "tactics": policy.DESCRIPTION + _TOURNAMENT_STAKES_SUFFIX,
+        "status": "active",
+        "created_ms": now_ms,
+    }
+    save_tournament_roster(roster)
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "branch", branch_name],
+            capture_output=True, text=True, timeout=30, shell=False,
+        )
+        if result.returncode != 0 and "already exists" not in (result.stderr or ""):
+            print(
+                f"admit_policy_to_forward_pool: git branch {branch_name!r} 创建失败"
+                f"(非'已存在'原因,已忽略,继续): {result.stderr.strip()}",
+                flush=True,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(
+            f"admit_policy_to_forward_pool: git branch {branch_name!r} 创建异常"
+            f"(已忽略,继续): {exc!r}",
+            flush=True,
+        )
+
+    return roster, branch_name
+
+
+def promote_policy_branch(
+    branch: str,
+    policy_id: str,
+    roster: dict,
+    evolution_orchestrator: EvolutionOrchestrator,
+    scheduler,
+    today: str,
+    daily_branch_lookup: Optional[Callable[[str], list[tuple[int, float]]]] = None,
+) -> dict:
+    """M8"两级晋升"的核心(修复改造规格书§0.1诊断2)。战术锦标赛
+    (evaluate_tactic_tournament)对一个挂着policy_id的分支判定PROMOTE,
+    只代表"这个分支有资格去问真正的裁判",不等于真的晋升——这里才是真正
+    问裁判、真正合并代码的地方:
+
+      1. register_branch:如果这个分支在_ensure_evo_simulator()把它加进
+         名册、构造它自己的Simulator时就已经注册过(主循环里对所有名册
+         分支无条件注册,不分是否有policy_id),这里跳过,不重复注册；
+         如果尚未注册且orchestrator已达到max_concurrent_branches上限,
+         register_branch()返回False——这种情况下"真正的裁决"这一步做不
+         了,如实返回一个未合并的结果,不假装晋升成功(锦标赛自己那个
+         PROMOTE事件依然会让分支离开锦标赛active池、腾出名额,这是"两级"
+         架构里一个诚实的权衡:锦标赛的判定权与EvolutionOrchestrator的
+         准入上限是两回事,不因为这里注册失败就回滚锦标赛自己的判定)。
+      2. 构造真实的日级 branch_navs——main用 LOG/nav.tsv 的官方日级历史
+         (scorer.daily_mark()维护的权威三线序列,长期存在、覆盖这个候选
+         分支整个生命周期),candidate分支用
+         read_branch_daily_nav_series(branch)(从nav_intraday_branches.jsonl
+         降采样,转成与nav.tsv同构的ISO日期字符串key)——调用
+         scheduler.run_ratchet_judgment(),这是"侵入最小"的选择:该方法
+         已经完整实现了"调judge() -> PROMOTE时调
+         git_merge_executor.attempt_merge() -> merge成功才推进
+         effective_main_branch"这一整套逻辑并且已经被
+         tests/test_main_scheduler.py验证过,这里不需要、也不应该绕开它
+         直接调 orchestrator.judge()/git_merge_executor.attempt_merge()。
+      3. 判定的verdict如果不是PROMOTE(比如日级窗口下edge不够、或触发了
+         死刑回撤条款),真正的裁判否决了锦标赛自己的PROMOTE判断——这是
+         完全合法的结果,不触碰main任何状态。
+      4. verdict是PROMOTE但GitMergeExecutor拒绝了真实merge(测试红/分支
+         非法)——scheduler.run_ratchet_judgment() 内部已经把这种情况记成
+         severity=critical的promotion_veto,effective_main_branch保持
+         不变,这里只需要读 scheduler.effective_main_branch 是否等于
+         branch 就能判断merge到底有没有真的发生。
+      5. merge成功 -> 用该policy的DESCRIPTION更新
+         state/main_program_tactics.json(human/webui可读的文字描述)+
+         state/main_policy.json(DispatchingTrader.policy_resolver对"main"
+         分支实际查的文件)。main从下一个决策周期起自动切换成该policy的
+         纯代码路径,不需要重启进程。
+
+    返回一个summary dict(至少含"summary"这个可打印的人类可读字符串),
+    调用方(主循环)只需要打印,不需要进一步处理。
+    """
+    if evolution_orchestrator.branch_meta(branch) is None:
+        created_date = roster[branch].get("created_date") or _utc_date_str(roster[branch]["created_ms"])
+        if not evolution_orchestrator.register_branch(branch, created_date):
+            return {
+                "registered": False,
+                "verdict": None,
+                "merged": False,
+                "summary": (
+                    f"evolution_orchestrator at max_concurrent_branches capacity, cannot "
+                    f"register {branch!r} -- real code-level judgment/merge did not run this "
+                    f"round (tournament's own PROMOTE nomination still stands and the branch "
+                    f"still vacates its tournament slot)"
+                ),
+            }
+
+    branch_lookup = daily_branch_lookup or read_branch_daily_nav_series
+    nav_series = read_nav_tsv_series()  # 官方日级三线历史(main/benchmark),权威来源
+    branch_date_series = [(_utc_date_str(ts), nav) for ts, nav in branch_lookup(branch)]
+
+    if len(nav_series["main"]) < 2 or len(branch_date_series) < 2:
+        return {
+            "registered": True,
+            "verdict": None,
+            "merged": False,
+            "summary": (
+                "insufficient daily NAV history for main or branch -- skipping the real "
+                "code-level judgment this round, will retry next tournament tick"
+            ),
+        }
+
+    verdicts = scheduler.run_ratchet_judgment(
+        now_date=today,
+        branch_navs={"main": nav_series["main"], branch: branch_date_series},
+        benchmark_navs=nav_series["benchmark"],
+    )
+    verdict = verdicts.get(branch)
+    if verdict is None:
+        return {
+            "registered": True,
+            "verdict": None,
+            "merged": False,
+            "summary": "evolution_orchestrator.judge() produced no verdict for this branch this round",
+        }
+
+    if verdict.decision != "PROMOTE":
+        return {
+            "registered": True,
+            "verdict": verdict.decision,
+            "merged": False,
+            "summary": (
+                f"real judge() verdict={verdict.decision!r} (reason={verdict.reason!r}) -- the "
+                f"tournament's own PROMOTE nomination was overridden by the official gate"
+            ),
+        }
+
+    if scheduler.effective_main_branch != branch:
+        return {
+            "registered": True,
+            "verdict": "PROMOTE",
+            "merged": False,
+            "summary": (
+                "judge()==PROMOTE but GitMergeExecutor vetoed the real git merge (see "
+                "LOG/scheduler_errors.jsonl event=promotion_veto for the reason)"
+            ),
+        }
+
+    policy = load_policy(policy_id)
+    save_main_tactics(policy.DESCRIPTION, branch, scheduler.clock.now_ms())
+    save_main_policy_id(policy_id, branch, scheduler.clock.now_ms())
+    return {
+        "registered": True,
+        "verdict": "PROMOTE",
+        "merged": True,
+        "summary": f"merged into main -- main now runs policy_id={policy_id!r} (no restart needed)",
+    }
+
+
+def evaluate_tactic_tournament(
+    roster: dict,
+    now_ms: int,
+    tournament_cfg: dict,
+    daily_main_lookup: Optional[Callable[[], list[tuple[int, float]]]] = None,
+    daily_branch_lookup: Optional[Callable[[str], list[tuple[int, float]]]] = None,
+    hourly_branch_lookup: Optional[Callable[[str], list[tuple[int, float]]]] = None,
+) -> list[dict]:
     """对名册里每个status=='active'的分支做一次评估,返回本次新产生的裁决
     事件列表(可能是空列表——这是正常情况,大多数分支大多数时候应该处于
     "还没有明确结论,继续观察"这个中间状态,不是每次调用都必须产生裁决,
     这正是与LOCKED.judge()"每次调用都对所有active分支强制产出裁决"最核心
-    的行为差异)。不修改roster的落盘,调用方负责在收到非空事件列表后落盘。"""
+    的行为差异)。不修改roster的落盘,调用方负责在收到非空事件列表后落盘。
+
+    改造规格书M8§4.2:收益率/edge的分母改用日级序列(daily_main_lookup/
+    daily_branch_lookup,默认 read_main_daily_nav_series/
+    read_branch_daily_nav_series)——信噪比理由见这两个函数的docstring。
+    回撤判定(_intraday_max_drawdown_pct)刻意维持小时级序列不变
+    (hourly_branch_lookup,默认read_branch_hourly_nav_series)——盘中回撤
+    本来就该看盘中,不应该被日级降采样抹平掉"日内曾经跌穿阈值"这个事实。
+    三个lookup均可注入,供测试构造合成日级/小时级数据。"""
     min_age_ms = int(float(tournament_cfg.get("min_hours_before_judgment", 4)) * 3_600_000)
     promote_edge = float(tournament_cfg.get("promote_edge_pct", 0.5))
     fail_dd = float(tournament_cfg.get("fail_drawdown_pct", 15))
 
-    main_series = read_main_hourly_nav_series()
+    main_daily_lookup = daily_main_lookup or read_main_daily_nav_series
+    branch_daily_lookup = daily_branch_lookup or read_branch_daily_nav_series
+    branch_hourly_lookup = hourly_branch_lookup or read_branch_hourly_nav_series
+
+    main_daily_series = main_daily_lookup()
     events: list[dict] = []
 
     for branch, meta in roster.items():
@@ -409,20 +784,24 @@ def evaluate_tactic_tournament(roster: dict, now_ms: int, tournament_cfg: dict) 
         if now_ms - created_ms < min_age_ms:
             continue
 
-        branch_series = _slice_since(read_branch_hourly_nav_series(branch), created_ms)
-        if len(branch_series) < 2:
+        branch_daily_series = _slice_since(branch_daily_lookup(branch), created_ms)
+        if len(branch_daily_series) < 2:
             continue
-        branch_return = _return_pct(branch_series)
+        branch_return = _return_pct(branch_daily_series)
         if branch_return is None:
             continue
 
-        main_window = _slice_since(main_series, created_ms)
+        main_window = _slice_since(main_daily_series, created_ms)
         main_return = _return_pct(main_window)
         if main_return is None:
             continue
 
         edge = branch_return - main_return
-        drawdown = _intraday_max_drawdown_pct(branch_series)
+        # 回撤仍然看小时级原始序列,不是上面用于算收益的日级降采样序列——
+        # 两者衡量的是不同的东西(收益率关心"起点到终点",回撤关心"中途
+        # 曾经跌到多深"),日级降采样会把日内的最深回撤点抹掉。
+        branch_hourly_window = _slice_since(branch_hourly_lookup(branch), created_ms)
+        drawdown = _intraday_max_drawdown_pct(branch_hourly_window)
 
         if drawdown > fail_dd:
             events.append({
@@ -459,12 +838,16 @@ def evaluate_cull(
 
     返回一个与 evaluate_tactic_tournament 事件同构的dict(decision='CULLED'),
     或 None(本轮没有可斩对象)。调用方负责节拍控制(cull_interval_hours)
-    和后续处理(强平/落盘/生成替补)。nav_series_lookup 可注入,测试用。"""
+    和后续处理(强平/落盘/生成替补)。nav_series_lookup 可注入,测试用,
+    默认改造规格书M8§4.2的日级序列(read_branch_daily_nav_series)——同
+    evaluate_tactic_tournament的信噪比理由,末位斩杀比的是"窗口内收益排名"
+    而不是"窗口内曾经跌到多深"(那是evaluate_tactic_tournament的死刑回撤
+    条款负责的事),所以这里也改用日级、不需要额外的小时级回撤分支。"""
     interval_h = float(tournament_cfg.get("cull_interval_hours", 12))
     min_age_ms = int(float(tournament_cfg.get("cull_min_age_hours", interval_h)) * 3_600_000)
     window_ms = int(interval_h * 3_600_000)
     if nav_series_lookup is None:
-        nav_series_lookup = read_branch_hourly_nav_series
+        nav_series_lookup = read_branch_daily_nav_series
 
     candidates: list[tuple[str, float]] = []
     for branch, meta in roster.items():
@@ -793,20 +1176,6 @@ def main() -> None:
     # 保持一致,如果以后改config记得同步改这里。
     LIANGXI_BRANCH = "evo/20260714-liangxi-style"
 
-    _TOURNAMENT_STAKES_SUFFIX = (
-        "\n\n【锦标赛生存规则,请认真对待,这不是走过场】你正在和另外几个"
-        "战术不同的分支实时竞争同一个位置。每隔几小时会用真实净值数据评估"
-        "一次:如果你自己的净值从历史峰值回撤超过15%,或任何一笔持仓被爆仓,"
-        "你会被立即强制平仓、永久淘汰出局,由全新设计的战术取代你,没有'再给"
-        "一次机会'这种说法;如果你的净值持续跑赢main分支0.5个百分点以上,你的"
-        "整套战术会被'扶正'成main分支新的打法,相当于赢家通吃、直接接管"
-        "主账户的决策权。此外还有末位斩杀(用户2026-07-15新增):每隔约12"
-        "小时,所有存活满一个考核窗口的分支按窗口内净值收益排名,收益最低的"
-        "那一个直接斩杀出局——哪怕它在小幅盈利、哪怕它没犯任何错。这意味着"
-        "'平庸'和'亏损'一样致命:长期空仓观望零收益,大概率就是下一个被斩的。"
-        "你的每一笔决策都真实关系到这个战术能不能活下去。"
-    )
-
     _DEFAULT_EVO_TACTICS = {
         "evo/20260714-aggressive": (
             "进取战术:在假设置信度足够(至少两条独立假设互相印证,或有真实"
@@ -886,6 +1255,28 @@ def main() -> None:
             + _TOURNAMENT_STAKES_SUFFIX
         ),
     }
+
+    # M8晋升闸门重构:scheduler.trader 从这里起不再直接是上面构造的裸
+    # Trader(纯LLM)——包一层 DispatchingTrader,policy_resolver 能查到
+    # policy_id 的分支(main通过state/main_policy.json,evo分支通过当前
+    # 名册)走M7确定性代码路径,零LLM;查不到的分支(老式纯提示词分支、
+    # 尚未被任何policy接管的main)原样委托给原始trader,现有LLM路径行为
+    # 完全不变。main.py.AlphaLoopScheduler._call_trader_with_timeout()
+    # 只认 self.trader.decide(...) 这一个签名,不需要知道、也不需要改动
+    # 来适配这层分发——这正是main.py"每个外部依赖都通过构造函数注入"这条
+    # 既定纪律的自然延伸。放在这里(_DEFAULT_EVO_TACTICS 定义之后)而不是
+    # 紧跟着 scheduler 构造的地方,是因为 make_policy_resolver 需要
+    # _DEFAULT_EVO_TACTICS 作为"名册文件不存在时的首次建档默认值"——两者
+    # 必须是同一份 defaults,否则 policy_resolver 在名册还没被主循环第一次
+    # 写盘之前查到的可能是一份不同的初始名册。
+    scheduler.trader = DispatchingTrader(
+        llm_trader=trader,
+        policy_resolver=make_policy_resolver(clock, _DEFAULT_EVO_TACTICS),
+        data_pipeline=dp,
+        memory_store=memory_store,
+        timeframe=config["data"]["timeframe"],
+    )
+
     tournament_roster = load_tournament_roster(clock.now_ms(), _DEFAULT_EVO_TACTICS)
     evo_simulators: dict[str, Simulator] = {}
 
@@ -1205,9 +1596,42 @@ def main() -> None:
                     roster[branch]["resolved_ms"] = now
 
                     if ev["decision"] == "PROMOTE":
-                        winning_tactics = roster[branch]["tactics"]
-                        save_main_tactics(winning_tactics, branch, now)
-                        print(f"[{now}] main分支战术已更新为 {branch} 的战术(立即生效,不需要重启)", flush=True)
+                        # M8两级晋升(见 promote_policy_branch 模块docstring):
+                        # 锦标赛自己的PROMOTE只是"有资格去问真正的裁判"这一步,
+                        # 这个分支离开锦标赛active池、腾出名额(上面两行已经
+                        # 做了)不代表main真的被改变——是否真的合并代码/切换
+                        # policy,完全由 promote_policy_branch() 里对
+                        # EvolutionOrchestrator.judge() + GitMergeExecutor 的
+                        # 真实调用结果决定。挂着policy_id的分支(M7代码化策略)
+                        # 走这条真实链路;没有policy_id的老式纯提示词分支
+                        # 维持原有的"战术文字接管main"行为不变(它们没有真实
+                        # 代码可以合并,GitMergeExecutor对它们没有意义)。
+                        policy_id = roster[branch].get("policy_id")
+                        if policy_id is None:
+                            winning_tactics = roster[branch]["tactics"]
+                            save_main_tactics(winning_tactics, branch, now)
+                            print(f"[{now}] main分支战术已更新为 {branch} 的战术(立即生效,不需要重启)", flush=True)
+                        else:
+                            try:
+                                outcome = promote_policy_branch(
+                                    branch=branch, policy_id=policy_id, roster=roster,
+                                    evolution_orchestrator=evolution_orchestrator,
+                                    scheduler=scheduler, today=today,
+                                )
+                                print(
+                                    f"[{now}] [{branch}] M8两级晋升(policy_id={policy_id}): "
+                                    f"{outcome['summary']}", flush=True,
+                                )
+                            except Exception:  # noqa: BLE001 -- 真正的裁决/merge出问题
+                                # 不应该拖垮整轮锦标赛处理(与本文件其它 try/except
+                                # 段落同一纪律),异常记录后本轮就当没有真的晋升,
+                                # main状态保持不变,下一次锦标赛节拍如果再次判定
+                                # 该policy分支(或它的替补)PROMOTE会自然重试。
+                                print(
+                                    f"[{now}] [{branch}] promote_policy_branch 异常"
+                                    f"(已记录,继续循环,main状态未改变):\n{traceback.format_exc()}",
+                                    flush=True,
+                                )
                     elif ev["decision"] in ("FAIL", "CULLED"):
                         # 确定性强制平仓,不经过Trader/子代理判断——这是锦标赛
                         # 淘汰机制本身的动作,与main.py.run_risk_check_cycle

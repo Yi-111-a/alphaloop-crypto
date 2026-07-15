@@ -218,6 +218,7 @@ class Scorer:
         thesis_marks: Iterable[ThesisMark] | None = None,
         promotions: Iterable[PromotionRecord] | None = None,
         branch_navs: dict[str, list[tuple[str, float]]] | None = None,
+        backtest_forward_pairs: Iterable[dict] | None = None,
     ) -> str:
         """读取 LOG/nav.tsv,输出月度 Markdown 报告字符串(不写盘,main.py 负责落地)。
 
@@ -227,6 +228,18 @@ class Scorer:
         的晋升后收益率。这是系统级体检指标,不是决策逻辑的一部分——如果晋升后
         普遍大幅跳水,说明棘轮在系统性地筛选运气而不是真实alpha,需要人类介入
         复查 min_promote_edge_pct 是否设置过低,而不是本方法自动做任何事。
+
+        M8 新增"回测vs前向一致性"栏(backtest_forward_pairs 提供且非空时才
+        输出),与上面"晋升前后表现对比"栏同一哲学——纯体检指标,不触发任何
+        自动动作。backtest_forward_pairs 里每个元素是一个从"内环回测(§5 M6
+        holdout窗口)进入前向池、最终真的被PROMOTE"的分支的一条记录,形如
+        {"branch": str, "backtest_holdout_edge_pct": float,
+        "forward_edge_pct": float}(调用方——scripts/ignite.py 或未来的M6
+        内环收尾脚本——负责从各自的记录里拼出这个列表,本方法不关心它们的
+        来源,只按这个约定的dict形状消费)。展示 holdout回测edge 与 前向实际
+        edge 的差值(forward - backtest):如果前向edge系统性大幅低于holdout
+        回测edge,说明内环回测存在过拟合/数据泄漏风险,需要人类介入复查,而
+        不是本方法自动做任何事——没有任何一条记录时优雅跳过整个栏目,不报错。
         """
         root = Path(nav_root) if nav_root is not None else (self.log_root or LOG_ROOT)
         path = root / NAV_TSV_RELATIVE_PATH
@@ -293,5 +306,31 @@ class Scorer:
                     f"- Average before: {avg_before:.2f}% / Average after: {avg_after:.2f}% "
                     f"(n={len(before_returns)} promotions)"
                 )
+
+        pairs = list(backtest_forward_pairs) if backtest_forward_pairs else []
+        if pairs:
+            lines.append("")
+            lines.append("## Backtest vs Forward Consistency (M8)")
+            lines.append(
+                "(体检指标,非决策依据,不触发任何自动动作——与上面"
+                "\"晋升前后表现对比\"栏同一哲学。前向edge系统性大幅低于holdout"
+                "回测edge,是内环回测过拟合/数据泄漏的直接证据,需要人类介入"
+                "复查,而不是本方法自动做任何事。)"
+            )
+            lines.append("")
+            lines.append("| branch | holdout backtest edge % | forward edge % | gap (forward - backtest) % |")
+            lines.append("|---|---|---|---|")
+            gaps: list[float] = []
+            for pair in pairs:
+                branch = pair["branch"]
+                backtest_edge = float(pair["backtest_holdout_edge_pct"])
+                forward_edge = float(pair["forward_edge_pct"])
+                gap = forward_edge - backtest_edge
+                gaps.append(gap)
+                lines.append(f"| {branch} | {backtest_edge:.2f}% | {forward_edge:.2f}% | {gap:.2f}% |")
+
+            avg_gap = sum(gaps) / len(gaps)
+            lines.append("")
+            lines.append(f"- Average gap: {avg_gap:.2f}% (n={len(gaps)} branches)")
 
         return "\n".join(lines)

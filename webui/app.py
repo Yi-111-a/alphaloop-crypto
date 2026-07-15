@@ -43,6 +43,11 @@ PROJECT_ROOT = APP_ROOT.parent
 
 LOG_ROOT = PROJECT_ROOT / "LOG"
 STATE_ROOT = PROJECT_ROOT / "state"
+# M7 新增:内环研究循环(scripts/research_loop.py)的实验台账,按规格书要求
+# 落在 ASSET/strategy/experiments/ 下而不是 LOG_ROOT——路径上是本文件唯一的
+# 例外,但读取方式仍然是纯文件I/O、不import任何ASSET业务模块,零计算、零写入
+# 的铁律没有变化(见下面 _read_experiments_ledger 的说明)。
+EXPERIMENTS_LEDGER_PATH = PROJECT_ROOT / "ASSET" / "strategy" / "experiments" / "ledger.jsonl"
 
 DISCLAIMER = "本内容为AI模拟实验输出,非投资建议,不构成任何交易依据"
 
@@ -271,6 +276,30 @@ def _read_circuit_state() -> Optional[str]:
     return records[-1].get("new_state")
 
 
+def _read_experiments_ledger() -> list[dict]:
+    """M7新增:ASSET/strategy/experiments/ledger.jsonl 是 scripts/research_loop.py
+    (内环研究循环)每轮实验结束后追加的一条记录,记录本身已经是研究循环算好、
+    落盘的最终结果(score分量/status/edge/drawdown等字段),这里只原样读回,
+    不做任何二次计算——遵守本文件"零计算"的规矩。与本文件其它读取函数按
+    LOG_ROOT/STATE_ROOT为根不同,这份文件按M7规格书要求就放在
+    ASSET/strategy/experiments/ 下;读取方式本身仍然是纯文件I/O,不import
+    任何ASSET业务模块,不写入任何东西,与"面板只读"的铁律没有冲突。"""
+    path = EXPERIMENTS_LEDGER_PATH
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # 容忍读到半行(研究循环正在追加写入中途读到)
+    return records
+
+
 # ---------------------------------------------------------------------------
 # 健康体征灯——都只是"读回LOG,对比预期节奏",不重新计算任何业务数字。
 # ---------------------------------------------------------------------------
@@ -424,6 +453,15 @@ def api_ratchet_log(limit: int = 10) -> dict:
     records = _read_jsonl("ratchet_verdicts.jsonl")
     recent = records[-limit:][::-1] if records else []
     return {"has_data": bool(records), "verdicts": recent}
+
+
+@app.get("/api/experiments")
+def api_experiments() -> dict:
+    """M7内环实验轨迹:原样返回 ledger.jsonl 里的记录列表,按experiment_id
+    排序(唯一允许的"计算"——纯排序,不是财务数值推导)。"""
+    records = _read_experiments_ledger()
+    records = sorted(records, key=lambda r: r.get("experiment_id", ""))
+    return {"has_data": bool(records), "experiments": records}
 
 
 @app.get("/api/health")

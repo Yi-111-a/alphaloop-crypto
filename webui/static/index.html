@@ -155,6 +155,12 @@
       </table>
       <div id="ratchetEmpty" class="empty" style="display:none;">等待系统启动 —— 尚无棘轮判定记录</div>
     </div>
+
+    <div class="panel full">
+      <h2>内环实验轨迹(M7 研究循环,score = val_edge_vs_benchmark_pct)</h2>
+      <canvas id="experimentsChart" height="90"></canvas>
+      <div id="experimentsEmpty" class="empty" style="display:none;">等待系统启动 —— 尚无内环实验记录</div>
+    </div>
   </div>
 
   <div class="footer-note">
@@ -165,6 +171,7 @@
 <script>
 const REFRESH_MS = 15000;
 let navChart = null;
+let experimentsChart = null;
 let navGranularity = "day"; // "day" -> /api/nav (nav.tsv 日线); "hour" -> /api/nav_intraday (小时级)
 let selectedBranch = "main";
 let knownBranches = [{ branch: "main", label: "main" }];
@@ -392,6 +399,69 @@ async function refreshRatchet() {
   }
 }
 
+function experimentPointColor(status) {
+  if (status === "kept") return "#3fb950";       // 绿色:保留
+  if (status === "reverted") return "#8b98a5";   // 灰色:回退
+  return "#d29922";                              // 其它(lint_failed/backtest_failed等):黄色
+}
+
+async function refreshExperiments() {
+  const data = await fetchJSON("/api/experiments");
+  const emptyEl = document.getElementById("experimentsEmpty");
+  const canvas = document.getElementById("experimentsChart");
+  if (!data.has_data || !data.experiments || data.experiments.length === 0) {
+    emptyEl.style.display = "block";
+    canvas.style.display = "none";
+    return;
+  }
+  emptyEl.style.display = "none";
+  canvas.style.display = "block";
+
+  const experiments = data.experiments;
+  const labels = experiments.map((_, i) => "#" + (i + 1));
+  const scores = experiments.map(e => e.val_edge_vs_benchmark_pct);
+  const pointColors = experiments.map(e => experimentPointColor(e.status));
+
+  if (experimentsChart) {
+    experimentsChart.destroy();
+  }
+  experimentsChart = new Chart(canvas.getContext("2d"), {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: "val edge vs benchmark (%)",
+        data: scores,
+        borderColor: "#58a6ff",
+        pointBackgroundColor: pointColors,
+        pointBorderColor: pointColors,
+        pointRadius: 5,
+        tension: 0.1,
+      }],
+    },
+    options: {
+      responsive: true,
+      scales: { y: { ticks: { color: "#8b98a5" } }, x: { ticks: { color: "#8b98a5" } } },
+      plugins: {
+        legend: { labels: { color: "#e6edf3" } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const e = experiments[ctx.dataIndex];
+              return [
+                `policy_id: ${e.policy_id}`,
+                `status: ${e.status}`,
+                `score: ${fmt(e.val_edge_vs_benchmark_pct)}%`,
+                `hypothesis: ${e.hypothesis || ""}`,
+              ];
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
 async function refreshHealth() {
   const data = await fetchJSON("/api/health");
   const row = document.getElementById("healthRow");
@@ -414,7 +484,7 @@ async function refreshAll() {
   try {
     await Promise.all([
       refreshStatus(), refreshNav(), refreshBranchSelector(), refreshPositions(),
-      refreshTrades(), refreshAdvice(), refreshCosts(), refreshRatchet(), refreshHealth(),
+      refreshTrades(), refreshAdvice(), refreshCosts(), refreshRatchet(), refreshExperiments(), refreshHealth(),
     ]);
   } catch (e) {
     console.error("refresh failed", e);
