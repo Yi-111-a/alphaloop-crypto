@@ -85,8 +85,8 @@ def test_fee_and_slippage_arithmetic(tmp_path, log_root, make_decision):
     assert isinstance(trade, Trade)
 
     # hand computation
-    nav_pre = 100_000.0  # config.capital_usdt, no prior positions
-    expected_notional = 0.50 * nav_pre  # 50000
+    nav_pre = float(load_config()["capital_usdt"])  # no prior positions -> nav = 期初资本
+    expected_notional = 0.50 * nav_pre
     expected_slippage_bps = 15  # base, since no volume given
     expected_price = 50_000.0 * (1 + expected_slippage_bps / 1e4 * 1)  # buy => sign +1
     expected_fee = expected_notional * 0.0005  # taker_pct
@@ -181,9 +181,9 @@ def test_funding_settlement_sign_and_amount(tmp_path, log_root, make_decision, a
 
     # wallet_balance should be reduced by exactly the (positive-signed) amount
     portfolio = sim.get_portfolio()
-    # wallet started at 100000, minus fee already paid, minus funding amount
+    # wallet started at config.capital_usdt, minus fee already paid, minus funding amount
     fee_paid = notional * 0.0005
-    expected_wallet = 100_000.0 - fee_paid - expected_amount
+    expected_wallet = float(load_config()["capital_usdt"]) - fee_paid - expected_amount
     assert portfolio["wallet_balance"] == pytest.approx(expected_wallet)
 
     records = log_writer.read_jsonl("funding.jsonl", root=log_root)
@@ -535,7 +535,7 @@ def test_exact_100pct_notional_decision_fills_and_satisfies_all_constraints(tmp_
     # against the post-fee marked NAV -- a fee nibbling free collateral after
     # entry doesn't retroactively make an already-sized position "too big";
     # that's what the separate maintenance-margin/liquidation check is for.
-    nav_pre = 100_000.0  # config.capital_usdt, no prior positions
+    nav_pre = float(load_config()["capital_usdt"])  # no prior positions
     pos = sim.positions["BTC/USDT:USDT"]
     assert abs(pos.notional) <= 1.00 * nav_pre + 1e-6, "position notional must not exceed 100% of pre-trade NAV"
     total_notional = sum(abs(p.notional) for p in sim.positions.values())
