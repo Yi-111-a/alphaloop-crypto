@@ -80,6 +80,33 @@ class StrategyContext:
                      (与 LOCKED.data_pipeline.OHLCV_COLUMNS 同构),按
                      timestamp 升序排列,最后一行是最新的已收盘K线。
       memory_context 记忆检索结果的文本列表,回测场景下可以是空列表。
+      recent_funding symbol -> 资金费率历史DataFrame(列 ["timestamp",
+                     "funding_rate"],与 LOCKED.data_pipeline.
+                     FUNDING_COLUMNS 同构),按timestamp升序排列,只包含
+                     <= ctx.ts 的记录——这是与 recent_bars 同源的时间边界
+                     纪律(回放/前向决策都不可窥见未来资金费率)。带默认值
+                     {}(field(default_factory=dict)),因为这是M7上线后
+                     新增的字段:所有既有构造点(测试/LOCKED/backtest_engine.py
+                     的鸭子类型StrategyContext/ASSET/strategy/policy_trader.py
+                     之前版本)不传它也不能报错。策略代码读取这个字段时应该
+                     用 `getattr(ctx, 'recent_funding', {})` 而不是
+                     `ctx.recent_funding` 直接访问——理由:
+                       1. 兼容"喂给policy.decide()的ctx对象不是本类实例"
+                          这种鸭子类型场景(LOCKED/backtest_engine.py自己
+                          定义了一个同名但字段集不完全相同的StrategyContext,
+                          module.decide作为strategy_fn被直接传进
+                          BacktestEngine.run()——如果某次改动暂时让那份
+                          ctx落后于本类的字段集,getattr兜底能让policy代码
+                          优雅降级到"当作没有funding数据"，而不是直接
+                          AttributeError崩掉整个回测)。
+                       2. 即使本类实例本身已经有default_factory兜底、
+                          "不传参也不炸"，policy模块仍然应该显式写
+                          getattr(ctx, 'recent_funding', {}) 这种防御性
+                          读法，把"字段可能不存在"这件事在调用点就地
+                          文档化，而不是依赖调用方类型恰好是本类这一
+                          隐式假设。carry_v1.py 就是这么写的，示例:
+                              funding_map = getattr(ctx, "recent_funding", {})
+                              fdf = funding_map.get(symbol)
     """
 
     ts: int
@@ -87,6 +114,7 @@ class StrategyContext:
     snapshot: dict[str, dict]
     recent_bars: dict[str, "pd.DataFrame"]
     memory_context: list[str] = field(default_factory=list)
+    recent_funding: dict[str, "pd.DataFrame"] = field(default_factory=dict)
 
 
 StrategyFn = Callable[[StrategyContext], list[Decision]]

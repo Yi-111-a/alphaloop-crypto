@@ -122,7 +122,13 @@ class FakeBacktestEngine:
         return min(edges) - 0.5 * max(r.max_drawdown_pct for r in val)
 
 
-def _make_result(label: str, edge_pct: float, max_dd_pct: float = 0.0, is_holdout: bool = False) -> BacktestResult:
+def _make_result(
+    label: str, edge_pct: float, max_dd_pct: float = 0.0, is_holdout: bool = False, trade_count: int = 6
+) -> BacktestResult:
+    """trade_count 默认给6——两个验证窗口(val_1/val_2)各6笔、总和12,高于
+    min_val_trades默认门槛(10),这样"kept应该是kept"的既有测试不会被任务2
+    新增的最小样本量门槛意外撞车(该门槛的专门测试会显式传trade_count覆盖
+    这个默认值)。"""
     window = BacktestWindow(label=label, start_ts=BASE_TS, end_ts=BASE_TS + 10 * STEP_MS, is_holdout=is_holdout)
     return BacktestResult(
         window=window,
@@ -132,7 +138,7 @@ def _make_result(label: str, edge_pct: float, max_dd_pct: float = 0.0, is_holdou
         max_drawdown_pct=max_dd_pct,
         edge_vs_benchmark_pct=edge_pct,
         branch_dead=False,
-        trade_count=0,
+        trade_count=trade_count,
         rejection_count=0,
     )
 
@@ -296,6 +302,9 @@ def test_full_round_reverted_has_no_result_commit_and_file_restored(tmp_path, mo
     assert record["status"] == "reverted"
     assert record["commit_sha_protocol"] is not None
     assert record["commit_sha_result"] is None
+    # 样本量本身是够的(默认trade_count=6*2=12>=min_val_trades),真正的
+    # revert原因是分数没打赢历史最优,不是任务2的样本量门槛
+    assert record["revert_reason"] == "score_not_better"
 
     subjects = _git_log_subjects(repo)
     assert not any("research(results):" in line for line in subjects)  # 没有结果commit
@@ -465,6 +474,7 @@ REQUIRED_LEDGER_FIELDS = {
     "commit_sha_protocol", "commit_sha_result", "status",
     "val_edge_vs_benchmark_pct", "val_max_drawdown_pct",
     "holdout_edge_vs_benchmark_pct", "wall_time_seconds",
+    "revert_reason", "strategy_class",  # 本次改动新增的两个向后兼容字段
 }
 
 
@@ -537,3 +547,255 @@ def test_next_policy_variant_id_avoids_collisions_and_strips_existing_suffix(tmp
     candidate = rl._next_policy_variant_id("momentum_v1", policies_dir)
     assert candidate == "momentum_v3"
     rl.validate_policy_id(candidate)  # 必须本身也是合法policy_id
+
+
+# ---------------------------------------------------------------------------
+# 9. 任务2:最小样本量门槛(min_val_trades)——总交易笔数不够,一律revert,
+#    不管分数多好,revert_reason 区分"样本不够"和"分数没打赢"
+# ---------------------------------------------------------------------------
+
+
+def test_min_val_trades_gate_reverts_even_with_good_score(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path)
+    monkeypatch.setattr(rl, "BacktestEngine", FakeBacktestEngine)
+    FakeBacktestEngine.injected_results = {
+        "train": _make_result("train", edge_pct=999.0, trade_count=0),
+        "val_1": _make_result("val_1", edge_pct=5.0, max_dd_pct=0.0, trade_count=2),
+        "val_2": _make_result("val_2", edge_pct=4.0, max_dd_pct=0.0, trade_count=1),
+        "holdout": _make_result("holdout", edge_pct=1.0, is_holdout=True, trade_count=0),
+    }
+    llm = make_llm_sequence([GOOD_POLICY_SOURCE])
+    ctx = make_ctx(repo, llm)
+
+    record = rl.run_single_experiment(ctx, experiment_index=0, dry_run=False, print_fn=lambda s: None)
+
+    # 分数其实是正的、严格好于0的历史最优基线,换成任务2之前的老逻辑本该kept——
+    # 但两个验证窗口的trade_count总和只有3(<min_val_trades默认10),一律revert
+    assert record["status"] == "reverted"
+    assert record["revert_reason"] == "insufficient_trades"
+    assert record["commit_sha_result"] is None
+    policy_path = ctx.policies_dir / f"{record['policy_id']}.py"
+    assert not policy_path.exists()  # 从未提交过的新文件,revert=删除
+
+
+def test_min_val_trades_gate_allows_keep_when_sample_size_sufficient(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path)
+    monkeypatch.setattr(rl, "BacktestEngine", FakeBacktestEngine)
+    FakeBacktestEngine.injected_results = {
+        "train": _make_result("train", edge_pct=999.0, trade_count=0),
+        "val_1": _make_result("val_1", edge_pct=5.0, max_dd_pct=0.0, trade_count=8),
+        "val_2": _make_result("val_2", edge_pct=4.0, max_dd_pct=0.0, trade_count=7),
+        "holdout": _make_result("holdout", edge_pct=1.0, is_holdout=True, trade_count=0),
+    }
+    llm = make_llm_sequence([GOOD_POLICY_SOURCE])
+    ctx = make_ctx(repo, llm)
+
+    record = rl.run_single_experiment(ctx, experiment_index=0, dry_run=False, print_fn=lambda s: None)
+
+    # trade_count总和=15(>=10)且分数(4.0,底线是min(5,4)-0*0.5=4.0)严格好于
+    # 历史最优0.0 -> kept,revert_reason为None(kept时该字段规定为null)
+    assert record["status"] == "kept"
+    assert record["revert_reason"] is None
+    assert record["commit_sha_result"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 10. 任务1:外环研究总监——mock deep_llm,校验落盘/重试耗尽后返回None
+# ---------------------------------------------------------------------------
+
+
+def test_run_research_director_writes_memo_and_archive_on_valid_response(tmp_path):
+    repo = init_repo(tmp_path)
+    valid_response = json.dumps(
+        {
+            "trajectory_insights": [
+                "目前只有aggressive这一个真实实现的策略类别,轨迹样本还很少",
+            ],
+            "directions": [
+                {"class": "funding_rate_carry", "hypothesis": "资金费率carry方向的具体假设", "rationale": "从未出现过的类别"},
+                {"class": "pairs_trading", "hypothesis": "配对交易方向的具体假设", "rationale": "分散化"},
+                {"class": "aggressive", "hypothesis": "在aggressive基础上进一步调参", "rationale": "复用已验证类别"},
+            ],
+        },
+        ensure_ascii=False,
+    )
+    llm = make_llm_sequence([valid_response])
+    ctx = make_ctx(repo, llm)
+
+    memo = rl.run_research_director(ctx, print_fn=lambda s: None)
+
+    assert memo is not None
+    assert len(memo["directions"]) == 3
+    assert memo["ts"] == ctx.data_end_ts  # ts复用ctx.data_end_ts,不读墙钟
+
+    memo_path = ctx.experiments_dir / "direction_memo.json"
+    md_path = ctx.experiments_dir / "direction_memo.md"
+    archive_path = ctx.experiments_dir / "memos" / f"memo_{ctx.data_end_ts}.json"
+    assert memo_path.exists()
+    assert md_path.exists()
+    assert archive_path.exists()
+
+    on_disk = json.loads(memo_path.read_text(encoding="utf-8"))
+    assert on_disk == memo
+    assert json.loads(archive_path.read_text(encoding="utf-8")) == memo
+    assert "funding_rate_carry" in md_path.read_text(encoding="utf-8")
+
+
+def test_run_research_director_returns_none_after_repeated_invalid_responses(tmp_path):
+    repo = init_repo(tmp_path)
+    llm = make_llm_sequence(["not json at all", "{}", "still not valid json"])
+    ctx = make_ctx(repo, llm)
+    printed: list[str] = []
+
+    memo = rl.run_research_director(ctx, print_fn=printed.append)
+
+    assert memo is None
+    assert not (ctx.experiments_dir / "direction_memo.json").exists()
+    assert printed  # 打印了失败信息告知调用方,但没有抛异常
+
+
+def test_build_director_prompt_contains_trajectory_and_death_archive_and_classes():
+    ledger_entries = [
+        {"policy_id": "momentum_v2", "hypothesis": "追涨杀跌", "status": "kept",
+         "val_edge_vs_benchmark_pct": 3.0, "val_max_drawdown_pct": 1.0, "holdout_edge_vs_benchmark_pct": 2.0},
+    ]
+    death_events = [
+        {"branch": "evo/20260701-carry", "decision": "FAIL", "edge_vs_main_pct": -2.0,
+         "max_drawdown_pct": 18.0, "reason": "drawdown blew through fail line", "ts": 123},
+    ]
+    prompt = rl.build_director_prompt(
+        ledger_entries, death_events, {"momentum_v1": "动量战术"}, known_classes=["momentum"],
+    )
+    assert "momentum_v2" in prompt
+    assert "evo/20260701-carry" in prompt
+    assert "momentum" in prompt
+    assert "directions" in prompt
+
+
+# ---------------------------------------------------------------------------
+# 11. 任务1:想法来源接线——总监备忘录消费 + 新颖性槽位
+# ---------------------------------------------------------------------------
+
+
+def test_select_idea_prefers_director_memo_when_present(tmp_path):
+    policies_dir = tmp_path / "policies"
+    policies_dir.mkdir()
+    (policies_dir / "momentum_v1.py").write_text(GOOD_POLICY_SOURCE, encoding="utf-8")
+    experiments_dir = tmp_path / "experiments"
+    experiments_dir.mkdir()
+    memo = {
+        "trajectory_insights": ["..."],
+        "directions": [
+            {"class": "funding_rate_carry", "hypothesis": "假设A", "rationale": "r"},
+            {"class": "pairs_trading", "hypothesis": "假设B", "rationale": "r"},
+        ],
+        "ts": 123,
+    }
+    (experiments_dir / "direction_memo.json").write_text(json.dumps(memo), encoding="utf-8")
+
+    idea0 = rl.select_idea(
+        0, ledger_entries=[], policies_dir=policies_dir, notes_dir=tmp_path / "notes", experiments_dir=experiments_dir,
+    )
+    assert idea0.source == "director"
+    assert idea0.hypothesis == "假设A"
+    assert idea0.strategy_class == "funding_rate_carry"
+
+    idea1 = rl.select_idea(
+        1, ledger_entries=[], policies_dir=policies_dir, notes_dir=tmp_path / "notes", experiments_dir=experiments_dir,
+    )
+    assert idea1.hypothesis == "假设B"  # 轮转:experiment_index % len(directions)
+
+
+def test_select_idea_falls_back_to_old_rotation_when_memo_absent(tmp_path):
+    policies_dir = tmp_path / "policies"
+    policies_dir.mkdir()
+    (policies_dir / "momentum_v1.py").write_text(GOOD_POLICY_SOURCE, encoding="utf-8")
+    # experiments_dir 存在但没有 direction_memo.json -> 视同不存在,不应该报错
+    experiments_dir = tmp_path / "experiments"
+    experiments_dir.mkdir()
+
+    idea = rl.select_idea(
+        0, ledger_entries=[], policies_dir=policies_dir, notes_dir=tmp_path / "notes", experiments_dir=experiments_dir,
+    )
+    assert idea.source == "seed_variant"  # 冷启动老逻辑不受影响
+
+
+def test_select_idea_forces_novelty_every_fifth_experiment_regardless_of_memo(tmp_path):
+    policies_dir = tmp_path / "policies"
+    policies_dir.mkdir()
+    (policies_dir / "momentum_v1.py").write_text(GOOD_POLICY_SOURCE, encoding="utf-8")
+    experiments_dir = tmp_path / "experiments"
+    experiments_dir.mkdir()
+    memo = {"directions": [{"class": "funding_rate_carry", "hypothesis": "假设A", "rationale": "r"}], "ts": 1}
+    (experiments_dir / "direction_memo.json").write_text(json.dumps(memo), encoding="utf-8")
+
+    for index in (4, 9, 14):  # experiment_index % 5 == 4
+        idea = rl.select_idea(
+            index, ledger_entries=[], policies_dir=policies_dir, notes_dir=tmp_path / "notes",
+            experiments_dir=experiments_dir,
+        )
+        assert idea.source == "novelty"  # 新颖性槽位凌驾于备忘录方向之上
+
+    idea_non_slot = rl.select_idea(
+        0, ledger_entries=[], policies_dir=policies_dir, notes_dir=tmp_path / "notes", experiments_dir=experiments_dir,
+    )
+    assert idea_non_slot.source == "director"  # 非第5个实验时正常消费备忘录
+
+
+def test_build_researcher_prompt_novelty_form_includes_known_classes():
+    idea = rl.Idea(
+        source="novelty", policy_id="novelty_idea_v1", parent_policy_id=None,
+        hypothesis=rl._NOVELTY_HYPOTHESIS, reference_policy_id="diversified_v1", strategy_class=None,
+    )
+    prompt = rl.build_researcher_prompt(
+        idea, "novelty_idea_v1", "new", "reference source here", known_classes=["momentum", "carry"],
+    )
+    assert "新颖性槽位" in prompt
+    assert "momentum" in prompt and "carry" in prompt  # 已存在类别清单必须出现在prompt里
+    assert "配对/价差回归" in prompt  # 经典类别菜单(仅作启发)
+
+
+def test_build_researcher_prompt_director_form_includes_target_class():
+    idea = rl.Idea(
+        source="director", policy_id="director_idea_v1", parent_policy_id=None,
+        hypothesis="假设文本", reference_policy_id="diversified_v1", strategy_class="funding_rate_carry",
+    )
+    prompt = rl.build_researcher_prompt(idea, "director_idea_v1", "new", "reference source here")
+    assert "研究总监指定方向" in prompt
+    assert "funding_rate_carry" in prompt
+
+
+# ---------------------------------------------------------------------------
+# 12. run_research_loop 收尾自动调研究总监一次;dry_run 时跳过
+# ---------------------------------------------------------------------------
+
+
+def test_run_research_loop_calls_research_director_once_when_not_dry_run(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path)
+    monkeypatch.setattr(rl, "BacktestEngine", FakeBacktestEngine)
+    FakeBacktestEngine.injected_results = {
+        "train": _make_result("train", edge_pct=999.0),
+        "val_1": _make_result("val_1", edge_pct=5.0, max_dd_pct=0.0),
+        "val_2": _make_result("val_2", edge_pct=4.0, max_dd_pct=0.0),
+        "holdout": _make_result("holdout", edge_pct=1.0, is_holdout=True),
+    }
+    calls = []
+    monkeypatch.setattr(rl, "run_research_director", lambda ctx, print_fn=print: calls.append(ctx))
+    llm = make_llm_sequence([GOOD_POLICY_SOURCE, GOOD_POLICY_SOURCE])
+    ctx = make_ctx(repo, llm)
+
+    rl.run_research_loop(ctx, max_experiments=2, dry_run=False, print_fn=lambda s: None)
+
+    assert len(calls) == 1
+
+
+def test_run_research_loop_skips_research_director_in_dry_run(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path)
+    calls = []
+    monkeypatch.setattr(rl, "run_research_director", lambda ctx, print_fn=print: calls.append(ctx))
+    llm = make_llm_sequence([GOOD_POLICY_SOURCE, GOOD_POLICY_SOURCE])
+    ctx = make_ctx(repo, llm)
+
+    rl.run_research_loop(ctx, max_experiments=2, dry_run=True, print_fn=lambda s: None)
+
+    assert calls == []

@@ -43,11 +43,21 @@ decisions 为空列表时,撮合循环(`for decision in decisions`)天然是0次
 "空列表=本周期无操作"语义在这里被完整保留,不需要在分发层强行合成一条
 其实没有真实信息量的 hold 决策(合成的 hold 决策还需要编一句真实但空洞的
 thesis/falsifier 才能通过 schema 校验,纯粹是为了凑数,没有必要)。
+
+ctx.recent_funding(M7资金费率感官前向注入):纯代码路径下,对
+latest_snapshot 里的每个symbol调用 data_pipeline.fetch_funding_rate_history
+拉近30天资金费率历史,10分钟memo缓存(同一个symbol10分钟内的多次
+decide()调用只拉一次,手法与 scripts/ignite.py::_trend_cache 一致但独立
+实现,不 import ignite)。拉取失败(网络异常/该symbol没有缓存/duck-type
+替身没实现这个方法)一律返回空DataFrame,不抛异常——funding是carry_v1等
+policy的增强感官输入,不是决策周期能否完成的前提。
 """
 from __future__ import annotations
 
 from dataclasses import replace
 from typing import Any, Callable, Optional
+
+import pandas as pd
 
 from LOCKED.schemas import Decision, PerpPosition
 
@@ -60,6 +70,17 @@ from ASSET.strategy.policies import StrategyContext, load_policy
 # `len(df) < REQUIRED_HISTORY_BARS` 的防御性检查也不会崩,只会保守地跳过
 # 本周期),纯粹是工程余量。
 _HISTORY_BUFFER_BARS = 5
+
+# ctx.recent_funding 的拉取窗口/缓存参数(M7资金费率感官前向注入)。
+# 30天回看:carry_v1真carry分支只需要近10天均值就够,30天给了充分富余,
+# 换算成条数(资金费率结算周期8h/条,一天3条)约90条,一次fetch就够。
+_FUNDING_LOOKBACK_MS = 30 * 24 * 3600 * 1000
+_FUNDING_FETCH_LIMIT = 90
+# 10分钟memo缓存,手法与 scripts/ignite.py 里 _trend_cache 一致(同一个
+# ts在10分钟内被多个分支/多次调用命中同一份数据,不重复拉取)。这里不
+# import ignite、独立在本类里维护一份缓存——DispatchingTrader 不应该
+# 依赖 scripts/ 目录下的调度脚本内部实现细节。
+_FUNDING_CACHE_MS = 10 * 60_000
 
 
 class DispatchingTrader:
@@ -98,6 +119,8 @@ class DispatchingTrader:
         self.data_pipeline = data_pipeline
         self.memory_store = memory_store
         self.timeframe = timeframe
+        # symbol -> (fetched_at_ts, DataFrame),见 _fetch_recent_funding。
+        self._funding_cache: dict[str, tuple[int, "pd.DataFrame"]] = {}
 
     # ------------------------------------------------------------------
     # positions: list[PerpPosition] -> dict[symbol, PerpPosition]
@@ -131,6 +154,28 @@ class DispatchingTrader:
             if isinstance(first, dict) and "content" in first:
                 return first["content"]
         return str(item)
+
+    # ------------------------------------------------------------------
+    # ctx.recent_funding:10分钟memo缓存 + 30天回看的资金费率历史拉取。
+    # ------------------------------------------------------------------
+
+    def _fetch_recent_funding(self, symbol: str, ts: int) -> "pd.DataFrame":
+        """返回symbol近30天的资金费率历史(升序DataFrame),10分钟内命中
+        同一份缓存结果不重复拉取。data_pipeline 拉取失败(网络异常/该
+        symbol没有资金费率缓存/duck-type替身根本没实现这个方法导致的
+        AttributeError等)一律返回空DataFrame,不抛异常——funding是policy
+        的增强感官输入,不该因为拉不到就打断整个决策周期。"""
+        cached = self._funding_cache.get(symbol)
+        if cached is not None and ts - cached[0] < _FUNDING_CACHE_MS:
+            return cached[1]
+        try:
+            df = self.data_pipeline.fetch_funding_rate_history(
+                symbol, since=ts - _FUNDING_LOOKBACK_MS, limit=_FUNDING_FETCH_LIMIT
+            )
+        except Exception:  # noqa: BLE001 -- funding是增强信息,拉不到不该毁掉整个决策周期
+            df = pd.DataFrame(columns=["timestamp", "funding_rate"])
+        self._funding_cache[symbol] = (ts, df)
+        return df
 
     def _retrieve_memory_context(self, query_text: str, ts: int, top_k: int, branch: str) -> list[str]:
         if self.memory_store is None:
@@ -185,12 +230,17 @@ class DispatchingTrader:
             for symbol in latest_snapshot
         }
 
+        recent_funding = {
+            symbol: self._fetch_recent_funding(symbol, ts) for symbol in latest_snapshot
+        }
+
         ctx = StrategyContext(
             ts=ts,
             positions=self._positions_to_dict(positions),
             snapshot=latest_snapshot,
             recent_bars=recent_bars,
             memory_context=self._retrieve_memory_context(memory_query_text, ts, top_k, branch),
+            recent_funding=recent_funding,
         )
 
         decisions = policy.decide(ctx)

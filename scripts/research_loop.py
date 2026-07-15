@@ -192,8 +192,22 @@ def build_ledger_record(
     val_max_drawdown_pct: Optional[float],
     holdout_edge_vs_benchmark_pct: Optional[float],
     wall_time_seconds: float,
+    revert_reason: Optional[str] = None,
 ) -> dict:
-    """schema 逐字遵守任务说明里列出的字段集合。"""
+    """schema 逐字遵守任务说明里列出的字段集合,另加两个向后兼容的新字段:
+
+    - revert_reason:kept时为None;status=="reverted"时按触发原因区分——
+      "insufficient_trades"(任务2:验证窗口trade_count总和不足门槛,直接
+      revert,分数再高也不算数)或"score_not_better"(正常棘轮判定没打赢
+      历史最优)。lint_failed/backtest_failed这两种status与"revert原因"
+      的概念无关,统一为None。
+    - strategy_class:source=="director"时来自研究总监备忘录的direction.
+      class,其余来源为None。写进ledger是为了下次
+      collect_known_strategy_classes()能认出"这个类别已经出现过"，不需要
+      额外的状态文件。
+
+    读旧行(不含这两个key)的调用方一律用 .get(...) 取值,缺字段不会报错——
+    向后兼容是字段新增的硬要求,不是可选项。"""
     return {
         "experiment_id": experiment_id,
         "policy_id": idea.policy_id,
@@ -206,6 +220,8 @@ def build_ledger_record(
         "val_max_drawdown_pct": val_max_drawdown_pct,
         "holdout_edge_vs_benchmark_pct": holdout_edge_vs_benchmark_pct,
         "wall_time_seconds": wall_time_seconds,
+        "revert_reason": revert_reason,
+        "strategy_class": idea.strategy_class,
     }
 
 
@@ -216,11 +232,18 @@ def build_ledger_record(
 
 @dataclass(frozen=True)
 class Idea:
-    source: str  # "kept_variant" | "research_note" | "seed_variant"
+    source: str  # "kept_variant" | "research_note" | "seed_variant" | "director" | "novelty"
     policy_id: str  # 目标文件名(已通过路径安全校验的候选)
     parent_policy_id: Optional[str]
     hypothesis: str
     reference_policy_id: Optional[str]  # "新建型"时用来给LLM参照的源码来自哪个policy_id
+    # source=="director"时由研究总监备忘录里的direction.class带过来,用于
+    # (a) 给LLM研究员prompt里点名要实现的类别 (b) 写进ledger后供下一次
+    # collect_known_strategy_classes()识别"这个类别已经出现过"。其余来源
+    # (kept_variant/research_note/seed_variant/novelty)一律为None——不是
+    # 每条idea都天然有一个"类别名"这个概念,novelty来源的类别名要等LLM真的
+    # 写出策略之后才知道,这里不去猜测/伪造一个。
+    strategy_class: Optional[str] = None
 
 
 def select_idea_source(experiment_index: int, ledger_has_kept: bool) -> str:
@@ -236,12 +259,21 @@ def select_idea_source(experiment_index: int, ledger_has_kept: bool) -> str:
     return order[experiment_index % 3]
 
 
+def _strip_variant_suffix(policy_id: str) -> str:
+    """去掉 policy_id 已有的 "_vN" 后缀(如果有),得到它的"策略家族名"——
+    momentum_v1/momentum_v2 都属于家族名"momentum"。_next_policy_variant_id
+    与"策略类别"相关的启发式(collect_known_strategy_classes/
+    _pick_reference_for_class)共用这一条规则,避免同一个概念散落成两份
+    正则。"""
+    return re.sub(r"_v\d+$", "", policy_id) or policy_id
+
+
 def _next_policy_variant_id(base_policy_id: str, policies_dir: Path) -> str:
     """给 base_policy_id 生成一个尚未存在于 policies_dir 下、且满足
     ^[a-z][a-z0-9_]{2,40}$ 白名单的新 policy_id,形如 "{stem}_v{n}"。
     先去掉 base_policy_id 已有的 "_vN" 后缀(如果有),避免变体的变体越叠
     越长(momentum_v1 -> momentum_v2,而不是 momentum_v1_v2)。"""
-    stem = re.sub(r"_v\d+$", "", base_policy_id) or base_policy_id
+    stem = _strip_variant_suffix(base_policy_id)
     n = 1
     while True:
         candidate = f"{stem}_v{n}"
@@ -273,12 +305,108 @@ def _extract_hypotheses(note_text: str) -> list[str]:
     return [m.strip() for m in _HYPOTHESIS_RE.findall(note_text) if m.strip()]
 
 
+def _load_direction_memo(experiments_dir: Optional[Path]) -> Optional[dict]:
+    """读 experiments_dir/direction_memo.json;文件不存在、不是合法JSON、或
+    顶层不是一个JSON对象,一律返回None(冷启动/总监从未成功运行过时的
+    正常状态,不是错误)。"""
+    if experiments_dir is None:
+        return None
+    path = Path(experiments_dir) / "direction_memo.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _pick_reference_for_class(class_name: str, ledger_entries: list[dict], policies_dir: Path) -> str:
+    """给研究总监指定的策略类别"就近"挑一个参照源码:优先在磁盘上真实存在
+    的已保留(kept)策略里找家族名与class_name有词面重叠的,其次退回同样
+    规则下的种子策略,都找不到就退回默认参照(diversified_v1)。
+
+    这是一个尽力而为的启发式,不是精确的语义分类器——class_name完全可能是
+    总监起的纯中文类别名(比如"资金费率carry的时段增强版"),这种情况下
+    大概率找不到任何词面重叠,直接落到默认参照分支。规格书没有规定"就近"
+    具体怎么算,这是本次实现自行拍板的一项设计决定。"""
+    needle = class_name.strip().lower()
+    kept_ids = [e["policy_id"] for e in ledger_entries if e.get("status") == "kept" and e.get("policy_id")]
+    seen: set[str] = set()
+    for candidate in list(dict.fromkeys(kept_ids)) + list(_SEED_POLICY_IDS):
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        family = _strip_variant_suffix(candidate).lower()
+        if family and (family in needle or needle in family) and (policies_dir / f"{candidate}.py").exists():
+            return candidate
+    return _DEFAULT_REFERENCE_POLICY_ID
+
+
+_NOVELTY_HYPOTHESIS = (
+    "新颖性槽位:设计一个当前所有已知策略类别之外的全新策略类别,而不是对"
+    "已有策略做参数/信号微调。可参考经典类别菜单启发(不限于此):配对/"
+    "价差回归、横截面多空排名、波动率突破、资金费率carry、时段效应、"
+    "相关性regime切换;也允许发明菜单之外的类别。"
+)
+
+
+def _select_director_idea(experiment_index: int, directions: list[dict], ledger_entries: list[dict], policies_dir: Path) -> Idea:
+    """消费研究总监备忘录里的一条研究方向(轮转:experiment_index % len(directions))。"""
+    direction = directions[experiment_index % len(directions)]
+    class_name = str(direction.get("class") or "").strip() or "unspecified"
+    hypothesis = str(direction.get("hypothesis") or "").strip() or "研究总监未提供具体假设文本。"
+    policy_id = _next_policy_variant_id("director_idea", policies_dir)
+    reference_policy_id = _pick_reference_for_class(class_name, ledger_entries, policies_dir)
+    return Idea(
+        source="director", policy_id=policy_id, parent_policy_id=None,
+        hypothesis=hypothesis, reference_policy_id=reference_policy_id,
+        strategy_class=class_name,
+    )
+
+
+def _select_novelty_idea(policies_dir: Path) -> Idea:
+    """新颖性槽位(每第5个实验强制,见select_idea):固定的探索性假设文本,
+    真正"发明一个新类别"的创造性工作交给build_researcher_prompt里对
+    source=="novelty"专门构造的prompt(带上已存在类别清单+经典类别菜单)。
+    strategy_class刻意留空——novelty产出的策略具体归属哪个新类别,要等LLM
+    真的写出DESCRIPTION之后才知道,这里不预先猜测/伪造一个类别名。"""
+    policy_id = _next_policy_variant_id("novelty_idea", policies_dir)
+    return Idea(
+        source="novelty", policy_id=policy_id, parent_policy_id=None,
+        hypothesis=_NOVELTY_HYPOTHESIS, reference_policy_id=_DEFAULT_REFERENCE_POLICY_ID,
+        strategy_class=None,
+    )
+
+
 def select_idea(
     experiment_index: int,
     ledger_entries: list[dict],
     policies_dir: Path,
     notes_dir: Path,
+    experiments_dir: Optional[Path] = None,
 ) -> Idea:
+    """想法来源轮转优先级(本次改动新增了两层,凌驾于原有三来源轮转之上):
+
+    1. 新颖性槽位:每第5个实验(experiment_index % 5 == 4)无条件强制走
+       source="novelty"——不管备忘录存不存在,这条槽位专门用来对抗"内环
+       只会顺着已有类别做局部变体、永远发明不出全新类别"这个问题。
+    2. 研究总监备忘录:experiments_dir/direction_memo.json 存在且有非空
+       directions 时,优先消费备忘录方向(source="director"),按
+       experiment_index % len(directions) 轮转取一条。
+    3. 备忘录不存在(典型的"首夜",总监还从未成功运行过一次)时,退回
+       原有的 kept_variant/research_note/seed_variant 三来源轮转。
+
+    experiments_dir 是新增的可选参数(默认None——省略即视为"不查备忘录",
+    向后兼容既有调用/测试)。"""
+    if experiment_index % 5 == 4:
+        return _select_novelty_idea(policies_dir)
+
+    memo = _load_direction_memo(experiments_dir)
+    directions = memo.get("directions") if memo else None
+    if directions:
+        return _select_director_idea(experiment_index, directions, ledger_entries, policies_dir)
+
     kept_entries = [e for e in ledger_entries if e.get("status") == "kept"]
     source = select_idea_source(experiment_index, ledger_has_kept=bool(kept_entries))
 
@@ -429,17 +557,48 @@ def resolve_reference(policies_dir: Path, idea: Idea) -> tuple[str, str]:
     return "new", ref_source
 
 
-def build_researcher_prompt(idea: Idea, target_policy_id: str, reference_kind: str, reference_source: str) -> str:
+def _build_source_specific_prompt_section(idea: Idea, known_classes: Optional[list[str]]) -> str:
+    """director/novelty 两种来源在"你是研究员,写代码"这个通用外壳之外,各自
+    需要一段额外的定向要求段落;kept_variant/research_note/seed_variant
+    维持原有prompt形态,不受影响(返回空字符串)。"""
+    if idea.source == "director":
+        return (
+            "\n## 研究总监指定方向\n"
+            f"- 目标策略类别:{idea.strategy_class or '(未指定)'}\n"
+            "这条假设来自外环研究总监对全部历史实验轨迹的复盘,请围绕这个类别"
+            "具体落地,不要偏离到无关的策略类型。\n"
+        )
+    if idea.source == "novelty":
+        classes_text = "、".join(known_classes) if known_classes else "(暂无记录)"
+        return (
+            "\n## 新颖性槽位要求\n"
+            f"- 已存在的策略类别清单(必须避开,不要与其重复或只做参数微调):{classes_text}\n"
+            "- 请设计一个上述清单中不存在的全新策略类别。经典类别菜单仅作启发"
+            "(不限于此):配对/价差回归、横截面多空排名、波动率突破、资金"
+            "费率carry、时段效应、相关性regime切换;也允许发明菜单之外的类别。\n"
+        )
+    return ""
+
+
+def build_researcher_prompt(
+    idea: Idea,
+    target_policy_id: str,
+    reference_kind: str,
+    reference_source: str,
+    known_classes: Optional[list[str]] = None,
+) -> str:
     reference_note = (
         "改进型:下面是目标文件当前的源码,请在此基础上按假设修改"
         if reference_kind == "improve"
         else "新建型:下面是最相近的参考源码(种子策略或血缘父策略),请仿照其结构新建"
     )
+    source_specific = _build_source_specific_prompt_section(idea, known_classes)
     return (
         "你是AlphaLoop-Crypto的内环策略研究员。任务:为下面这条假设写/改一个"
         "确定性的Python策略模块(ASSET/strategy/policies 目录下的policy)。\n\n"
         f"## 目标 policy_id\n{target_policy_id}\n\n"
-        f"## 假设\n{idea.hypothesis}\n\n"
+        f"## 假设\n{idea.hypothesis}\n"
+        f"{source_specific}\n"
         f"## 参考源码({reference_note})\n"
         f"```python\n{reference_source}\n```\n\n"
         "## StrategyContext 协议(decide(ctx)的唯一输入)\n"
@@ -597,6 +756,16 @@ def compute_val_stats(results: dict) -> tuple[float, float]:
     return edge, dd
 
 
+def compute_val_trade_count(results: dict) -> int:
+    """验证窗口(排除train和holdout,口径与compute_val_stats完全一致)的
+    trade_count总和——最小样本量门槛(config.backtest.min_val_trades)的
+    判定依据。任务2的核心动机:2-3笔交易就能靠运气拿到很高的edge分数,
+    量化的统计优势前提是samplesize——52%胜率×1万次才是大数定律生效的场景,
+    ×3次只是抛硬币,不该被允许晋级。"""
+    val_results = [r for label, r in results.items() if label != "train" and not r.window.is_holdout]
+    return sum(int(r.trade_count) for r in val_results)
+
+
 def historical_best_score(ledger_entries: list[dict], policy_id: str) -> float:
     """该 policy_id 迄今为止所有 status=kept 记录里的最高分数(用
     val_edge_vs_benchmark_pct - 0.5*val_max_drawdown_pct 重算,与
@@ -667,11 +836,16 @@ def run_single_experiment(
 ) -> dict:
     start_time = time.time()
     ledger_entries = read_ledger(ctx.ledger_path)
-    idea = select_idea(experiment_index, ledger_entries, ctx.policies_dir, ctx.notes_dir)
+    idea = select_idea(experiment_index, ledger_entries, ctx.policies_dir, ctx.notes_dir, experiments_dir=ctx.experiments_dir)
     experiment_id = f"{idea.policy_id}_{experiment_index:04d}"
 
     reference_kind, reference_source = resolve_reference(ctx.policies_dir, idea)
-    prompt = build_researcher_prompt(idea, idea.policy_id, reference_kind, reference_source)
+    # known_classes 只在 director/novelty 两种来源的prompt分支里真正用到
+    # (见 _build_source_specific_prompt_section),但计算成本很低、且对
+    # 其余来源无副作用,统一算好传下去,不必按source分叉两条调用路径。
+    policy_descriptions = collect_existing_strategy_descriptions(ctx.policies_dir)
+    known_classes = collect_known_strategy_classes(ledger_entries, policy_descriptions)
+    prompt = build_researcher_prompt(idea, idea.policy_id, reference_kind, reference_source, known_classes=known_classes)
 
     if dry_run:
         print_fn(f"[dry-run] experiment_id={experiment_id} policy_id={idea.policy_id} source={idea.source}")
@@ -745,11 +919,21 @@ def run_single_experiment(
     scoring_results = {label: r for label, r in results.items() if label != "holdout"}
     new_score = engine.score(scoring_results)
     val_edge, val_dd = compute_val_stats(results)
+    val_trade_count = compute_val_trade_count(results)
     holdout_result = results.get("holdout")
     holdout_edge = holdout_result.edge_vs_benchmark_pct if holdout_result is not None else None
 
-    previous_best = historical_best_score(ledger_entries, idea.policy_id)
-    status = decide_keep_or_revert(new_score, previous_best)
+    # ---- 任务2:最小样本量门槛——比分数判定更前置,总交易笔数不够直接
+    # revert,分数再好也不算数(见 config.yaml backtest.min_val_trades 注释:
+    # 2-3笔交易靠运气拿高分是抛硬币,不是统计优势)。
+    min_val_trades = int((ctx.config.get("backtest", {}) or {}).get("min_val_trades", 10))
+    if val_trade_count < min_val_trades:
+        status = "reverted"
+        revert_reason = "insufficient_trades"
+    else:
+        previous_best = historical_best_score(ledger_entries, idea.policy_id)
+        status = decide_keep_or_revert(new_score, previous_best)
+        revert_reason = None if status == "kept" else "score_not_better"
 
     if status == "kept":
         commit_sha_result = git_commit_result(
@@ -766,6 +950,7 @@ def run_single_experiment(
         status=status,
         val_edge_vs_benchmark_pct=val_edge, val_max_drawdown_pct=val_dd,
         holdout_edge_vs_benchmark_pct=holdout_edge, wall_time_seconds=wall_time_seconds,
+        revert_reason=revert_reason,
     )
     append_ledger(ctx.ledger_path, record)
     print_fn(
@@ -797,7 +982,233 @@ def run_research_loop(
     records = []
     for i in range(limit):
         records.append(run_single_experiment(ctx, base + i, dry_run=dry_run, print_fn=print_fn))
+    # 所有实验跑完之后自动跑一次外环研究总监,产出给下一晚select_idea()消费
+    # 的方向备忘录——dry_run时跳过(dry_run本身就是"只看想法/prompt/lint,
+    # 不动磁盘/git",总监落盘memo文件属于"动磁盘",与dry_run的语义矛盾)。
+    if not dry_run:
+        run_research_director(ctx, print_fn=print_fn)
     return records
+
+
+# ---------------------------------------------------------------------------
+# 9b. 外环研究总监(§任务1:让内环从"无记忆爬山"升级为"真正做研究")
+# ---------------------------------------------------------------------------
+
+_DIRECTOR_MAX_ATTEMPTS = 3
+_DIRECTOR_MIN_DIRECTIONS = 3
+_DIRECTOR_MAX_DIRECTIONS = 5
+
+
+def _read_tactic_promotions(repo_path: Path) -> list[dict]:
+    """LOG/tactic_promotions.jsonl——战术锦标赛的分支死亡/晋升档案(见
+    scripts/ignite.py evaluate_tactic_tournament/evaluate_cull 写入处,
+    字段:branch/decision[PROMOTE|FAIL|CULLED]/edge_vs_main_pct/
+    max_drawdown_pct/reason/ts)。复用read_ledger:纯jsonl读取,文件不存在
+    -> 空列表,与ledger.jsonl的读取方式完全对称,不需要为一个不同目录下的
+    同构jsonl文件另写一遍读取逻辑。"""
+    return read_ledger(repo_path / "LOG" / "tactic_promotions.jsonl")
+
+
+def collect_existing_strategy_descriptions(policies_dir: Path) -> dict[str, str]:
+    """遍历 policies_dir 下全部 *.py(排除 __init__.py),用
+    load_policy_from_dir 尝试加载并取出 DESCRIPTION 导出;加载失败(语法
+    错误/契约缺失/AST层面就有问题)的文件直接跳过——研究总监需要的是"现有
+    策略类别一览"这个粗粒度输入,不因为某一个坏文件让整条总监流程崩溃。"""
+    result: dict[str, str] = {}
+    if not policies_dir.exists():
+        return result
+    for path in sorted(policies_dir.glob("*.py")):
+        if path.stem == "__init__":
+            continue
+        try:
+            module = load_policy_from_dir(path.stem, policies_dir)
+        except Exception:  # noqa: BLE001 - 任何加载失败都跳过,不中断总监流程
+            continue
+        desc = getattr(module, "DESCRIPTION", None)
+        if isinstance(desc, str) and desc.strip():
+            result[path.stem] = desc.strip()
+    return result
+
+
+def collect_known_strategy_classes(ledger_entries: list[dict], policy_descriptions: dict[str, str]) -> list[str]:
+    """"已出现过的策略类别"清单,两个来源合并去重:
+      (a) 现有策略文件的"家族名"(policy_id去掉_vN后缀,如 momentum_v2 ->
+          momentum)——代表"已经有可运行实现"的类别;
+      (b) ledger里带 strategy_class 标记的历史实验(director来源产生的
+          类别,见Idea.strategy_class/build_ledger_record)——代表"总监已经
+          明确指派过"的类别,哪怕对应实验最终被revert也算"出现过",避免
+          总监反复重复建议同一个已经试过的方向。
+
+    规格书没有强制规定"策略类别"这个概念该有一个独立的分类字段/标签体系,
+    这是本次实现自行拍板的一项设计决定:不引入额外的人工打标签流程,只是
+    复用已经存在的policy_id命名家族 + 总监自己历史上分配过的class标签,
+    对"避免和已有类别重复"这个实际需求已经足够。"""
+    classes = {_strip_variant_suffix(pid) for pid in policy_descriptions}
+    for e in ledger_entries:
+        cls = e.get("strategy_class")
+        if isinstance(cls, str) and cls.strip():
+            classes.add(cls.strip())
+    return sorted(classes)
+
+
+def _summarize_trajectory(ledger_entries: list[dict]) -> list[str]:
+    return [
+        f"- policy_id={e.get('policy_id')} hypothesis={(e.get('hypothesis') or '')[:60]!r} "
+        f"status={e.get('status')} val_edge={e.get('val_edge_vs_benchmark_pct')} "
+        f"val_dd={e.get('val_max_drawdown_pct')} holdout_edge={e.get('holdout_edge_vs_benchmark_pct')}"
+        for e in ledger_entries
+    ]
+
+
+def _summarize_death_archive(events: list[dict]) -> list[str]:
+    return [
+        f"- branch={e.get('branch')} decision={e.get('decision')} "
+        f"edge_vs_main_pct={e.get('edge_vs_main_pct')} max_drawdown_pct={e.get('max_drawdown_pct')} "
+        f"reason={e.get('reason')} ts={e.get('ts')}"
+        for e in events
+    ]
+
+
+def build_director_prompt(
+    ledger_entries: list[dict],
+    death_events: list[dict],
+    policy_descriptions: dict[str, str],
+    known_classes: list[str],
+    retry_feedback: Optional[str] = None,
+) -> str:
+    trajectory_lines = _summarize_trajectory(ledger_entries)
+    death_lines = _summarize_death_archive(death_events)
+    strategy_lines = [f"- {pid}: {desc[:120]}" for pid, desc in policy_descriptions.items()]
+    lines = [
+        "你是AlphaLoop-Crypto的外环研究总监。你不写代码,你的职责是回顾内环"
+        "全部实验轨迹,给出下一批研究方向,引导内环从'无记忆爬山'升级为"
+        "'真正做研究'。",
+        "",
+        "## 实验轨迹(全部ledger记录:policy_id/hypothesis/status/"
+        "val_edge/val_dd/holdout_edge)",
+        "\n".join(trajectory_lines) if trajectory_lines else "(尚无实验记录,冷启动)",
+        "",
+        "## 分支死亡/晋升档案(LOG/tactic_promotions.jsonl)",
+        "\n".join(death_lines) if death_lines else "(尚无记录)",
+        "",
+        "## 现有策略类别清单(以下类别已经有实现或已经被指派过,新方向不应与其重复)",
+        "\n".join(strategy_lines) if strategy_lines else "(尚无策略文件)",
+        f"已出现过的策略类别名:{', '.join(known_classes) if known_classes else '(无)'}",
+        "",
+        "## 输出要求",
+        "严格输出一个JSON对象(不要markdown代码块,不要任何JSON之外的文字):",
+        '{"trajectory_insights": ["洞察1", "洞察2", ...], '
+        '"directions": [{"class": "策略类别名", "hypothesis": "具体可实施的研究方向一句话", '
+        '"rationale": "基于轨迹的理由"}, ...]}',
+        f"directions 需要{_DIRECTOR_MIN_DIRECTIONS}到{_DIRECTOR_MAX_DIRECTIONS}条,"
+        "每条都必须有非空的class与hypothesis字段。其中至少1条的class必须是"
+        "上面'现有策略类别清单'里完全没有出现过的全新类别——不要全部都是对"
+        "已有类别的参数微调式重复。",
+    ]
+    if retry_feedback:
+        lines.append("")
+        lines.append(f"你上一次的输出未通过校验:{retry_feedback}。请修正后重新严格输出JSON对象。")
+    return "\n".join(lines)
+
+
+def _validate_director_response(raw: str, known_classes: list[str]) -> tuple[Optional[dict], Optional[str]]:
+    try:
+        parsed = json.loads(strip_code_fences(raw))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None, "response_not_valid_json"
+    if not isinstance(parsed, dict):
+        return None, "response_not_a_json_object"
+
+    insights = parsed.get("trajectory_insights")
+    if not isinstance(insights, list):
+        return None, "trajectory_insights_must_be_a_list"
+
+    directions = parsed.get("directions")
+    if not isinstance(directions, list) or not (_DIRECTOR_MIN_DIRECTIONS <= len(directions) <= _DIRECTOR_MAX_DIRECTIONS):
+        return None, f"directions_must_be_a_list_of_{_DIRECTOR_MIN_DIRECTIONS}_to_{_DIRECTOR_MAX_DIRECTIONS}_items"
+
+    known_lower = {c.strip().lower() for c in known_classes if isinstance(c, str) and c.strip()}
+    has_novel_class = False
+    for d in directions:
+        if not isinstance(d, dict):
+            return None, "each_direction_must_be_an_object"
+        cls = d.get("class")
+        hyp = d.get("hypothesis")
+        if not isinstance(cls, str) or not cls.strip():
+            return None, "direction_missing_non_empty_class"
+        if not isinstance(hyp, str) or not hyp.strip():
+            return None, "direction_missing_non_empty_hypothesis"
+        if cls.strip().lower() not in known_lower:
+            has_novel_class = True
+    if not has_novel_class:
+        return None, "directions_must_include_at_least_one_class_not_in_known_classes"
+
+    return parsed, None
+
+
+def _render_direction_memo_markdown(memo: dict) -> str:
+    lines = [f"# Research Direction Memo (ts={memo.get('ts')})", ""]
+    lines.append("## Trajectory Insights")
+    for insight in memo.get("trajectory_insights") or []:
+        lines.append(f"- {insight}")
+    lines.append("")
+    lines.append("## Directions")
+    for d in memo.get("directions") or []:
+        lines.append(f"### {d.get('class')}")
+        lines.append(f"- hypothesis: {d.get('hypothesis')}")
+        lines.append(f"- rationale: {d.get('rationale', '')}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def run_research_director(ctx: LoopContext, print_fn: Callable[[str], None] = print) -> Optional[dict]:
+    """外环研究总监:回顾ledger全部实验轨迹 + LOG/tactic_promotions.jsonl
+    死亡/晋升档案 + 现有策略DESCRIPTION清单,向 ctx.deep_llm 请求下一批研究
+    方向,校验通过后落盘 direction_memo.json/.md + 历史存档
+    experiments/memos/memo_{ts}.json,供下一次 select_idea() 消费。
+
+    最多重试_DIRECTOR_MAX_ATTEMPTS次,全部未通过校验则打印一行日志并返回
+    None,不抛异常——总监是"锦上添花"的外环指导,它这一轮失败不应该让
+    已经跑完的内环实验结果无法落盘、也不应该让整个调用方进程崩溃退出。
+
+    ts 直接复用 ctx.data_end_ts(已经是"由缓存数据推出的确定性时间戳",不是
+    墙钟),而不是另外调用 time.time()——与本模块其余部分"不读墙钟"的精神
+    一致,顺带也让测试不需要额外 monkeypatch 时间模块。"""
+    ledger_entries = read_ledger(ctx.ledger_path)
+    death_events = _read_tactic_promotions(ctx.repo_path)
+    policy_descriptions = collect_existing_strategy_descriptions(ctx.policies_dir)
+    known_classes = collect_known_strategy_classes(ledger_entries, policy_descriptions)
+
+    parsed: Optional[dict] = None
+    retry_feedback: Optional[str] = None
+    for _attempt in range(_DIRECTOR_MAX_ATTEMPTS):
+        prompt = build_director_prompt(ledger_entries, death_events, policy_descriptions, known_classes, retry_feedback)
+        raw = ctx.deep_llm(prompt)
+        parsed, error = _validate_director_response(raw, known_classes)
+        if error is None:
+            break
+        retry_feedback = error
+        parsed = None
+
+    if parsed is None:
+        print_fn(f"[research_director] 连续{_DIRECTOR_MAX_ATTEMPTS}次未通过校验,放弃本轮,last_error={retry_feedback}")
+        return None
+
+    ts = ctx.data_end_ts
+    memo = dict(parsed)
+    memo["ts"] = ts
+
+    ctx.experiments_dir.mkdir(parents=True, exist_ok=True)
+    memo_json = json.dumps(memo, ensure_ascii=False, indent=2)
+    (ctx.experiments_dir / "direction_memo.json").write_text(memo_json, encoding="utf-8")
+    (ctx.experiments_dir / "direction_memo.md").write_text(_render_direction_memo_markdown(memo), encoding="utf-8")
+
+    memos_dir = ctx.experiments_dir / "memos"
+    memos_dir.mkdir(parents=True, exist_ok=True)
+    (memos_dir / f"memo_{ts}.json").write_text(memo_json, encoding="utf-8")
+
+    print_fn(f"[research_director] memo written: {len(memo.get('directions') or [])} directions, ts={ts}")
+    return memo
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +1225,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="AlphaLoop-Crypto M7 内环研究循环")
     parser.add_argument("--max-experiments", type=int, default=20)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--director-only", action="store_true",
+        help="只跑一次外环研究总监(run_research_director),不跑任何内环实验——"
+        "用于单独刷新 direction_memo,不消耗实验预算/不产生新的policy变体。",
+    )
     args = parser.parse_args()
 
     from LOCKED.data_pipeline import DataPipeline
@@ -822,7 +1238,10 @@ def main() -> None:
     _routine_llm, deep_llm = build_llm_clients(config)
     data_pipeline = DataPipeline(exchange_id=config["data"]["exchange"])
     ctx = build_loop_context(config, PROJECT_ROOT, deep_llm, data_pipeline)
-    run_research_loop(ctx, max_experiments=args.max_experiments, dry_run=args.dry_run)
+    if args.director_only:
+        run_research_director(ctx, print_fn=print)
+    else:
+        run_research_loop(ctx, max_experiments=args.max_experiments, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

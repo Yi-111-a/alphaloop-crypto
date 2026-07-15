@@ -388,3 +388,51 @@ def test_no_signal_data_returns_empty_list_not_hold_decision():
     for policy_id in POLICY_IDS:
         module = load_policy(policy_id)
         assert module.decide(ctx) == [], f"{policy_id} should return [] when history is insufficient"
+
+
+# ---------------------------------------------------------------------------
+# 5. M7资金费率感官注入:StrategyContext.recent_funding 默认值 + 旧策略不受影响
+# ---------------------------------------------------------------------------
+
+
+def test_strategy_context_recent_funding_defaults_to_empty_dict_without_crashing():
+    """不传 recent_funding 构造 StrategyContext 不能报错——所有既有构造点
+    (测试/LOCKED/backtest_engine.py/ASSET/strategy/policy_trader.py 升级前的
+    调用方式)在这个字段存在之前就已经写好,必须继续可用、且默认值是空dict
+    (而不是None——policy代码里`ctx.recent_funding.get(symbol)`这种写法不该
+    因为默认值是None而崩)。"""
+    ctx = StrategyContext(
+        ts=1_700_000_000_000,
+        positions={},
+        snapshot={},
+        recent_bars={},
+    )
+    assert ctx.recent_funding == {}
+
+
+@pytest.mark.parametrize("policy_id", ["momentum_v1", "aggressive_v1", "conservative_v1", "diversified_v1"])
+@pytest.mark.parametrize("ctx_factory", [_trending_ctx, _flat_ctx], ids=["trending", "flat"])
+def test_non_carry_seed_policies_ignore_recent_funding_field(policy_id, ctx_factory):
+    """规范约定:除carry_v1外,种子策略完全不读ctx.recent_funding——本次升级
+    给StrategyContext加字段不应该悄悄改变这些策略在任何合成场景下的输出。
+    往ctx里塞进非空的recent_funding数据,断言输出与不塞时逐字段相同。"""
+    module = load_policy(policy_id)
+
+    ctx_without = ctx_factory()
+    decisions_without = module.decide(ctx_without)
+
+    ctx_base = ctx_factory()
+    funding_df = pd.DataFrame(
+        {"timestamp": [ctx_base.ts - 1000], "funding_rate": [0.001]}
+    )
+    ctx_with_funding = StrategyContext(
+        ts=ctx_base.ts,
+        positions=ctx_base.positions,
+        snapshot=ctx_base.snapshot,
+        recent_bars=ctx_base.recent_bars,
+        memory_context=ctx_base.memory_context,
+        recent_funding={sym: funding_df for sym in ctx_base.snapshot},
+    )
+    decisions_with = module.decide(ctx_with_funding)
+
+    assert decisions_without == decisions_with

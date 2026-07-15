@@ -360,3 +360,117 @@ def test_performance_smoke_500_bars_under_30_seconds(tmp_path):
 
     assert elapsed < 30.0, f"500-bar replay took {elapsed:.2f}s, exceeds the 30s regression budget"
     assert len(results["val_1"].nav_series) == n
+
+
+def test_ctx_recent_funding_never_leaks_future_data(tmp_path):
+    """M7资金费率感官注入最重要的一条测试(未来函数检测):回放过程中任何
+    一个bar喂给策略的ctx.recent_funding,其内部时间戳的最大值绝不能超过
+    该bar的ctx.ts——否则策略在bar N就能看到bar N之后才真实发生的资金费率
+    结算,是未来函数,直接让回测结果失去参考意义。
+
+    断言方式:用一个"回声策略"(echo strategy),每次被调用时只记录
+    (ctx.ts, ctx.recent_funding里的最大timestamp),不产生任何真实交易决策
+    (返回[]),跑完整个窗口后对记录下来的每一对做未来函数检测,而不是只
+    抽查某一个bar。"""
+    n = 30
+    ohlcv = make_wavy_ohlcv(n)
+
+    # 资金费率恰好每根K线结算一次(简化的确定性构造,不代表真实8h周期,但
+    # 足以精确验证游标切片的边界:第i根bar对应的funding记录时间戳就是
+    # BASE_TS + i*STEP_MS,与cur_ts一一对齐)。
+    funding_df = pd.DataFrame(
+        {
+            "timestamp": [BASE_TS + i * STEP_MS for i in range(n)],
+            "funding_rate": [0.0001 * (i + 1) for i in range(n)],
+        }
+    )
+
+    engine, _ = make_engine(tmp_path, {BTC: ohlcv}, {BTC: funding_df})
+    window = BacktestWindow(label="val_1", start_ts=BASE_TS, end_ts=BASE_TS + n * STEP_MS)
+
+    observed = []
+
+    def echo_strategy(ctx):
+        fdf = ctx.recent_funding.get(BTC)
+        max_ts = int(fdf["timestamp"].max()) if fdf is not None and not fdf.empty else None
+        observed.append((ctx.ts, max_ts))
+        return []
+
+    engine.run(echo_strategy, [BTC], [window], experiment_id="exp_funding_boundary")
+
+    assert observed, "expected the echo strategy to be invoked at least once"
+    assert any(max_ts is not None for _, max_ts in observed), (
+        "expected at least some bars to see non-empty funding data (otherwise this test is vacuous)"
+    )
+
+    for ctx_ts, max_funding_ts in observed:
+        if max_funding_ts is None:
+            continue
+        # 核心断言(未来函数检测):任意bar看到的funding最大timestamp必须
+        # <= 该bar的ctx.ts。
+        assert max_funding_ts <= ctx_ts, (
+            "future function detected: ctx.recent_funding max timestamp %r > ctx.ts %r"
+            % (max_funding_ts, ctx_ts)
+        )
+        # 更精确的边界断言:本测试构造的funding记录与每根bar的cur_ts一一
+        # 对齐(ctx.ts = cur_ts + 1),游标切到"<=cur_ts"应该恰好等于
+        # ctx.ts - 1,而不是提前把ctx.ts当成这一bar自己的费率也算进去、
+        # 更不是把窗口内全部未来记录都给了。
+        assert max_funding_ts == ctx_ts - 1, (
+            "expected max funding timestamp to be exactly ctx.ts - 1 (cursor cutoff == cur_ts), "
+            "got %r for ctx.ts=%r" % (max_funding_ts, ctx_ts)
+        )
+
+
+def test_ctx_recent_funding_is_empty_dataframe_when_symbol_has_no_funding_data(tmp_path):
+    """窗口内某symbol完全没有资金费率数据时,ctx.recent_funding[symbol]必须
+    是一个列齐全的空DataFrame,而不是该symbol缺key/None。"""
+    n = 10
+    ohlcv = make_flat_ohlcv(n)
+    engine, _ = make_engine(tmp_path, {BTC: ohlcv})  # 不提供任何funding_by_symbol
+    window = BacktestWindow(label="val_1", start_ts=BASE_TS, end_ts=BASE_TS + n * STEP_MS)
+
+    probe = {}
+
+    def echo_strategy(ctx):
+        if "checked" not in probe:
+            fdf = ctx.recent_funding.get(BTC)
+            probe["checked"] = True
+            probe["is_dataframe"] = isinstance(fdf, pd.DataFrame)
+            probe["is_empty"] = fdf.empty if fdf is not None else None
+            probe["columns"] = list(fdf.columns) if fdf is not None else None
+        return []
+
+    engine.run(echo_strategy, [BTC], [window], experiment_id="exp_funding_empty")
+
+    assert probe.get("checked") is True
+    assert probe["is_dataframe"] is True
+    assert probe["is_empty"] is True
+    assert probe["columns"] == ["timestamp", "funding_rate"]
+
+
+def test_ctx_recent_funding_injected_alongside_recent_bars(tmp_path):
+    """基本注入验收:有真实资金费率数据时,ctx.recent_funding确实被填充。"""
+    n = 15
+    ohlcv = make_wavy_ohlcv(n)
+    funding_df = pd.DataFrame(
+        {
+            "timestamp": [BASE_TS + i * STEP_MS for i in range(n)],
+            "funding_rate": [0.0002] * n,
+        }
+    )
+    engine, _ = make_engine(tmp_path, {BTC: ohlcv}, {BTC: funding_df})
+    window = BacktestWindow(label="val_1", start_ts=BASE_TS, end_ts=BASE_TS + n * STEP_MS)
+
+    seen_non_empty = {"flag": False}
+
+    def echo_strategy(ctx):
+        fdf = ctx.recent_funding.get(BTC)
+        if fdf is not None and not fdf.empty:
+            seen_non_empty["flag"] = True
+            assert set(fdf.columns) >= {"timestamp", "funding_rate"}
+        return []
+
+    engine.run(echo_strategy, [BTC], [window], experiment_id="exp_funding_injected")
+
+    assert seen_non_empty["flag"] is True

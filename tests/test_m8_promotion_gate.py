@@ -709,3 +709,145 @@ def test_policy_resolver_reads_main_policy_json_for_main_branch(ignite_paths):
     assert resolver("main") is None  # 尚未有任何policy晋升
     ignite.save_main_policy_id("momentum_v1", "evo/20260715-momentum_v1", clock.now_ms())
     assert resolver("main") == "momentum_v1"  # 落盘立即生效,无需重启/重建resolver
+
+
+# ===========================================================================
+# M7资金费率感官前向注入:DispatchingTrader.decide() 里的 ctx.recent_funding
+# ===========================================================================
+#
+# 下面几个helper都是离线fake,不发起任何真实网络请求。用一个"记录型"假
+# policy模块(而不是真momentum_v1等种子策略)拦截decide()真正构造出来的
+# ctx,这样能直接断言ctx.recent_funding的内容/缓存行为,而不需要通过某个
+# 具体策略的交易逻辑去间接推断。
+
+
+class _RecordingPolicyModule:
+    """假冒 load_policy() 返回值的记录型policy:只记录传入的ctx,不产出任何
+    决策,不实现真正的策略逻辑——本节测试只关心DispatchingTrader怎么构造
+    ctx,不关心某个具体策略怎么用它。"""
+
+    REQUIRED_HISTORY_BARS = 1
+    DESCRIPTION = "recording stub policy for ctx.recent_funding injection tests"
+
+    def __init__(self):
+        self.seen_ctxs = []
+
+    def decide(self, ctx):
+        self.seen_ctxs.append(ctx)
+        return []
+
+
+class _FundingRecordingDataPipeline:
+    """离线fake:fetch_ohlcv固定返回空K线(本节测试只关心funding注入,不
+    关心K线内容),fetch_funding_rate_history记录每次调用的(symbol, since,
+    limit),可选按symbol模拟拉取失败。"""
+
+    def __init__(self, funding_by_symbol=None, raise_for=None):
+        self.funding_by_symbol = funding_by_symbol or {}
+        self.raise_for = raise_for or set()
+        self.funding_calls: list[tuple[str, int, int]] = []
+
+    def fetch_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    def fetch_funding_rate_history(self, symbol, since=None, limit=1000):
+        self.funding_calls.append((symbol, since, limit))
+        if symbol in self.raise_for:
+            raise RuntimeError(f"synthetic funding fetch failure for {symbol}")
+        return self.funding_by_symbol.get(
+            symbol, pd.DataFrame(columns=["timestamp", "funding_rate"])
+        )
+
+
+def _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module):
+    """monkeypatch掉 ASSET.strategy.policy_trader.load_policy,让
+    DispatchingTrader.decide() 拿到 _RecordingPolicyModule 而不是真的从磁盘
+    加载种子策略——这样测试只关心ctx怎么被构造,不受某个具体策略实现变化
+    影响。"""
+    import ASSET.strategy.policy_trader as policy_trader_module
+
+    monkeypatch.setattr(policy_trader_module, "load_policy", lambda policy_id: policy_module)
+    return DispatchingTrader(
+        llm_trader=None,  # policy_resolver永远返回policy_id,不会走到llm_trader
+        policy_resolver=lambda branch: "stub_policy",
+        data_pipeline=dp,
+    )
+
+
+def test_dispatching_trader_injects_recent_funding_into_ctx(monkeypatch):
+    """基本注入验收:ctx.recent_funding里确实出现了data_pipeline返回的
+    资金费率数据,且拉取参数(since/limit)符合"近30天"的设计。"""
+    import ASSET.strategy.policy_trader as policy_trader_module
+
+    funding_df = pd.DataFrame({"timestamp": [BASE_TS - 1000], "funding_rate": [0.0003]})
+    dp = _FundingRecordingDataPipeline(funding_by_symbol={"BTC/USDT:USDT": funding_df})
+    policy_module = _RecordingPolicyModule()
+    dispatcher = _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module)
+
+    dispatcher.decide(ts=BASE_TS, positions=[], latest_snapshot={"BTC/USDT:USDT": {"last": 50_000.0}})
+
+    assert len(policy_module.seen_ctxs) == 1
+    ctx = policy_module.seen_ctxs[0]
+    assert "BTC/USDT:USDT" in ctx.recent_funding
+    pd.testing.assert_frame_equal(
+        ctx.recent_funding["BTC/USDT:USDT"].reset_index(drop=True),
+        funding_df.reset_index(drop=True),
+    )
+    assert dp.funding_calls == [
+        (
+            "BTC/USDT:USDT",
+            BASE_TS - policy_trader_module._FUNDING_LOOKBACK_MS,
+            policy_trader_module._FUNDING_FETCH_LIMIT,
+        )
+    ]
+
+
+def test_dispatching_trader_funding_cache_hits_within_ten_minutes(monkeypatch):
+    """同一个symbol在10分钟memo缓存窗口内只真正拉取一次;超过窗口后应该
+    再拉一次——手法与 scripts/ignite.py::_trend_cache 相同但独立维护。"""
+    dp = _FundingRecordingDataPipeline(
+        funding_by_symbol={"BTC/USDT:USDT": pd.DataFrame(columns=["timestamp", "funding_rate"])}
+    )
+    policy_module = _RecordingPolicyModule()
+    dispatcher = _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module)
+    snapshot = {"BTC/USDT:USDT": {"last": 50_000.0}}
+
+    dispatcher.decide(ts=BASE_TS, positions=[], latest_snapshot=snapshot)
+    dispatcher.decide(ts=BASE_TS + 5 * 60_000, positions=[], latest_snapshot=snapshot)  # 5分钟后,仍在缓存窗口内
+    assert len(dp.funding_calls) == 1, "expected the second call (5 minutes later) to hit the cache"
+
+    dispatcher.decide(ts=BASE_TS + 11 * 60_000, positions=[], latest_snapshot=snapshot)  # 超过10分钟缓存窗口
+    assert len(dp.funding_calls) == 2, "expected a fresh fetch once the 10-minute cache window has elapsed"
+
+
+def test_dispatching_trader_funding_fetch_failure_yields_empty_dataframe_not_exception(monkeypatch):
+    """data_pipeline.fetch_funding_rate_history 抛异常时,decide() 不应该
+    跟着崩——funding是增强感官输入,不是决策周期能否完成的前提。"""
+    dp = _FundingRecordingDataPipeline(raise_for={"BTC/USDT:USDT"})
+    policy_module = _RecordingPolicyModule()
+    dispatcher = _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module)
+
+    result = dispatcher.decide(ts=BASE_TS, positions=[], latest_snapshot={"BTC/USDT:USDT": {"last": 50_000.0}})
+
+    assert result == []  # 记录型policy本来就不产出决策,但更重要的是没有异常往外抛
+    ctx = policy_module.seen_ctxs[0]
+    fdf = ctx.recent_funding["BTC/USDT:USDT"]
+    assert fdf.empty
+    assert list(fdf.columns) == ["timestamp", "funding_rate"]
+
+
+def test_dispatching_trader_handles_data_pipeline_without_funding_method(monkeypatch):
+    """向后兼容:data_pipeline 是本文件既有的 FakeDataPipeline(定义在本文件
+    顶部,只实现了fetch_ohlcv,压根没有fetch_funding_rate_history方法)——
+    这是本次升级前所有既有测试都在用的替身,升级后必须继续零改动可用。"""
+    bars = _make_bars(5, base_price=50_000.0, drift_pct=0.0)
+    dp = FakeDataPipeline({"BTC/USDT:USDT": bars})
+    policy_module = _RecordingPolicyModule()
+    dispatcher = _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module)
+
+    dispatcher.decide(ts=BASE_TS, positions=[], latest_snapshot={"BTC/USDT:USDT": {"last": 50_000.0}})
+
+    ctx = policy_module.seen_ctxs[0]
+    fdf = ctx.recent_funding["BTC/USDT:USDT"]
+    assert fdf.empty
+    assert list(fdf.columns) == ["timestamp", "funding_rate"]
