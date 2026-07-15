@@ -442,6 +442,60 @@ def evaluate_tactic_tournament(roster: dict, now_ms: int, tournament_cfg: dict) 
     return events
 
 
+def evaluate_cull(
+    roster: dict, now_ms: int, tournament_cfg: dict, nav_series_lookup=None
+) -> Optional[dict]:
+    """末位斩杀(用户2026-07-15要求):每 cull_interval_hours 一次,把所有
+    "存活满一个考核窗口"的active分支按窗口内净值收益排名,收益最低的那个
+    直接判CULLED——哪怕它在盈利。与 evaluate_tactic_tournament 的两条绝对
+    红线(回撤15%/晋升0.5%)互补:那两条管的是"犯错"和"卓越",这条管的是
+    "平庸"——保证种群哪怕在风平浪静的行情里也持续换血。
+
+    保护规则(防止斩杀机制退化成斩杀噪声/斩杀新人):
+      - 不满 cull_min_age_hours 的新分支不参与排名(否则新补位分支带着
+        全新空仓账户必然垫底,进化变成死循环);
+      - 可排名的分支不足2个时不斩(排名无意义);
+      - main分支不参与(它是擂主,由晋升机制换血,不由斩杀机制清退)。
+
+    返回一个与 evaluate_tactic_tournament 事件同构的dict(decision='CULLED'),
+    或 None(本轮没有可斩对象)。调用方负责节拍控制(cull_interval_hours)
+    和后续处理(强平/落盘/生成替补)。nav_series_lookup 可注入,测试用。"""
+    interval_h = float(tournament_cfg.get("cull_interval_hours", 12))
+    min_age_ms = int(float(tournament_cfg.get("cull_min_age_hours", interval_h)) * 3_600_000)
+    window_ms = int(interval_h * 3_600_000)
+    if nav_series_lookup is None:
+        nav_series_lookup = read_branch_hourly_nav_series
+
+    candidates: list[tuple[str, float]] = []
+    for branch, meta in roster.items():
+        if meta.get("status") != "active":
+            continue
+        if now_ms - meta.get("created_ms", now_ms) < min_age_ms:
+            continue
+        series = _slice_since(nav_series_lookup(branch), now_ms - window_ms)
+        if len(series) < 2:
+            continue
+        ret = _return_pct(series)
+        if ret is None:
+            continue
+        candidates.append((branch, ret))
+
+    if len(candidates) < 2:
+        return None
+
+    worst_branch, worst_ret = min(candidates, key=lambda pair: pair[1])
+    return {
+        "branch": worst_branch,
+        "decision": "CULLED",
+        "edge_vs_main_pct": worst_ret,
+        "max_drawdown_pct": 0.0,
+        "reason": (
+            f"cull: lowest return {worst_ret:.2f}% over last {interval_h:.0f}h "
+            f"among {len(candidates)} eligible branches (末位斩杀,与对错无关)"
+        ),
+    }
+
+
 _TACTIC_GENERATION_MAX_RETRIES = 3
 _MIN_GENERATED_TACTICS_LEN = 20
 
@@ -737,14 +791,16 @@ def main() -> None:
 
     _TOURNAMENT_STAKES_SUFFIX = (
         "\n\n【锦标赛生存规则,请认真对待,这不是走过场】你正在和另外几个"
-        "战术不同的分支实时竞争同一个位置。每隔几小时会用真实小时级净值"
-        "数据评估一次:如果你自己的净值从历史峰值回撤超过15%,你会被立即"
-        "强制平仓、永久淘汰出局,由全新设计的战术取代你,没有'再给一次"
-        "机会'这种说法;如果你的净值持续跑赢main分支0.5个百分点以上,你的"
+        "战术不同的分支实时竞争同一个位置。每隔几小时会用真实净值数据评估"
+        "一次:如果你自己的净值从历史峰值回撤超过15%,或任何一笔持仓被爆仓,"
+        "你会被立即强制平仓、永久淘汰出局,由全新设计的战术取代你,没有'再给"
+        "一次机会'这种说法;如果你的净值持续跑赢main分支0.5个百分点以上,你的"
         "整套战术会被'扶正'成main分支新的打法,相当于赢家通吃、直接接管"
-        "主账户的决策权。表现平庸(既不领先也没有爆仓)可以继续存活,但不"
-        "会被特殊保护——你的每一笔决策都真实关系到这个战术能不能活下去,"
-        "过度谨慎导致长期跑不赢main、或过度冒进导致回撤爆表,都会让你出局。"
+        "主账户的决策权。此外还有末位斩杀(用户2026-07-15新增):每隔约12"
+        "小时,所有存活满一个考核窗口的分支按窗口内净值收益排名,收益最低的"
+        "那一个直接斩杀出局——哪怕它在小幅盈利、哪怕它没犯任何错。这意味着"
+        "'平庸'和'亏损'一样致命:长期空仓观望零收益,大概率就是下一个被斩的。"
+        "你的每一笔决策都真实关系到这个战术能不能活下去。"
     )
 
     _DEFAULT_EVO_TACTICS = {
@@ -1111,6 +1167,24 @@ def main() -> None:
                 tournament_cfg = config.get("tactic_tournament", {}) or {}
                 roster = load_tournament_roster(now, _DEFAULT_EVO_TACTICS)
                 events = evaluate_tactic_tournament(roster, now, tournament_cfg)
+
+                # 末位斩杀(用户2026-07-15要求,见evaluate_cull的docstring):
+                # 独立于上面两条绝对红线的定期强制换血,按自己的节拍
+                # (cull_interval_hours)触发,不跟随每次锦标赛评估。
+                cull_interval_ms = int(float(tournament_cfg.get("cull_interval_hours", 12)) * 3_600_000)
+                last_cull_ms = schedule_state.get("last_cull_ms")
+                if last_cull_ms is None:
+                    # 首轮不斩,先记时间起点——刚清零/刚部署时所有分支都没有
+                    # 满窗口的数据,立刻评估只会空转。
+                    schedule_state["last_cull_ms"] = now
+                    save_schedule_state(schedule_state)
+                elif now - last_cull_ms >= cull_interval_ms:
+                    cull_event = evaluate_cull(roster, now, tournament_cfg)
+                    if cull_event is not None:
+                        events.append(cull_event)
+                    schedule_state["last_cull_ms"] = now
+                    save_schedule_state(schedule_state)
+
                 for ev in events:
                     branch = ev["branch"]
                     log_writer.append_jsonl("tactic_promotions.jsonl", {**ev, "ts": now}, root=LOG_ROOT)
@@ -1119,19 +1193,20 @@ def main() -> None:
                         f"(edge={ev['edge_vs_main_pct']:.2f}%, drawdown={ev['max_drawdown_pct']:.2f}%)",
                         flush=True,
                     )
-                    roster[branch]["status"] = ev["decision"].lower()  # "promoted" / "failed"
+                    roster[branch]["status"] = ev["decision"].lower()  # "promoted" / "failed" / "culled"
                     roster[branch]["resolved_ms"] = now
 
                     if ev["decision"] == "PROMOTE":
                         winning_tactics = roster[branch]["tactics"]
                         save_main_tactics(winning_tactics, branch, now)
                         print(f"[{now}] main分支战术已更新为 {branch} 的战术(立即生效,不需要重启)", flush=True)
-                    elif ev["decision"] == "FAIL":
+                    elif ev["decision"] in ("FAIL", "CULLED"):
                         # 确定性强制平仓,不经过Trader/子代理判断——这是锦标赛
                         # 淘汰机制本身的动作,与main.py.run_risk_check_cycle
                         # (LOCKED区确定性风控哨兵)同一种"不等agent推理"的设计
                         # 理念,但这里的裁决逻辑是本脚本自己的锦标赛规则,不是
-                        # LOCKED区代码。
+                        # LOCKED区代码。FAIL=回撤红线;CULLED=末位斩杀,处理
+                        # 流程完全相同(强平退场+自动生成替补),只是死因不同。
                         failed_sim = evo_simulators.get(branch)
                         if failed_sim is not None:
                             for symbol, pos in list(failed_sim.positions.items()):
@@ -1139,8 +1214,8 @@ def main() -> None:
                                     ts=now, symbol=symbol, action="close", target_notional_pct=0.0,
                                     leverage=pos.leverage,
                                     thesis=(
-                                        f"战术锦标赛判定失败(分支自身净值回撤 {ev['max_drawdown_pct']:.2f}% "
-                                        f"超过fail_drawdown_pct阈值),强制平仓退场,不是Trader/子代理的主观判断。"
+                                        f"锦标赛出局强制平仓({ev['decision']}: {ev['reason'][:80]}),"
+                                        f"确定性机制触发,不是Trader/子代理的主观判断。"
                                     ),
                                     falsifier="本决策为锦标赛淘汰机制触发,不设新的可证伪主张。",
                                     horizon="0h", branch=branch,
@@ -1148,7 +1223,7 @@ def main() -> None:
                                 failed_sim.log_decision(close_decision)
                                 next_bar = next_bar_provider(symbol, now)
                                 failed_sim.execute(close_decision, next_bar)
-                                print(f"[{now}] [{branch}] 锦标赛淘汰强制平仓: {symbol}", flush=True)
+                                print(f"[{now}] [{branch}] 锦标赛出局强制平仓: {symbol}", flush=True)
 
                 if events:
                     save_tournament_roster(roster)

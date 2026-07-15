@@ -153,3 +153,94 @@ class TestGenerateReplacementTactic:
         ignite.generate_replacement_tactic(_client, SAMPLE_EVENT, SAMPLE_ROSTER, ["BTC/USDT:USDT"])
         assert "evo/20260714-carry" in captured_prompts[0]
         assert "FAIL" in captured_prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# 末位斩杀 evaluate_cull(用户2026-07-15):按窗口收益排名斩最差,带新分支
+# 保护期和最小可比数量保护。
+# ---------------------------------------------------------------------------
+
+HOUR_MS = 3_600_000
+CULL_CFG = {"cull_interval_hours": 12, "cull_min_age_hours": 12}
+
+
+def _series(*navs, start_ms=0, step_ms=HOUR_MS):
+    return [(start_ms + i * step_ms, nav) for i, nav in enumerate(navs)]
+
+
+class TestEvaluateCull:
+    def test_kills_lowest_return_even_if_profitable(self):
+        now = 100 * HOUR_MS
+        roster = {
+            "evo/a": {"status": "active", "created_ms": 0},
+            "evo/b": {"status": "active", "created_ms": 0},
+            "evo/c": {"status": "active", "created_ms": 0},
+        }
+        lookup = {
+            "evo/a": _series(100, 110, start_ms=now - 11 * HOUR_MS),  # +10%
+            "evo/b": _series(100, 103, start_ms=now - 11 * HOUR_MS),  # +3%  <- 最差但在盈利
+            "evo/c": _series(100, 105, start_ms=now - 11 * HOUR_MS),  # +5%
+        }
+        event = ignite.evaluate_cull(roster, now, CULL_CFG, nav_series_lookup=lookup.get)
+        assert event is not None
+        assert event["branch"] == "evo/b"
+        assert event["decision"] == "CULLED"
+
+    def test_young_branch_is_protected(self):
+        now = 100 * HOUR_MS
+        roster = {
+            "evo/old-loser": {"status": "active", "created_ms": 0},
+            "evo/old-winner": {"status": "active", "created_ms": 0},
+            "evo/newborn": {"status": "active", "created_ms": now - 2 * HOUR_MS},  # 才2小时
+        }
+        lookup = {
+            "evo/old-loser": _series(100, 95, start_ms=now - 11 * HOUR_MS),   # -5%
+            "evo/old-winner": _series(100, 105, start_ms=now - 11 * HOUR_MS), # +5%
+            "evo/newborn": _series(100, 80, start_ms=now - 2 * HOUR_MS),      # -20%但受保护
+        }
+        event = ignite.evaluate_cull(roster, now, CULL_CFG, nav_series_lookup=lookup.get)
+        assert event is not None
+        assert event["branch"] == "evo/old-loser"  # 新分支垫底也不斩,斩老的最差
+
+    def test_no_cull_when_fewer_than_two_eligible(self):
+        now = 100 * HOUR_MS
+        roster = {
+            "evo/only": {"status": "active", "created_ms": 0},
+            "evo/baby": {"status": "active", "created_ms": now - HOUR_MS},
+        }
+        lookup = {
+            "evo/only": _series(100, 90, start_ms=now - 11 * HOUR_MS),
+            "evo/baby": _series(100, 120, start_ms=now - HOUR_MS),
+        }
+        event = ignite.evaluate_cull(roster, now, CULL_CFG, nav_series_lookup=lookup.get)
+        assert event is None  # 只有1个可排名对象,排名无意义,不斩
+
+    def test_non_active_branches_ignored(self):
+        now = 100 * HOUR_MS
+        roster = {
+            "evo/dead": {"status": "failed", "created_ms": 0},
+            "evo/a": {"status": "active", "created_ms": 0},
+            "evo/b": {"status": "active", "created_ms": 0},
+        }
+        lookup = {
+            "evo/dead": _series(100, 1, start_ms=now - 11 * HOUR_MS),
+            "evo/a": _series(100, 101, start_ms=now - 11 * HOUR_MS),
+            "evo/b": _series(100, 99, start_ms=now - 11 * HOUR_MS),
+        }
+        event = ignite.evaluate_cull(roster, now, CULL_CFG, nav_series_lookup=lookup.get)
+        assert event["branch"] == "evo/b"
+
+    def test_branch_without_enough_window_data_skipped(self):
+        now = 100 * HOUR_MS
+        roster = {
+            "evo/a": {"status": "active", "created_ms": 0},
+            "evo/b": {"status": "active", "created_ms": 0},
+            "evo/no-data": {"status": "active", "created_ms": 0},
+        }
+        lookup = {
+            "evo/a": _series(100, 102, start_ms=now - 11 * HOUR_MS),
+            "evo/b": _series(100, 101, start_ms=now - 11 * HOUR_MS),
+            "evo/no-data": [(now - HOUR_MS, 100.0)],  # 窗口内只有1个点,无法算收益
+        }
+        event = ignite.evaluate_cull(roster, now, CULL_CFG, nav_series_lookup=lookup.get)
+        assert event["branch"] == "evo/b"

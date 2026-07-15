@@ -1,4 +1,6 @@
-capital_usdt: 100000
+capital_usdt: 100               # 用户2026-07-15清零重启:每个分支从100U开始
+                                  # (原100000)。模拟器所有费率/仓位/风控都是
+                                  # 百分比制,数学上完全成立;致敬凉兮1000元起家
 mode: perp                     # USDT本位永续合约,支持双向(做多/做空)+杠杆
 llm:                           # LLM来源(2026-07-15新增,24h无人值守服务器模式)
   mode: bridge                 # bridge=签入agent文件握手(本地开发/人工介入);
@@ -110,6 +112,11 @@ tactic_tournament:                # 用户要求"自动进化+晋升赢家"(2026
   fail_drawdown_pct: 15          # 分支自身净值从其历史峰值回撤超过这个百分比 ->
                                   # 判定失败退场,强制平仓,不等main分支的
                                   # constraints.max_drawdown_pct(20%,组合级熔断)
+  cull_interval_hours: 12        # 末位斩杀(用户2026-07-15):每12小时把存活满一个
+                                  # 考核窗口的active分支按窗口内收益排名,最差的直接
+                                  # 斩杀——哪怕在盈利。惩罚"平庸",保证种群持续换血
+  cull_min_age_hours: 12         # 新分支保护期:不满一个窗口不参与排名,否则新补位
+                                  # 分支(空仓零收益)必然垫底秒死,进化变成死循环
 data:
   exchange: okx                # M5 shakedown 期间由 binance 改为 okx(见 universe_rule.source 注释)
   timeframe: 4h
