@@ -542,7 +542,11 @@ def git_commit_protocol(repo_path: Path, protocol_file: Path, message: str) -> s
         raise RuntimeError(f"git add (protocol) failed: {add.stderr}")
     commit = _run_git(["commit", "-m", message], repo_path)
     if commit.returncode != 0:
-        raise RuntimeError(f"git commit (protocol) failed: {commit.stderr}")
+        # git的'nothing to commit'走stdout而非stderr——两者都带上,否则报错
+        # 信息是一个空字符串,现场无法定位(服务器首次冒烟真实发生过)。
+        raise RuntimeError(
+            f"git commit (protocol) failed: stderr={commit.stderr!r} stdout={commit.stdout!r}"
+        )
     return _current_head_sha(repo_path)
 
 
@@ -771,14 +775,28 @@ def run_single_experiment(
     return record
 
 
+def existing_experiment_count(protocols_dir: Path) -> int:
+    """已存在的协议文件数,作为本次运行experiment_index的起始偏移。
+
+    真实踩过的坑(服务器首次冒烟):上一次运行在协议commit之后、写ledger之前
+    崩溃(LLM调用失败),重跑时index从0重来->生成同名协议文件+相同内容->
+    git 'nothing to commit'->整个循环报错退出。协议文件本身就是最可靠的
+    "已经消耗掉的实验序号"记录(它先于一切结果落盘),用它做偏移比用ledger
+    行数更能覆盖"半途崩溃"的场景。"""
+    if not protocols_dir.exists():
+        return 0
+    return len(list(protocols_dir.glob("*.md")))
+
+
 def run_research_loop(
     ctx: LoopContext, max_experiments: int, dry_run: bool = False, print_fn: Callable[[str], None] = print
 ) -> list[dict]:
     max_per_night = int((ctx.config.get("backtest", {}) or {}).get("max_experiments_per_night", 50))
     limit = max(0, min(max_experiments, max_per_night))
+    base = existing_experiment_count(ctx.protocols_dir)
     records = []
     for i in range(limit):
-        records.append(run_single_experiment(ctx, i, dry_run=dry_run, print_fn=print_fn))
+        records.append(run_single_experiment(ctx, base + i, dry_run=dry_run, print_fn=print_fn))
     return records
 
 
