@@ -123,6 +123,7 @@ from __future__ import annotations
 import copy
 import datetime
 import json
+import os
 import subprocess
 import sys
 import time
@@ -1039,7 +1040,21 @@ def main() -> None:
     dp = DataPipeline(exchange_id=config["data"]["exchange"], clock=clock)
     uf = UniverseFilter(config, clock=clock)
     memory_store = MemoryStore(db_path=PROJECT_ROOT / "ASSET" / "memory" / "memory.db")
-    researcher = Researcher(llm_client=deep_llm, memory_store=memory_store, genesis_path=GENESIS_PATH)
+    # 真实外部检索(2026-07-15,用户选定Tavily):TAVILY_API_KEY 存在时研究
+    # 周期带真实新闻/宏观检索(每小时1次≈720次/月,落在免费层1000次内,
+    # 客户端自带950次/月保险丝);没有key时 search_client=None,Researcher
+    # 走既有的"无搜索源"降级路径,行为与此前完全一致。
+    _tavily_key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if _tavily_key:
+        from search_client import TavilySearchClient  # noqa: PLC0415
+        search_client = TavilySearchClient(api_key=_tavily_key)
+        print("Tavily搜索已启用(月度保险丝950次)", flush=True)
+    else:
+        search_client = None
+    researcher = Researcher(
+        llm_client=deep_llm, memory_store=memory_store, genesis_path=GENESIS_PATH,
+        search_client=search_client,
+    )
     trader = Trader(
         llm_client=routine_llm,
         memory_store=memory_store,
@@ -1554,9 +1569,21 @@ def main() -> None:
                 )
             else:
                 research_persona = research_roster[research_branch]["tactics"]
+            # 检索query带上当前市场状态(涨跌最猛的币),让Tavily返回的是
+            # "此刻正在发生什么、为什么"的新闻,而不是泛泛的行业文章;
+            # 没配Tavily时queries无效果(search_client=None直接返回空)。
+            movers = sorted(
+                ((s.split("/")[0], v[1]) for s, v in _trend_cache.items() if v[1] is not None),
+                key=lambda kv: abs(kv[1]), reverse=True,
+            )[:3]
+            movers_txt = " ".join(f"{sym}" for sym, _ in movers)
+            research_queries = [
+                f"crypto market today why moving {movers_txt} news macro fed stocks gold sentiment"
+            ]
             try:
                 research_result = researcher.daily_research(
                     ts=now, date_str=research_label,
+                    queries=research_queries,
                     branch=research_branch, persona=research_persona,
                 )
                 print(f"[{now}] [{research_branch}] 分支视角研究完成: {research_result}", flush=True)

@@ -139,3 +139,58 @@ def test_strip_code_fences_does_not_touch_backticks_inside_text():
 
     inner = 'thesis mentions `code` but response is plain JSON: [1]'
     assert _strip_code_fences(inner) == inner
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-15:Tavily搜索客户端(scripts/search_client.py)——离线测试:
+# 响应解析、失败降级、月度保险丝。不发真实网络请求。
+# ---------------------------------------------------------------------------
+
+
+def test_tavily_client_parses_answer_and_results(tmp_path, monkeypatch):
+    from search_client import TavilySearchClient
+
+    class FakeResp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"answer": "BTC下跌因宏观避险", "results": [
+                {"title": "t1", "url": "http://x", "content": "c1"},
+            ]}
+
+    import search_client as sc
+    monkeypatch.setattr(sc.requests, "post", lambda *a, **k: FakeResp())
+    client = TavilySearchClient(api_key="k", usage_path=tmp_path / "u.json")
+    out = client("btc why down")
+    assert out[0]["content"] == "BTC下跌因宏观避险"
+    assert out[1]["title"] == "t1"
+    assert client._load_usage()["calls"] == 1
+
+
+def test_tavily_client_network_error_returns_empty_and_no_usage(tmp_path, monkeypatch):
+    from search_client import TavilySearchClient
+    import search_client as sc
+
+    def boom(*a, **k): raise RuntimeError("network down")
+    monkeypatch.setattr(sc.requests, "post", boom)
+    client = TavilySearchClient(api_key="k", usage_path=tmp_path / "u.json")
+    assert client("q") == []
+    assert client._load_usage()["calls"] == 0  # 失败调用不消耗额度计数
+
+
+def test_tavily_monthly_fuse_blocks_calls(tmp_path, monkeypatch):
+    from search_client import TavilySearchClient
+    import search_client as sc
+
+    called = {"n": 0}
+    class FakeResp:
+        def raise_for_status(self): pass
+        def json(self): return {"results": []}
+    def post(*a, **k):
+        called["n"] += 1
+        return FakeResp()
+    monkeypatch.setattr(sc.requests, "post", post)
+    client = TavilySearchClient(api_key="k", usage_path=tmp_path / "u.json", max_monthly_calls=1)
+    client("q1")  # 消耗唯一额度
+    assert client("q2") == []  # 保险丝生效
+    assert called["n"] == 1  # 第二次根本没发请求
