@@ -169,6 +169,17 @@ def _validate_decision_dict(
             f"target_notional_pct_invalid: must be in [0,100] (percent of NAV, "
             f"never negative -- direction comes from action, not sign), got {target_notional_pct!r}"
         )
+    elif action in ("open_long", "open_short", "adjust") and target_notional_pct < 1.0:
+        # 2026-07-15新增语义校验:真实观察到LLM给出0.02%/0.1%这种"连手续费都
+        # 跑不赢"的仓位——要么是把百分点误当成了0-1小数比例(0.1其实想表达
+        # 10%),要么是无意义的过度胆小。两种情况都应该拒绝重试,并在反馈里
+        # 把单位讲清楚,而不是放行一笔毫无意义的决策。
+        errors.append(
+            f"target_notional_pct_invalid: {target_notional_pct!r} is below the 1.0 minimum "
+            "for open/adjust decisions. NOTE the unit is PERCENTAGE POINTS of NAV: 15.0 means "
+            "15% of account value, 0.1 means one-tenth of one percent (almost nothing). "
+            "If you intended a fraction (e.g. 0.15 = 15%), multiply by 100."
+        )
 
     symbol = d.get("symbol")
     if not isinstance(symbol, str) or not symbol.strip():
@@ -289,6 +300,10 @@ class Trader:
             "You are the Trader agent for AlphaLoop-Crypto (§3.2). "
             "Respond with a JSON list of decision objects only, matching the Decision schema "
             "(ts, symbol, action, target_notional_pct, leverage, thesis, falsifier, horizon). "
+            "UNITS: target_notional_pct is PERCENTAGE POINTS of account NAV -- 15.0 means a "
+            "position worth 15% of account value, NOT a 0-1 fraction. Open/adjust decisions "
+            "below 1.0 (i.e. under 1% of NAV) are rejected as economically meaningless. "
+            "Size positions to match conviction: capital that sits idle earns nothing. "
             "For every decision whose action is NOT \"hold\", you MUST also include "
             "falsifier_condition: a machine-readable price clause in the exact format "
             "'price<NUMBER', 'price<=NUMBER', 'price>NUMBER', or 'price>=NUMBER' "

@@ -561,3 +561,35 @@ class TestMalformedJsonHandledAsValidationFailure:
         )
         assert llm_client.calls["count"] == 3
         assert decisions[0].action == "open_long"
+
+
+class TestMinimumMeaningfulPositionSize:
+    """2026-07-15:真实观察到LLM给出0.02%/0.1%的仓位(100U本金下连手续费都
+    覆盖不了),开仓/调仓最低1个百分点,低于即拒绝重试并在反馈里讲清单位。"""
+
+    def test_dust_position_rejected_then_retried(self):
+        memory_store = FakeMemoryStore()
+        bad = valid_response_json(overrides={"target_notional_pct": 0.1})  # 0.1% dust
+        good = valid_response_json(overrides={"target_notional_pct": 10.0})
+        llm_client = make_llm_sequence([bad, good])
+        trader = Trader(llm_client=llm_client, memory_store=memory_store, max_retries=3)
+
+        decisions = trader.decide(
+            ts=1_700_000_000_000, positions=[], latest_snapshot={}, memory_query_text="q",
+        )
+        assert llm_client.calls["count"] == 2
+        assert decisions[0].target_notional_pct >= 1.0
+
+    def test_hold_with_zero_pct_still_valid(self):
+        memory_store = FakeMemoryStore()
+        hold = valid_response_json(overrides={
+            "action": "hold", "target_notional_pct": 0.0, "falsifier_condition": None,
+        })
+        llm_client = make_llm_sequence([hold])
+        trader = Trader(llm_client=llm_client, memory_store=memory_store)
+
+        decisions = trader.decide(
+            ts=1_700_000_000_000, positions=[], latest_snapshot={}, memory_query_text="q",
+        )
+        assert llm_client.calls["count"] == 1
+        assert decisions[0].action == "hold"
