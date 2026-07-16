@@ -922,31 +922,51 @@ class DataPipeline:
                 )
                 fetched = pd.DataFrame(columns=OI_COLUMNS)
             else:
-                try:
-                    raw = self._with_retry(
-                        lambda: fetch_fn(symbol, since=since, limit=limit),
-                        f"fetch_open_interest_history({symbol})",
-                    )
-                    rows = [
-                        {
-                            "timestamp": entry.get("timestamp"),
-                            "open_interest": (
-                                entry.get("openInterestValue")
-                                if entry.get("openInterestValue") is not None
-                                else entry.get("openInterestAmount")
-                            ),
-                        }
-                        for entry in raw
-                        if entry.get("timestamp") is not None
-                    ]
-                    fetched = pd.DataFrame(rows, columns=OI_COLUMNS)
-                except Exception as exc:  # noqa: BLE001 - OI是增强感官输入,拉不到/交易所不支持都不该打断调用方
-                    logger.warning(
-                        "fetch_open_interest_history(%s) failed (%r); OKX持仓量历史深度可能只有"
-                        "几十天(交易所限制),容忍拉取失败/短历史,返回空DataFrame",
-                        symbol, exc,
-                    )
-                    fetched = pd.DataFrame(columns=OI_COLUMNS)
+                # OKX真实探测结果(2026-07-16,生产服务器直连验证):该接口只
+                # 支持 5m/1h/1d 三种粒度;1h 只允许查最近约30天,1d 可查到约
+                # 260天,窗口超限直接报 50030 "Illegal time range" 而不是返回
+                # 空——所以按请求窗口自适应选粒度,窗口仍超限时逐级收缩since
+                # 重试,拿到多少算多少(短历史是交易所限制,不是错误)。
+                now_ms = self.clock.now_ms()
+                window_ms = (now_ms - since) if since is not None else 30 * 86_400_000
+                oi_timeframe = "1d" if window_ms > 25 * 86_400_000 else "1h"
+                attempt_sinces = [since]
+                if since is not None:
+                    # 逐级收缩:请求窗口 -> 240天 -> 25天(1d粒度约260天上限、
+                    # 1h粒度约30天上限,各留余量)
+                    for clamp_days in (240, 25):
+                        clamp_since = now_ms - clamp_days * 86_400_000
+                        if clamp_since > since:
+                            attempt_sinces.append(clamp_since)
+                fetched = pd.DataFrame(columns=OI_COLUMNS)
+                for attempt_since in attempt_sinces:
+                    tf = "1d" if (attempt_since is None or now_ms - attempt_since > 25 * 86_400_000) else "1h"
+                    try:
+                        raw = self._with_retry(
+                            lambda s=attempt_since, t=tf: fetch_fn(symbol, timeframe=t, since=s, limit=limit),
+                            f"fetch_open_interest_history({symbol},{tf})",
+                        )
+                        rows = [
+                            {
+                                "timestamp": entry.get("timestamp"),
+                                "open_interest": (
+                                    entry.get("openInterestValue")
+                                    if entry.get("openInterestValue") is not None
+                                    else entry.get("openInterestAmount")
+                                ),
+                            }
+                            for entry in raw
+                            if entry.get("timestamp") is not None
+                        ]
+                        fetched = pd.DataFrame(rows, columns=OI_COLUMNS)
+                        break  # 本级窗口成功,不再收缩
+                    except Exception as exc:  # noqa: BLE001 - OI是增强感官,拉不到不该打断调用方
+                        logger.warning(
+                            "fetch_open_interest_history(%s, tf=%s, since=%s) failed (%r); "
+                            "尝试收缩窗口重试(OKX: 1h粒度约30天/1d粒度约260天上限)",
+                            symbol, tf, attempt_since, exc,
+                        )
+                        continue
             merged = self._merge_dedupe(cached, fetched)
             self._save_parquet(cache_path, merged)
             cached = merged
