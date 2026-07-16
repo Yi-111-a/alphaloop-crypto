@@ -317,11 +317,19 @@ class Trader:
         memory_store: Any,
         max_retries: int = 3,
         max_leverage: int = MAX_LEVERAGE,
+        llm_client_resolver: Optional[Callable[[str], Optional[Callable[[str], str]]]] = None,
     ):
         self.llm_client = llm_client
         self.memory_store = memory_store
         self.max_retries = max_retries
         self.max_leverage = max_leverage
+        # llm_client_resolver(2026-07-16,分支级认知多样性):branch名 ->
+        # 该分支应该用的llm_client,可选。不传时(默认None)decide()的行为
+        # 与改造前逐字节相同,只用构造时传入的self.llm_client——这是本次
+        # 改动刻意做到"最小化,不动其他逻辑"的落地方式:resolver只影响
+        # decide()内部选哪个callable去发prompt,不改prompt拼装/校验/重试/
+        # 兜底hold的任何一处逻辑。
+        self.llm_client_resolver = llm_client_resolver
 
     # ------------------------------------------------------------------
     # 记忆检索结果的防御性解包(duck-typing，见模块顶部docstring)
@@ -559,10 +567,24 @@ class Trader:
         # 也不要在真实网络故障期间把这个新校验变成额外一层全部拒绝。
         valid_symbols = set(latest_snapshot.keys()) if latest_snapshot else None
 
+        # 分支级路由(2026-07-16):resolver能查到这个分支该用哪个llm_client
+        # 就用它,查不到/resolver本身抛异常都回退到构造时传入的
+        # self.llm_client——分支路由是"锦上添花"的认知多样性实验,不应该
+        # 因为resolver内部任何问题(供应商掉线、名册文件损坏等)让这个分支
+        # 的决策周期整个失败,决策仍然必须能用某个可用的client完成。
+        client = self.llm_client
+        if self.llm_client_resolver is not None:
+            try:
+                resolved = self.llm_client_resolver(branch)
+            except Exception:  # noqa: BLE001 -- resolver失败必须回退,不能让decide()崩溃
+                resolved = None
+            if resolved is not None:
+                client = resolved
+
         retry_feedback: Optional[str] = None
         for _attempt in range(1, self.max_retries + 1):
             prompt = self._format_prompt(context, retry_feedback, ts=ts)
-            raw_response = self.llm_client(prompt)
+            raw_response = client(prompt)
             decisions, error = self._parse_and_validate(raw_response, ts, branch, valid_symbols=valid_symbols)
             if error is None:
                 return decisions

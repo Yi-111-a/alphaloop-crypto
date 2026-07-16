@@ -627,3 +627,89 @@ class TestMarketRegimeLine:
         )
         prompt = trader._format_prompt(ctx, None, ts=1)
         assert "MARKET REGIME" in prompt
+
+
+# ---------------------------------------------------------------------------
+# 6. llm_client_resolver(2026-07-16,分支级认知多样性):不同分支用不同的
+#    llm_client,打破单一模型的思维趋同。改动最小化的验收标准就是这里的
+#    最后一个测试:不传resolver时,行为必须与改造前逐字节相同。
+# ---------------------------------------------------------------------------
+
+
+class TestLlmClientResolver:
+    def test_resolver_routes_different_branches_to_different_clients(self):
+        memory_store = FakeMemoryStore()
+        client_a = make_llm_sequence([valid_response_json(branch="evo/a")])
+        client_b = make_llm_sequence([valid_response_json(branch="evo/b")])
+        default_client = make_llm_sequence(["should never be called"])
+
+        def resolver(branch):
+            return {"evo/a": client_a, "evo/b": client_b}.get(branch)
+
+        trader = Trader(
+            llm_client=default_client, memory_store=memory_store, llm_client_resolver=resolver,
+        )
+
+        trader.decide(
+            ts=1_700_000_000_000, positions=[], latest_snapshot={}, memory_query_text="q",
+            branch="evo/a",
+        )
+        trader.decide(
+            ts=1_700_000_000_000, positions=[], latest_snapshot={}, memory_query_text="q",
+            branch="evo/b",
+        )
+
+        assert client_a.calls["count"] == 1
+        assert client_b.calls["count"] == 1
+        assert default_client.calls["count"] == 0  # 两个分支都被resolver接管了,default完全没被调用
+
+    def test_resolver_returning_none_falls_back_to_default_client(self):
+        memory_store = FakeMemoryStore()
+        default_client = make_llm_sequence([valid_response_json(branch="evo/unrouted")])
+
+        def resolver(branch):
+            return None  # 查不到该分支对应的client
+
+        trader = Trader(
+            llm_client=default_client, memory_store=memory_store, llm_client_resolver=resolver,
+        )
+        decisions = trader.decide(
+            ts=1_700_000_000_000, positions=[], latest_snapshot={}, memory_query_text="q",
+            branch="evo/unrouted",
+        )
+
+        assert default_client.calls["count"] == 1
+        assert decisions[0].branch == "evo/unrouted"
+
+    def test_resolver_raising_exception_falls_back_to_default_client(self):
+        """resolver本身出故障(比如名册文件损坏)不应该让decide()崩溃——分支
+        路由是锦上添花的功能,不能拖累决策周期本身的可用性。"""
+        memory_store = FakeMemoryStore()
+        default_client = make_llm_sequence([valid_response_json()])
+
+        def broken_resolver(branch):
+            raise RuntimeError("roster file corrupted")
+
+        trader = Trader(
+            llm_client=default_client, memory_store=memory_store, llm_client_resolver=broken_resolver,
+        )
+        decisions = trader.decide(
+            ts=1_700_000_000_000, positions=[], latest_snapshot={}, memory_query_text="q",
+        )
+
+        assert default_client.calls["count"] == 1
+        assert decisions[0].action == "open_long"
+
+    def test_no_resolver_behaves_identically_to_before(self):
+        """没有传llm_client_resolver时(默认None),行为必须与改造前完全一致
+        ——只使用构造时传入的self.llm_client,不做任何分支查询。"""
+        memory_store = FakeMemoryStore()
+        llm_client = make_llm_sequence([valid_response_json()])
+        trader = Trader(llm_client=llm_client, memory_store=memory_store)
+
+        assert trader.llm_client_resolver is None
+        decisions = trader.decide(
+            ts=1_700_000_000_000, positions=[], latest_snapshot={}, memory_query_text="q",
+        )
+        assert llm_client.calls["count"] == 1
+        assert decisions[0].action == "open_long"

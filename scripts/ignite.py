@@ -213,6 +213,250 @@ def build_llm_clients(config: dict):
     return routine_llm, deep_llm
 
 
+# 默认供应商:main分支(擂主)固定用它,也是"名册指定的供应商没配key/查不到"
+# 时的兜底选择——与config.yaml llm.api.providers.deepseek这个key保持一致,
+# 复用它原本的base_url/模型(与build_llm_clients的老字段数值相同,不是
+# 两份独立配置)。
+_DEFAULT_LLM_PROVIDER = "deepseek"
+
+
+def build_provider_clients(config: dict) -> dict:
+    """多LLM供应商注册表(2026-07-16用户要求"打破单一模型的思维趋同"):
+    读 config.yaml 的 llm.api.providers 段,返回
+    {provider_name: (routine_llm, deep_llm)}。
+
+    与 build_llm_clients() 是两条独立但共存的路径——build_llm_clients()
+    是main分支/反思/研究默认使用的老路径,保持完全不变(向后兼容:老配置
+    没有providers段时,build_llm_clients()行为与改造前逐字节相同);本函数
+    只服务"分支级路由"这一新增能力,两者可以同时被main()调用而互不干扰。
+
+    llm.mode == "bridge":返回 {"bridge": (bridge, bridge)},bridge是新建的
+    AgentBridgeLLMClient——桥模式下没有"不同供应商"这个概念(签入agent只有
+    一个),这里只是让上层resolver逻辑不需要对bridge模式特殊分支处理,统一
+    走"从字典里查provider name"这一条路径。
+
+    llm.mode == "api":遍历providers字典,每个供应商按 api_key_env 对应的
+    环境变量取key——环境变量不存在或为空(用户还没申请/配置这个供应商的
+    key)时直接跳过并print说明,不抛异常:用户可能只想先用deepseek一个
+    供应商跑起来,后续再逐步加glm/doubao,系统必须在只配了部分key的情况下
+    正常运行,只用已配key的供应商。format字段决定实例化哪个客户端类
+    (anthropic -> AnthropicLLMClient,openai -> OpenAIChatLLMClient);
+    未知format同样跳过并print说明,不抛异常(配置笔误不应该让整个点火
+    进程起不来)。
+
+    auth字段(2026-07-16新增,接入火山方舟Ark Agent Plan后发现的真实
+    差异):format=anthropic的供应商不都用同一种认证头——DeepSeek/智谱GLM
+    走x-api-key(auth省略,默认"api_key"),火山方舟Ark Agent Plan专属端点
+    (官方文档给Claude Code配ANTHROPIC_BASE_URL用的那个)要求标准的
+    `Authorization: Bearer` 头,对应auth="auth_token"。原样透传给
+    AnthropicLLMClient(auth=...),format=openai的供应商不受这个字段影响
+    (OpenAIChatLLMClient固定用Bearer,本来就是Authorization: Bearer头)。
+
+    所有供应商共用同一份每日调用预算文件(state/llm_api_usage.json,与
+    build_llm_clients()的AnthropicLLMClient实例默认路径相同)——"今天总共
+    调用了多少次真实付费API"是需要被封顶的总量,不按供应商拆分预算(见
+    llm_bridge._DailyBudgetedLLMClient docstring)。
+
+    共享api_key_env的供应商(2026-07-16最终设计:火山方舟Agent Plan一份
+    ARK_API_KEY订阅下的doubao/glm/kimi/minimax/deepseek五个"大脑"共用同一个
+    api_key_env=ARK_API_KEY,只有模型名不同):这个环境变量缺失/为空时,
+    共享它的所有供应商都跳过,但只print一次说明,不按供应商数量重复打印
+    同一句话——先按api_key_env分组读一次环境变量,再回填给组内每个供应商,
+    环境变量本身只被读一次。
+    """
+    llm_cfg = (config.get("llm", {}) or {})
+    mode = llm_cfg.get("mode", "bridge")
+    if mode == "bridge":
+        bridge = AgentBridgeLLMClient(poll_seconds=2.0, timeout_seconds=1800.0)
+        return {"bridge": (bridge, bridge)}
+
+    api_cfg = llm_cfg.get("api", {}) or {}
+    providers_cfg = api_cfg.get("providers", {}) or {}
+    max_daily_calls = int(api_cfg.get("max_daily_calls", 600))
+    usage_path = STATE_ROOT / "llm_api_usage.json"
+
+    from llm_bridge import AnthropicLLMClient, OpenAIChatLLMClient  # noqa: PLC0415
+
+    # 按api_key_env分组:多个供应商共享同一个环境变量时(ARK_API_KEY下的
+    # 五个ark-*供应商),环境变量只读一次、缺失时的提示只print一次。
+    providers_by_env: dict = {}
+    for name, provider_cfg in providers_cfg.items():
+        providers_by_env.setdefault((provider_cfg or {}).get("api_key_env"), []).append(name)
+
+    resolved_keys: dict = {}
+    for api_key_env, names in providers_by_env.items():
+        api_key = os.environ.get(api_key_env, "").strip() if api_key_env else ""
+        if not api_key:
+            print(
+                f"build_provider_clients: 环境变量 {api_key_env!r} 未配置(不存在或"
+                f"为空),跳过共享它的供应商 {sorted(names)}——分支路由到这些供应商时会"
+                "回退到默认供应商,不影响其它已配key的供应商", flush=True,
+            )
+            continue
+        resolved_keys[api_key_env] = api_key
+
+    clients: dict = {}
+    for name, provider_cfg in providers_cfg.items():
+        provider_cfg = provider_cfg or {}
+        api_key_env = provider_cfg.get("api_key_env")
+        api_key = resolved_keys.get(api_key_env)
+        if not api_key:
+            continue
+
+        fmt = provider_cfg.get("format", "anthropic")
+        base_url = provider_cfg.get("base_url")
+        trader_model = provider_cfg.get("trader_model")
+        deep_model = provider_cfg.get("deep_model")
+        auth_mode = provider_cfg.get("auth", "api_key")  # "api_key"(x-api-key,默认) | "auth_token"(Bearer)
+        if fmt == "anthropic":
+            routine = AnthropicLLMClient(
+                model=trader_model, max_daily_calls=max_daily_calls,
+                base_url=base_url, usage_path=usage_path, api_key=api_key, auth=auth_mode,
+            )
+            deep = AnthropicLLMClient(
+                model=deep_model, max_daily_calls=max_daily_calls,
+                base_url=base_url, usage_path=usage_path, api_key=api_key, auth=auth_mode,
+            )
+        elif fmt == "openai":
+            routine = OpenAIChatLLMClient(
+                model=trader_model, api_key=api_key, base_url=base_url,
+                max_daily_calls=max_daily_calls, usage_path=usage_path,
+            )
+            deep = OpenAIChatLLMClient(
+                model=deep_model, api_key=api_key, base_url=base_url,
+                max_daily_calls=max_daily_calls, usage_path=usage_path,
+            )
+        else:
+            print(f"build_provider_clients: 供应商 {name!r} 的format {fmt!r} 未知,跳过", flush=True)
+            continue
+
+        clients[name] = (routine, deep)
+
+    return clients
+
+
+def evo_rotation_pool(available_provider_clients: dict) -> list:
+    """从 build_provider_clients() 的返回值里筛出"evo候选分支可以轮转使用"
+    的供应商名单——排除 _DEFAULT_LLM_PROVIDER("deepseek",main分支专属+
+    全局兜底的DeepSeek直连)。
+
+    2026-07-16用户最终确认的设计:main的"擂主"大脑必须是一条不参与分支间
+    多样性实验的稳定基准线,即使技术上deepseek这个模型也可能通过
+    ark-deepseek(经火山方舟Agent Plan订阅走同一个模型)间接出现在轮转池
+    里——那是一个不同的供应商身份(不同端点/不同计费/不同故障域),不受
+    这条排除规则影响,这里只精确排除_DEFAULT_LLM_PROVIDER这一个具体名字。
+
+    bridge模式/只配了deepseek一个供应商的key时,排除后池子为空——
+    assign_providers_to_roster对空池是no-op,evo分支不会被分配llm_provider,
+    resolver会让它们全部回退到默认供应商(实质上和main用同一个deepseek),
+    这是"只配了部分key时系统必须正常运行"的自然退化路径,不是bug。
+    """
+    return [name for name in available_provider_clients if name != _DEFAULT_LLM_PROVIDER]
+
+
+def assign_providers_to_roster(roster: dict, available_providers: list) -> dict:
+    """给锦标赛名册里"还没有llm_provider字段"的active分支按供应商轮转
+    (round-robin)分配一个llm_provider,写回磁盘,返回更新后的roster。
+
+    确定性:先把待分配分支按分支名排序、供应商列表也排序,再按索引取模轮转
+    ——不依赖dict遍历顺序或调用方传入available_providers的原始顺序,保证
+    同一份名册在同样一组可用供应商下,不管重启多少次、调用多少次,分配结果
+    完全一样。这对"认知多样性"本身很重要:如果分配结果每次重启都能变,
+    分支的"大脑"就不稳定,历史决策也失去可解释性。
+
+    幂等:已经带llm_provider字段的分支不会被重新分配(不重新洗牌)——不然
+    一个分支运行到一半突然被换脑子,该分支积累的"这个模型的写作风格/记忆"
+    就被打断了。第二次对同一份(已经全部分配过的)名册调用是纯粹的no-op,
+    不会产生任何变化,也不会重复写盘。
+
+    available_providers为空(还没配任何供应商的key,或bridge模式)时直接
+    原样返回,不碰磁盘——调用方(main()主循环)每轮都会调这个函数,没有
+    可分配的供应商时不需要真的触碰文件系统。
+
+    main分支不在这个函数的处理范围内(它甚至不会出现在roster里——roster
+    只包含锦标赛候选分支;main固定用默认供应商,见 make_llm_resolver)。
+    """
+    if not available_providers:
+        return roster
+
+    to_assign = sorted(
+        branch for branch, meta in roster.items()
+        if isinstance(meta, dict) and meta.get("status") == "active" and not meta.get("llm_provider")
+    )
+    if not to_assign:
+        return roster
+
+    sorted_providers = sorted(available_providers)
+    roster = dict(roster)
+    for i, branch in enumerate(to_assign):
+        provider = sorted_providers[i % len(sorted_providers)]
+        roster[branch] = {**roster[branch], "llm_provider": provider}
+
+    save_tournament_roster(roster)
+    return roster
+
+
+def make_llm_resolver(available_clients: dict, roster_loader: Callable[[], dict]) -> Callable[[str], Optional[Callable]]:
+    """构造 Trader(llm_client_resolver=...) 要的 branch -> routine_llm
+    可调用对象(2026-07-16,分支级认知多样性)。
+
+    available_clients: build_provider_clients() 的返回值
+      {provider_name: (routine_llm, deep_llm)}。
+    roster_loader: 零参可调用,返回当前锦标赛名册——每次解析都重新调用
+      (不缓存),与本文件"名册可能被锦标赛/替补战术生成流程随时改写,调用方
+      必须总是看到最新版本"的既定原则一致(参见 make_policy_resolver 的
+      同一条注释)。
+
+    main分支固定返回默认供应商(_DEFAULT_LLM_PROVIDER,即deepseek;若该
+    供应商未配置则退到available_clients里排序后的第一个)——不查名册。
+    main根本不是锦标赛候选、不会出现在roster里,它的"擂主"身份需要一个
+    稳定基准的大脑,不参与本次改造的分支级多样性实验(这是有意的:分支
+    之间比较"哪种大脑更赚钱"的前提,是有且只有一个不变的参照系)。
+
+    其它分支:查名册里该分支的llm_provider字段;字段缺失、或指向的供应商
+    没有出现在available_clients里(没配key/format未知,被build_provider_
+    clients跳过了)——一律回退到同一个默认供应商,而不是抛异常或返回None
+    (分支路由是"锦上添花"的多样性实验,不应该因为某个供应商的key还没配好
+    就让该分支的决策周期整个失败)。
+
+    只有一种情况返回None:available_clients本身是空字典(mode=api但一个
+    供应商的key都没配——理论上不会发生,因为bridge模式下build_provider_
+    clients总会返回{"bridge": ...},但防御性地保留这条路径)。Trader.decide()
+    对resolver返回None的处理是回退到构造时传入的self.llm_client,行为退化
+    为"完全不接这层resolver"。
+    """
+
+    def _default_provider() -> Optional[str]:
+        if not available_clients:
+            return None
+        if _DEFAULT_LLM_PROVIDER in available_clients:
+            return _DEFAULT_LLM_PROVIDER
+        return sorted(available_clients)[0]
+
+    def _resolver(branch: str) -> Optional[Callable]:
+        default_provider = _default_provider()
+        if branch == "main":
+            # 大脑德比(2026-07-16):main默认仍是_DEFAULT_LLM_PROVIDER的
+            # 稳定基准脑,但某个大脑分支PROMOTE后,state/main_brain.json
+            # 会记录赢家provider——"赢家通吃、接管主账户决策权"在德比里
+            # 的唯一落点就是这里(所有分支任务书一字不差,能接管的只有
+            # 大脑本体)。文件不存在/指向未配置的供应商时回退默认脑,与
+            # 分支路由的兜底纪律一致。
+            override = load_main_brain()
+            provider = override if override and override in available_clients else default_provider
+        else:
+            roster = roster_loader() or {}
+            meta = roster.get(branch)
+            provider = meta.get("llm_provider") if isinstance(meta, dict) else None
+            if not provider or provider not in available_clients:
+                provider = default_provider
+        if provider is None or provider not in available_clients:
+            return None
+        return available_clients[provider][0]
+
+    return _resolver
+
+
 def load_config() -> dict:
     with open(PROJECT_ROOT / "config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -337,6 +581,13 @@ MAIN_TACTICS_PATH = STATE_ROOT / "main_program_tactics.json"
 # 路径的权威开关。两份状态在 promote_policy_branch() 里总是同一次晋升
 # 一起更新,不会出现只更新其中一份的中间态。
 MAIN_POLICY_PATH = STATE_ROOT / "main_policy.json"
+# 大脑德比(用户2026-07-16最终指令:"你不要改成各个不同性格的分支了,直接
+# 改成不同的ai大脑,然后重新来"):main分支当前由哪个供应商大脑执掌。默认
+# 不存在(main用_DEFAULT_LLM_PROVIDER,deepseek直连);某个大脑分支PROMOTE
+# 后写入该大脑的provider名,make_llm_resolver对"main"的解析优先读这里——
+# 大脑德比里"赢家通吃"的含义从"战术文字接管main"变成"大脑本体接管main"
+# (所有分支的任务书一字不差,能接管的只有大脑)。
+MAIN_BRAIN_PATH = STATE_ROOT / "main_brain.json"
 
 _DAY_MS = 86_400_000
 
@@ -366,6 +617,156 @@ _TOURNAMENT_STAKES_SUFFIX = (
     "风险控制靠falsifier止损纪律和杠杆选择,不靠把仓位缩到没有意义。"
     "你的每一笔决策都真实关系到这个战术能不能活下去。"
 )
+
+# ---------------------------------------------------------------------------
+# 大脑德比(brain derby,用户2026-07-16最终指令):废弃"不同性格分支"的
+# 差异化战术设计,所有evo分支拿到下面这份一字不差的中性任务书,唯一的变量
+# 是名册里llm_provider指向的大模型是谁——比较的对象从"哪种战术更好"变成
+# "哪个大脑更会交易"。战术文字里刻意不给任何风格暗示(不说进取/保守/动量/
+# carry/分散,不举例某种打法),只交代账户事实、可用工具边界和系统级硬纪律,
+# 其余全部留给大脑自己判断。
+# ---------------------------------------------------------------------------
+_BRAIN_DERBY_MANDATE = (
+    "你在管理一个独立的、本金100U的加密永续合约模拟账户。唯一目标:让净值"
+    "增长,越多越好。没有任何预设风格或流派——做多还是做空、用多少倍杠杆"
+    "(系统硬上限100倍,注意爆仓线)、选哪些标的(universe内全部可选)、"
+    "持仓多久、集中还是分散,全部由你自己判断。用你自己的方式分析市场"
+    "(价格趋势、资金费率、宏观与新闻研究笔记、记忆里的历史教训,都可以"
+    "用),建立并持续迭代你认为最优的交易方法。唯一的硬性纪律来自系统:"
+    "每笔非hold决策必须写出真实可检验的falsifier_condition(被证伪就止损"
+    "离场)和horizon(到期系统会真的强制平仓);爆仓即死。"
+)
+
+# 大脑德比版生存规则后缀:与_TOURNAMENT_STAKES_SUFFIX同源(数值15%/0.5%/
+# 约3天必须与tactic_tournament配置保持一致,改config记得同步改这里),但
+# 语义按德比规则改写:出局后是"同一个大脑满血复活"而不是"被全新战术取代",
+# PROMOTE是"大脑接管main"而不是"战术文字接管main"。
+_BRAIN_DERBY_STAKES_SUFFIX = (
+    "\n\n【大脑德比生存规则,请认真对待,这不是走过场】这是一场纯粹的"
+    "'AI大脑'对决:所有参赛分支拿到的任务书一字不差,唯一的变量是背后做"
+    "决策的大模型是谁——你的每一笔决策都在为你所代表的模型在公开记分板上"
+    "挣名次。规则:每隔几小时用真实净值数据评估一次,你的净值从历史峰值"
+    "回撤超过15%、或任何一笔持仓被爆仓,立即强制平仓出局;每隔约3天还有"
+    "一次末位斩杀,存活满一个考核窗口的分支里窗口内收益最低的那个直接出局"
+    "——哪怕它在小幅盈利、哪怕它没犯任何错。这意味着'平庸'和'亏损'一样"
+    "致命:长期空仓观望零收益,大概率就是下一个被斩的。你出局后,同一个"
+    "大脑会带着全新的100U重新入场,但死亡次数会被永久记录并公示——复活"
+    "不清除记录。反过来,如果你的净值持续跑赢main分支0.5个百分点以上,你"
+    "这个大脑会直接接管main主账户的决策权,赢家通吃。仓位规模必须和信念"
+    "匹配:target_notional_pct的单位是净值的百分点(15.0=拿净值的15%建仓),"
+    "本金只有100U,系统允许单仓名义到净值100%、全组合总名义敞口到300%"
+    "(即总杠杆3倍)——总敞口长期连净值的100%都不到,意味着连1倍杠杆都"
+    "不敢用满,数学上注定跑不出有意义的收益,也逃不过斩杀。有真实依据就"
+    "该用杠杆把仓位放大到有意义的量级,风险控制靠falsifier止损纪律和杠杆"
+    "选择,不靠把仓位缩到没有意义。"
+)
+
+
+def tournament_mode(config: dict) -> str:
+    """tactic_tournament.mode 配置项:"brain_derby"(2026-07-16起的现行模式,
+    大脑德比)或缺省的"tactic_evolution"(历史模式,性格分支+LLM生成替补
+    战术)。代码默认值故意选历史模式——已有测试和老配置在不写mode时的行为
+    不变,现行模式由config.yaml显式声明。"""
+    return str((config.get("tactic_tournament") or {}).get("mode", "tactic_evolution"))
+
+
+def load_main_brain() -> Optional[str]:
+    """main分支当前生效的大脑provider名——默认None(用_DEFAULT_LLM_PROVIDER
+    的deepseek直连),大脑德比判定某个大脑PROMOTE后写入赢家provider,
+    持久化到重启后依然生效。与load_main_tactics同一套"每次都重读文件"的
+    消费方式(make_llm_resolver每次解析都调用),锦标赛写入后下一个决策
+    周期立刻生效,不需要重启。"""
+    if MAIN_BRAIN_PATH.exists():
+        try:
+            data = json.loads(MAIN_BRAIN_PATH.read_text(encoding="utf-8"))
+            provider = data.get("llm_provider")
+            return str(provider) if provider else None
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def save_main_brain(provider: str, source_branch: str, now_ms: int) -> None:
+    MAIN_BRAIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MAIN_BRAIN_PATH.write_text(
+        json.dumps(
+            {"llm_provider": provider, "source_branch": source_branch, "promoted_ms": now_ms},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def build_brain_derby_defaults(rotation_pool: list, now_ms: int) -> dict:
+    """大脑德比模式下"名册文件不存在,首次建档用什么"的默认值:每个可用
+    供应商大脑一个分支,任务书全部是同一份_BRAIN_DERBY_MANDATE+德比生存
+    规则,llm_provider直接预置(不走assign_providers_to_roster的轮转——
+    轮转是为'分支比供应商多/少'的旧场景设计的,德比里分支和大脑一一对应,
+    身份必须确定)。
+
+    rotation_pool为空(bridge模式/ARK_API_KEY未配置)时退化为单分支德比:
+    用_DEFAULT_LLM_PROVIDER顶上,和main同脑——比较意义为零但系统照常运行,
+    与evo_rotation_pool docstring里"只配了部分key时系统必须正常运行"同一条
+    自然退化纪律。
+    """
+    providers = sorted(rotation_pool) if rotation_pool else [_DEFAULT_LLM_PROVIDER]
+    date_compact = datetime.datetime.utcfromtimestamp(now_ms / 1000).strftime("%Y%m%d")
+    return {
+        f"evo/{date_compact}-brain-{provider}": {
+            "tactics": _BRAIN_DERBY_MANDATE + _BRAIN_DERBY_STAKES_SUFFIX,
+            "llm_provider": provider,
+            "kind": "brain",
+            "generation": 1,
+            "deaths": 0,
+            "promotions": 0,
+        }
+        for provider in providers
+    }
+
+
+def respawn_brain_branch(roster: dict, dead_branch: str, decision: str, now_ms: int) -> tuple[dict, Optional[str]]:
+    """大脑德比的换血规则:大脑是永久选手,账户才是消耗品。一个大脑分支
+    出局(FAIL回撤红线/CULLED末位斩杀)或PROMOTE(接管main)后,同一个
+    大脑立刻带着全新的100U以新分支身份重新入场——不再像历史模式那样请LLM
+    设计一个全新性格战术。死亡次数(deaths)/晋升次数(promotions)跨世代
+    累计,写在新分支的meta里公示。
+
+    新分支id格式 evo/{YYYYMMDD}-brain-{provider}-g{generation}(世代号从2
+    起——初代没有后缀),若与名册现有key冲突则世代号继续+1直到不冲突
+    (同一天同一个大脑死多次的极端情况)。
+
+    dead_branch不是大脑分支(没有llm_provider,比如M8内环送进来的policy
+    分支)时返回(roster, None),调用方据此跳过——policy分支的名额由内环
+    的admit_policy_to_forward_pool自然补充,不归德比复活规则管。
+    返回的roster是新字典,调用方负责save_tournament_roster落盘。
+    """
+    dead_meta = roster.get(dead_branch) or {}
+    provider = dead_meta.get("llm_provider")
+    if not provider or dead_meta.get("kind") != "brain":
+        return roster, None
+
+    deaths = int(dead_meta.get("deaths", 0)) + (1 if decision in ("FAIL", "CULLED") else 0)
+    promotions = int(dead_meta.get("promotions", 0)) + (1 if decision == "PROMOTE" else 0)
+    generation = int(dead_meta.get("generation", 1)) + 1
+    date_compact = datetime.datetime.utcfromtimestamp(now_ms / 1000).strftime("%Y%m%d")
+    new_branch = f"evo/{date_compact}-brain-{provider}-g{generation}"
+    while new_branch in roster:
+        generation += 1
+        new_branch = f"evo/{date_compact}-brain-{provider}-g{generation}"
+
+    roster = dict(roster)
+    roster[new_branch] = {
+        "tactics": _BRAIN_DERBY_MANDATE + _BRAIN_DERBY_STAKES_SUFFIX,
+        "llm_provider": provider,
+        "kind": "brain",
+        "status": "active",
+        "created_ms": now_ms,
+        "generation": generation,
+        "deaths": deaths,
+        "promotions": promotions,
+        "respawned_from": dead_branch,
+    }
+    return roster, new_branch
 
 
 def read_main_hourly_nav_series() -> list[tuple[int, float]]:
@@ -475,9 +876,16 @@ def load_tournament_roster(now_ms: int, defaults: dict[str, str]) -> dict:
     # 调用多次(决策周期那段、锦标赛评估那段),如果不在这里就写文件,
     # created_ms会在每次调用时都被重新赋成"现在",min_hours_before_judgment
     # 门槛永远也等不到,是刚才第一次重启后真实复现的bug,不是假设性边界情况。
+    # defaults的value兼容两种形态:str(历史模式,纯战术文字)或dict(大脑
+    # 德比模式,build_brain_derby_defaults给出的完整meta——llm_provider/
+    # kind/deaths等字段必须原样进名册,status/created_ms由这里统一盖章)。
     roster = {
-        name: {"tactics": tactics, "status": "active", "created_ms": now_ms}
-        for name, tactics in defaults.items()
+        name: (
+            {**value, "status": "active", "created_ms": now_ms}
+            if isinstance(value, dict)
+            else {"tactics": value, "status": "active", "created_ms": now_ms}
+        )
+        for name, value in defaults.items()
     }
     save_tournament_roster(roster)
     return roster
@@ -1102,6 +1510,11 @@ def main() -> None:
     # routine_llm:量大的例行决策周期;deep_llm:反思/研究/战术设计。
     # bridge模式下两者是同一个对象,api模式下分别对应便宜/强两档模型。
     routine_llm, deep_llm = build_llm_clients(config)
+    # 供应商注册表(2026-07-16,分支级认知多样性):与上面的routine_llm/
+    # deep_llm是两条独立但共存的路径——那两个仍然是main分支/反思/研究默认
+    # 使用的"老"客户端,这里额外构造一份{provider_name: (routine, deep)}
+    # 字典,供下面的Trader llm_client_resolver按分支路由到不同供应商。
+    available_provider_clients = build_provider_clients(config)
 
     LOG_ROOT.mkdir(parents=True, exist_ok=True)
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1124,14 +1537,32 @@ def main() -> None:
         print("Tavily搜索已启用(月度保险丝950次)", flush=True)
     else:
         search_client = None
+    # 分支级路由(2026-07-16)有意只接到Trader.decide()这一处,Researcher/
+    # Reflector仍然固定用deep_llm(供应商注册表里的默认供应商)——不是遗漏,
+    # 是刻意分步:研究/反思的输出会写进共享记忆(MemoryStore),被所有分支
+    # 检索到,如果研究/反思本身也按分支切换供应商,"哪条记忆是哪个大脑
+    # 写的"会变成一个新的复杂度维度,而这次改造的诉求只是"决策"层面的认知
+    # 多样性。留到分支路由验证有效之后再评估要不要扩展到这两处。
     researcher = Researcher(
         llm_client=deep_llm, memory_store=memory_store, genesis_path=GENESIS_PATH,
         search_client=search_client,
     )
+    # llm_client_resolver:分支级认知多样性(2026-07-16)。这里传的lambda
+    # 引用了roster_defaults——一个在main()这同一个函数作用域里、要到
+    # 下面几百行之后(_DEFAULT_EVO_TACTICS定义后的模式分派处)才会被赋值的
+    # 局部变量。这依赖Python闭包的延迟绑定:lambda体本身现在不会被求值,
+    # 只有Trader.decide()真正调用resolver时(发生在下面的while循环里,那时
+    # roster_defaults早已赋值完毕)才会按名字查找这个变量的当前值,不是在
+    # 这里立即求值——所以这里的构造顺序是安全的,不需要把它的定义搬到
+    # 几百行之前。
     trader = Trader(
         llm_client=routine_llm,
         memory_store=memory_store,
         max_leverage=int((config.get("leverage", {}) or {}).get("max", 10)),
+        llm_client_resolver=make_llm_resolver(
+            available_provider_clients,
+            lambda: load_tournament_roster(clock.now_ms(), roster_defaults),
+        ),
     )
     reflector = Reflector(llm_client=deep_llm, memory_store=memory_store, log_root=LOG_ROOT)
     scorer = Scorer(config, log_root=LOG_ROOT)
@@ -1382,6 +1813,28 @@ def main() -> None:
         ),
     }
 
+    # 大脑德比(用户2026-07-16最终指令):config.yaml声明tactic_tournament.
+    # mode: brain_derby时,上面这份"性格分支"默认名册整体弃用,换成"每个
+    # 可用供应商大脑一个分支、任务书一字不差"的德比名册(见
+    # build_brain_derby_defaults docstring)。_DEFAULT_EVO_TACTICS的定义
+    # 保留不删:历史模式的回退路径 + 既有测试的行为锚点。此后所有需要
+    # "名册首次建档默认值"的地方(make_policy_resolver、Trader的roster_
+    # loader、主循环的load_tournament_roster)统一用roster_defaults这一个
+    # 变量,保证不管哪种模式,全进程看到的都是同一份defaults。
+    derby_mode = tournament_mode(config) == "brain_derby"
+    if derby_mode:
+        roster_defaults = build_brain_derby_defaults(
+            evo_rotation_pool(available_provider_clients), clock.now_ms()
+        )
+        print(
+            f"=== 大脑德比模式:{len(roster_defaults)} 个大脑参赛 "
+            f"{[m['llm_provider'] for m in roster_defaults.values()]},"
+            f"任务书一字不差,唯一变量是大脑 ===",
+            flush=True,
+        )
+    else:
+        roster_defaults = _DEFAULT_EVO_TACTICS
+
     # M8晋升闸门重构:scheduler.trader 从这里起不再直接是上面构造的裸
     # Trader(纯LLM)——包一层 DispatchingTrader,policy_resolver 能查到
     # policy_id 的分支(main通过state/main_policy.json,evo分支通过当前
@@ -1397,13 +1850,21 @@ def main() -> None:
     # 写盘之前查到的可能是一份不同的初始名册。
     scheduler.trader = DispatchingTrader(
         llm_trader=trader,
-        policy_resolver=make_policy_resolver(clock, _DEFAULT_EVO_TACTICS),
+        policy_resolver=make_policy_resolver(clock, roster_defaults),
         data_pipeline=dp,
         memory_store=memory_store,
         timeframe=config["data"]["timeframe"],
     )
 
-    tournament_roster = load_tournament_roster(clock.now_ms(), _DEFAULT_EVO_TACTICS)
+    tournament_roster = load_tournament_roster(clock.now_ms(), roster_defaults)
+    # 分支级认知多样性(2026-07-16):给还没有llm_provider字段的active分支
+    # 按可用供应商轮转分配一个,幂等——已经分配过的分支不受影响。轮转池用
+    # evo_rotation_pool()排除掉_DEFAULT_LLM_PROVIDER(deepseek直连,main
+    # 专属+全局兜底),不参与evo分支间的多样性实验;池子为空(bridge模式/
+    # ARK_API_KEY未配置)时是no-op。
+    tournament_roster = assign_providers_to_roster(
+        tournament_roster, evo_rotation_pool(available_provider_clients)
+    )
     evo_simulators: dict[str, Simulator] = {}
 
     def _ensure_evo_simulator(evo_branch: str) -> Simulator:
@@ -1473,7 +1934,13 @@ def main() -> None:
         # 重启ignite.py进程就能生效——只处理status=='active'的分支,循环
         # 结束后不需要额外重置program_tactics,下一轮while顶部main分支调用
         # 前已经会重新读一次。
-        tournament_roster = load_tournament_roster(now, _DEFAULT_EVO_TACTICS)
+        tournament_roster = load_tournament_roster(now, roster_defaults)
+        # 新分支(比如替补战术生成刚填补的空缺)可能还没有llm_provider——
+        # 幂等分配,已经分配过的分支不受影响(见assign_providers_to_roster
+        # docstring)。
+        tournament_roster = assign_providers_to_roster(
+            tournament_roster, evo_rotation_pool(available_provider_clients)
+        )
         for evo_branch, meta in tournament_roster.items():
             if meta.get("status") != "active":
                 continue
@@ -1643,7 +2110,7 @@ def main() -> None:
         last_reflection_ts = schedule_state.get("last_reflection_ts")
         if last_reflection_ts is None or now - last_reflection_ts >= reflection_interval_ms:
             reflection_branches = ["main"] + [
-                b for b, m in load_tournament_roster(now, _DEFAULT_EVO_TACTICS).items()
+                b for b, m in load_tournament_roster(now, roster_defaults).items()
                 if m.get("status") == "active"
             ]
             for reflection_branch in reflection_branches:
@@ -1666,7 +2133,7 @@ def main() -> None:
         # 完全一致(每小时1次),每个分支约N小时轮到一次(N=活跃分支数)。
         if now - last_research_ms >= research_interval_ms:
             research_label = _utc_research_label(now)
-            research_roster = load_tournament_roster(now, _DEFAULT_EVO_TACTICS)
+            research_roster = load_tournament_roster(now, roster_defaults)
             research_branches = ["main"] + [
                 b for b, m in research_roster.items() if m.get("status") == "active"
             ]
@@ -1758,7 +2225,7 @@ def main() -> None:
         if last_tournament_ms is None or now - last_tournament_ms >= ratchet_interval_ms:
             try:
                 tournament_cfg = config.get("tactic_tournament", {}) or {}
-                roster = load_tournament_roster(now, _DEFAULT_EVO_TACTICS)
+                roster = load_tournament_roster(now, roster_defaults)
                 events = evaluate_tactic_tournament(roster, now, tournament_cfg)
 
                 # 末位斩杀(用户2026-07-15要求,见evaluate_cull的docstring):
@@ -1802,9 +2269,24 @@ def main() -> None:
                         # 代码可以合并,GitMergeExecutor对它们没有意义)。
                         policy_id = roster[branch].get("policy_id")
                         if policy_id is None:
-                            winning_tactics = roster[branch]["tactics"]
-                            save_main_tactics(winning_tactics, branch, now)
-                            print(f"[{now}] main分支战术已更新为 {branch} 的战术(立即生效,不需要重启)", flush=True)
+                            if derby_mode and roster[branch].get("kind") == "brain":
+                                # 大脑德比:所有分支任务书一字不差,"赢家的
+                                # 战术文字接管main"没有信息量——接管main的
+                                # 是大脑本体(换脑不换词)。main的战术偏置
+                                # 保持不变(默认None),只切换llm_provider,
+                                # make_llm_resolver对"main"的解析下一个决策
+                                # 周期立刻用上,不需要重启。
+                                winning_brain = roster[branch]["llm_provider"]
+                                save_main_brain(winning_brain, branch, now)
+                                print(
+                                    f"[{now}] 大脑德比PROMOTE: main分支大脑切换为 "
+                                    f"{winning_brain}(来自{branch},立即生效,不需要重启)",
+                                    flush=True,
+                                )
+                            else:
+                                winning_tactics = roster[branch]["tactics"]
+                                save_main_tactics(winning_tactics, branch, now)
+                                print(f"[{now}] main分支战术已更新为 {branch} 的战术(立即生效,不需要重启)", flush=True)
                         else:
                             try:
                                 outcome = promote_policy_branch(
@@ -1859,6 +2341,48 @@ def main() -> None:
                     )
                     for ev in events:
                         resolved_branch = ev["branch"]
+
+                        # 大脑德比:出局/晋升的名额不再请LLM设计新性格战术,
+                        # 而是同一个大脑满血复活(见respawn_brain_branch
+                        # docstring:大脑是永久选手,账户才是消耗品)。
+                        # policy分支(M8内环送进来的)不归复活规则管,名额
+                        # 留给内环下一次admit补充。
+                        if derby_mode:
+                            roster, respawned_id = respawn_brain_branch(
+                                roster, resolved_branch, ev["decision"], now
+                            )
+                            if respawned_id is not None:
+                                save_tournament_roster(roster)
+                                new_meta = roster[respawned_id]
+                                log_writer.append_jsonl(
+                                    "tactic_generations.jsonl",
+                                    {
+                                        "ts": now, "resolved_branch": resolved_branch,
+                                        "resolved_decision": ev["decision"],
+                                        "status": "brain_respawn",
+                                        "new_branch_id": respawned_id,
+                                        "llm_provider": new_meta["llm_provider"],
+                                        "generation": new_meta["generation"],
+                                        "deaths": new_meta["deaths"],
+                                        "promotions": new_meta["promotions"],
+                                    },
+                                    root=LOG_ROOT,
+                                )
+                                print(
+                                    f"[{now}] 大脑德比复活: {new_meta['llm_provider']} 带着新的100U"
+                                    f"重新入场 -> {respawned_id}(第{new_meta['generation']}世代,"
+                                    f"累计死亡{new_meta['deaths']}次/晋升{new_meta['promotions']}次,"
+                                    f"立即生效,不需要重启)",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"[{now}] [{resolved_branch}] 非大脑分支出局,德比模式下"
+                                    f"不自动生成替补,名额留给内环policy补充",
+                                    flush=True,
+                                )
+                            continue
+
                         try:
                             generated = generate_replacement_tactic(
                                 deep_llm, ev, roster, universe_symbols_now

@@ -403,11 +403,34 @@ def api_branches() -> dict:
         if "branch" in r:
             seen[r["branch"]] = {"branch": r["branch"], "label": r["branch"], "kind": "evo",
                                  "created_date": r.get("created_date")}
+    # llm_provider(2026-07-16):名册条目里新增的"这个分支用哪个供应商的
+    # 大脑"字段(见 scripts/ignite.py::assign_providers_to_roster)——面板
+    # 之前只透传branch/label/kind/created_date,漏掉了这个字段会让"分支级
+    # 认知多样性"在面板上完全不可见。零计算原则不变:原样读roster里已经
+    # 有的值,不做任何推断/默认值填充。
     roster = _read_json_state_file(STATE_ROOT / "tactic_tournament_roster.json") or {}
     for branch, meta in roster.items():
-        if isinstance(meta, dict) and meta.get("status") == "active" and branch not in seen:
+        if not isinstance(meta, dict):
+            continue
+        if branch not in seen:
+            if meta.get("status") != "active":
+                continue
             seen[branch] = {"branch": branch, "label": branch, "kind": "evo", "created_date": None}
-    branches = [{"branch": "main", "label": "main", "kind": "main"}] + sorted(
+        seen[branch]["llm_provider"] = meta.get("llm_provider")
+        # 大脑德比(2026-07-16):世代/死亡/晋升计数是名册里现成的公示字段
+        # (见 scripts/ignite.py::respawn_brain_branch),原样透传,零计算
+        # 原则不变;历史模式的名册没有这些字段,前端拿到None自行忽略。
+        seen[branch]["generation"] = meta.get("generation")
+        seen[branch]["deaths"] = meta.get("deaths")
+        seen[branch]["promotions"] = meta.get("promotions")
+    main_entry: dict = {"branch": "main", "label": "main", "kind": "main"}
+    # main当前由哪个大脑执掌(大脑德比PROMOTE后 state/main_brain.json 记录
+    # 赢家provider,见 scripts/ignite.py::save_main_brain)——文件不存在时
+    # 不填字段,前端按"默认脑"展示。
+    main_brain = _read_json_state_file(STATE_ROOT / "main_brain.json") or {}
+    if main_brain.get("llm_provider"):
+        main_entry["llm_provider"] = main_brain.get("llm_provider")
+    branches = [main_entry] + sorted(
         seen.values(), key=lambda b: b["branch"]
     )
     return {"branches": branches, "has_data": True}

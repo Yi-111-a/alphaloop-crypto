@@ -235,6 +235,35 @@ def test_branches_endpoint_includes_registered_evo_branches(client):
     assert evo_entry["created_date"] == "2026-07-14"
 
 
+def test_branches_endpoint_surfaces_llm_provider_field(client):
+    """2026-07-16:分支级认知多样性——名册里的llm_provider字段(见
+    scripts/ignite.py::assign_providers_to_roster)必须能在面板上看到,不能
+    只存在于state文件里。同时覆盖"分支已经在branch_registrations.jsonl里
+    注册过"这条路径也要能拿到roster的llm_provider(不只是roster独有的新
+    分支)。"""
+    test_client, log_root, state_root = client
+    with open(log_root / "branch_registrations.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"branch": "evo/20260714-aggressive", "created_date": "2026-07-14"}) + "\n")
+    (state_root / "tactic_tournament_roster.json").write_text(
+        json.dumps({
+            "evo/20260714-aggressive": {
+                "tactics": "...", "status": "active", "created_ms": 0, "llm_provider": "glm",
+            },
+            "evo/20260716-newcomer": {
+                "tactics": "...", "status": "active", "created_ms": 0, "llm_provider": "doubao",
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    data = test_client.get("/api/branches").json()
+    by_branch = {b["branch"]: b for b in data["branches"]}
+    # 已经在registered_branches里出现过的分支,也要能从roster补上llm_provider
+    assert by_branch["evo/20260714-aggressive"]["llm_provider"] == "glm"
+    # roster独有(尚未注册)的新分支同样要出现,且带上它的llm_provider
+    assert by_branch["evo/20260716-newcomer"]["llm_provider"] == "doubao"
+
+
 def test_nav_intraday_branches_endpoint_filters_by_hours_window(client):
     test_client, log_root, _state_root = client
     now_ms = int(time.time() * 1000)

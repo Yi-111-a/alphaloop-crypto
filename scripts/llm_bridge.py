@@ -22,14 +22,19 @@ pending request,有就读 prompt、推理、调这个函数把响应写回去。
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
+import requests
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATE_ROOT = PROJECT_ROOT / "state"
 REQUEST_PATH = STATE_ROOT / "llm_pending_request.json"
+
+logger = logging.getLogger(__name__)
 
 
 class AgentBridgeLLMClient:
@@ -87,43 +92,23 @@ def _strip_code_fences(text: str) -> str:
     return "\n".join(lines[1:-1])
 
 
-class AnthropicLLMClient:
-    """直连 Anthropic API 的 llm_client(用户2026-07-15要求,24h无人值守
-    服务器模式)。与 AgentBridgeLLMClient 完全同构:Callable[[str], str],
-    失败抛异常交给 main.py 既有的失败隔离层(Trader重试/兜底hold、
-    Researcher/Reflector的try-except-skip),自己不做业务级重试。
+class _DailyBudgetedLLMClient:
+    """AnthropicLLMClient 与 OpenAIChatLLMClient(2026-07-16新增,多供应商
+    分支路由)共用的每日调用预算记账逻辑——两个供应商的账单风险是同一件事
+    (代码bug导致的死循环调用把账单烧穿),抽成基类避免逐字复制同一套
+    读文件/判定/写回逻辑。
 
-    额外职责(桥模式不需要、无人值守必须有的):
-      - 每日调用预算熔断:state/llm_api_usage.json 记录当日调用数/税token,
-        超过 max_daily_calls 直接抛 RuntimeError,让当天剩余周期全部走安全
-        降级路径(hold/skip),第二天零点(UTC)自动恢复——防止代码bug导致
-        的死循环调用把账单烧穿。
-      - 响应围栏剥离:见 _strip_code_fences()。
-    API key 从环境变量 ANTHROPIC_API_KEY 读取,不进代码/配置文件。
+    预算文件默认共享同一份 state/llm_api_usage.json——即使分支路由到不同
+    供应商,"今天总共调用了多少次真实付费API"仍然是同一个需要被封顶的
+    总量,不需要、也不应该按供应商拆分成多份独立预算(拆分后总账单风险
+    敞口反而变成"供应商数 x max_daily_calls",违背这道闸门本来的目的)。
+    子类只需要在 __call__ 里调 _check_budget_or_raise() 拿到当天用量字典、
+    真正调用成功后调 _record_usage() 记账。
     """
 
-    def __init__(
-        self,
-        model: str,
-        max_tokens: int = 4096,
-        max_daily_calls: int = 600,
-        timeout_seconds: float = 180.0,
-        usage_path: Optional[Path] = None,
-        base_url: Optional[str] = None,
-    ):
-        import anthropic  # 延迟导入:桥模式/本地测试不需要装 anthropic SDK
-
-        self.model = model
-        self.max_tokens = max_tokens
+    def __init__(self, max_daily_calls: int = 600, usage_path: Optional[Path] = None):
         self.max_daily_calls = max_daily_calls
         self.usage_path = usage_path or (STATE_ROOT / "llm_api_usage.json")
-        # base_url:兼容Anthropic消息格式的第三方端点(用户2026-07-15选定
-        # DeepSeek,base_url=https://api.deepseek.com/anthropic,模型
-        # deepseek-v4-flash/pro)。None时走官方Anthropic端点。
-        client_kwargs: dict = {"timeout": timeout_seconds, "max_retries": 2}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        self._client = anthropic.Anthropic(**client_kwargs)
         STATE_ROOT.mkdir(parents=True, exist_ok=True)
 
     def _load_usage(self) -> dict:
@@ -140,7 +125,7 @@ class AnthropicLLMClient:
     def _save_usage(self, usage: dict) -> None:
         self.usage_path.write_text(json.dumps(usage, ensure_ascii=False), encoding="utf-8")
 
-    def __call__(self, prompt: str) -> str:
+    def _check_budget_or_raise(self) -> dict:
         usage = self._load_usage()
         if usage["calls"] >= self.max_daily_calls:
             raise RuntimeError(
@@ -148,6 +133,82 @@ class AnthropicLLMClient:
                 f"max_daily_calls {self.max_daily_calls}; degrading to safe fallback "
                 "until UTC midnight"
             )
+        return usage
+
+    def _record_usage(self, usage: dict, input_tokens: int, output_tokens: int) -> None:
+        usage["calls"] += 1
+        usage["input_tokens"] += input_tokens
+        usage["output_tokens"] += output_tokens
+        self._save_usage(usage)
+
+
+class AnthropicLLMClient(_DailyBudgetedLLMClient):
+    """直连 Anthropic API 的 llm_client(用户2026-07-15要求,24h无人值守
+    服务器模式)。与 AgentBridgeLLMClient 完全同构:Callable[[str], str],
+    失败抛异常交给 main.py 既有的失败隔离层(Trader重试/兜底hold、
+    Researcher/Reflector的try-except-skip),自己不做业务级重试。
+
+    额外职责(桥模式不需要、无人值守必须有的):
+      - 每日调用预算熔断(见 _DailyBudgetedLLMClient):超过 max_daily_calls
+        直接抛 RuntimeError,让当天剩余周期全部走安全降级路径(hold/skip),
+        第二天零点(UTC)自动恢复。
+      - 响应围栏剥离:见 _strip_code_fences()。
+    API key 从环境变量 ANTHROPIC_API_KEY 读取,不进代码/配置文件。
+
+    认证方式(2026-07-16新增,接入火山方舟Ark Agent Plan专属端点后发现的
+    真实差异):不是所有Anthropic消息格式兼容端点都用同一种认证头。
+    DeepSeek/智谱GLM这类走 `x-api-key` 请求头(anthropic SDK对应
+    `Anthropic(api_key=...)`);火山方舟Ark Agent Plan端点
+    (https://ark.cn-beijing.volces.com/api/plan,官方文档就是给Claude Code
+    配ANTHROPIC_BASE_URL用的)要求标准的 `Authorization: Bearer` 头
+    (SDK对应 `Anthropic(auth_token=...)`)。用户提供的官方文档同时指出
+    智谱GLM官方接入方式也是ANTHROPIC_AUTH_TOKEN风格。auth参数就是为了
+    覆盖这个差异:"api_key"(默认,兼容老行为)走x-api-key,"auth_token"
+    走Bearer,由调用方(ignite.py build_provider_clients)按供应商注册表里
+    每个供应商的auth字段决定传哪一种。
+    """
+
+    def __init__(
+        self,
+        model: str,
+        max_tokens: int = 4096,
+        max_daily_calls: int = 600,
+        timeout_seconds: float = 180.0,
+        usage_path: Optional[Path] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        auth: str = "api_key",
+    ):
+        import anthropic  # 延迟导入:桥模式/本地测试不需要装 anthropic SDK
+
+        if auth not in ("api_key", "auth_token"):
+            raise ValueError(f"AnthropicLLMClient: auth 必须是 'api_key' 或 'auth_token',得到 {auth!r}")
+
+        super().__init__(max_daily_calls=max_daily_calls, usage_path=usage_path)
+        self.model = model
+        self.max_tokens = max_tokens
+        # base_url:兼容Anthropic消息格式的第三方端点(用户2026-07-15选定
+        # DeepSeek,base_url=https://api.deepseek.com/anthropic,模型
+        # deepseek-v4-flash/pro;2026-07-16新增智谱GLM、火山方舟Ark Agent
+        # Plan同样走这个格式)。None时走官方Anthropic端点。
+        client_kwargs: dict = {"timeout": timeout_seconds, "max_retries": 2}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        # api_key/auth_token:2026-07-16多供应商改造前,anthropic SDK默认
+        # 自己读ANTHROPIC_API_KEY环境变量;现在供应商注册表(见ignite.py
+        # build_provider_clients)按各自的api_key_env读取key、显式传入,
+        # 兼容老路径——不传key时SDK仍按自己的默认行为读ANTHROPIC_API_KEY。
+        # auth决定这个key填进 api_key(x-api-key头)还是 auth_token
+        # (Authorization: Bearer头),见上面class docstring的说明。
+        if api_key:
+            if auth == "auth_token":
+                client_kwargs["auth_token"] = api_key
+            else:
+                client_kwargs["api_key"] = api_key
+        self._client = anthropic.Anthropic(**client_kwargs)
+
+    def __call__(self, prompt: str) -> str:
+        usage = self._check_budget_or_raise()
 
         message = self._client.messages.create(
             model=self.model,
@@ -158,10 +219,106 @@ class AnthropicLLMClient:
             block.text for block in message.content if getattr(block, "type", None) == "text"
         )
 
-        usage["calls"] += 1
-        usage["input_tokens"] += getattr(message.usage, "input_tokens", 0)
-        usage["output_tokens"] += getattr(message.usage, "output_tokens", 0)
-        self._save_usage(usage)
+        self._record_usage(
+            usage,
+            getattr(message.usage, "input_tokens", 0),
+            getattr(message.usage, "output_tokens", 0),
+        )
+
+        return _strip_code_fences(text)
+
+
+class OpenAIChatLLMClient(_DailyBudgetedLLMClient):
+    """OpenAI Chat Completions 格式的 llm_client(2026-07-16新增,用户要求
+    接入火山方舟豆包 Doubao-Seed-2.1-turbo,该端点是OpenAI格式而非
+    Anthropic兼容格式,与 AnthropicLLMClient 服务的DeepSeek/智谱GLM端点
+    不同,所以需要单独一个类)。
+
+    与 AnthropicLLMClient 完全同构:Callable[[str], str],共用同一套每日
+    预算记账(_DailyBudgetedLLMClient)和围栏剥离(_strip_code_fences)。
+    直接用 requests POST {base_url}/chat/completions,不引入 openai SDK
+    依赖——本项目已经在用 requests(见 scripts/search_client.py),没有
+    必要为了一个额外的HTTP客户端多装一个SDK。
+
+    重试:简单的"最多再试 max_retries 次"策略,不区分错误类型——网络抖动/
+    限流/端点临时5xx都值得原地重试;真正的业务级失败隔离(重试耗尽后
+    怎么办)仍然交给上层调用方(Trader的hold兜底、Researcher/Reflector的
+    try-except-skip),这里的重试只覆盖"这一次HTTP调用本身"。
+
+    思考类模型(reasoning models,豆包/DeepSeek系列都有对应版本)的响应
+    可能把真实内容放进 reasoning_content 字段、把 content 留空——只在
+    content为空时才回退读reasoning_content,并记一条warning,不能反过来
+    优先用reasoning_content(那是模型的思考过程草稿,不是最终答案,格式
+    通常也不满足下游要求的纯JSON)。
+    """
+
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        base_url: str,
+        max_tokens: int = 4096,
+        max_daily_calls: int = 600,
+        timeout_seconds: float = 180.0,
+        usage_path: Optional[Path] = None,
+        max_retries: int = 2,
+    ):
+        super().__init__(max_daily_calls=max_daily_calls, usage_path=usage_path)
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.max_tokens = max_tokens
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+
+    def __call__(self, prompt: str) -> str:
+        usage = self._check_budget_or_raise()
+
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.max_tokens,
+        }
+
+        last_exc: Optional[Exception] = None
+        data: Optional[dict] = None
+        for attempt in range(self.max_retries + 1):  # 首次尝试 + 最多 max_retries 次重试
+            try:
+                resp = requests.post(url, headers=headers, json=body, timeout=self.timeout_seconds)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as exc:  # noqa: BLE001 -- 网络/超时/HTTP错误统一走同一套重试
+                last_exc = exc
+                if attempt >= self.max_retries:
+                    raise
+                continue
+
+        assert data is not None  # for循环要么break成功、要么在最后一次尝试raise,不会掉到这里
+        _ = last_exc  # 仅用于上面raise前的赋值追踪,读到这里说明已经成功
+
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+        text = message.get("content") or ""
+        if not text.strip():
+            reasoning = message.get("reasoning_content")
+            if reasoning:
+                logger.warning(
+                    "OpenAIChatLLMClient: model %r response content 为空,回退到"
+                    "reasoning_content(思考类模型常见现象)", self.model,
+                )
+                text = reasoning
+
+        usage_stats = data.get("usage") or {}
+        self._record_usage(
+            usage,
+            int(usage_stats.get("prompt_tokens", 0) or 0),
+            int(usage_stats.get("completion_tokens", 0) or 0),
+        )
 
         return _strip_code_fences(text)
 
