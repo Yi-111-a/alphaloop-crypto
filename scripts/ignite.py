@@ -313,27 +313,34 @@ def build_provider_clients(config: dict) -> dict:
         # httpx.ReadTimeout→anthropic.APITimeoutError→该分支整个决策周期
         # 作废,虽然30分钟后的下一轮会自愈,但持续超时=该大脑永远饿死)。
         timeout_seconds = float(provider_cfg.get("timeout_seconds", 180.0))
+        # 每供应商可覆盖的max_tokens(2026-07-16德比首日实测的第二个坑:
+        # ark端点的思考模型把thinking块也计入max_tokens,kimi-k2.6对完整
+        # 交易prompt光思考就能写7000+字,4096配额被思考耗尽后text块为空
+        # (stop_reason=max_tokens)——JSON根本没输出,Trader连续3次schema
+        # 校验失败降级hold,表象是"kimi一直空仓",实际是它的答案每次都被
+        # 截没了。思考模型必须给足输出配额。
+        max_tokens = int(provider_cfg.get("max_tokens", 4096))
         if fmt == "anthropic":
             routine = AnthropicLLMClient(
                 model=trader_model, max_daily_calls=max_daily_calls,
                 base_url=base_url, usage_path=usage_path, api_key=api_key, auth=auth_mode,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=timeout_seconds, max_tokens=max_tokens,
             )
             deep = AnthropicLLMClient(
                 model=deep_model, max_daily_calls=max_daily_calls,
                 base_url=base_url, usage_path=usage_path, api_key=api_key, auth=auth_mode,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=timeout_seconds, max_tokens=max_tokens,
             )
         elif fmt == "openai":
             routine = OpenAIChatLLMClient(
                 model=trader_model, api_key=api_key, base_url=base_url,
                 max_daily_calls=max_daily_calls, usage_path=usage_path,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=timeout_seconds, max_tokens=max_tokens,
             )
             deep = OpenAIChatLLMClient(
                 model=deep_model, api_key=api_key, base_url=base_url,
                 max_daily_calls=max_daily_calls, usage_path=usage_path,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=timeout_seconds, max_tokens=max_tokens,
             )
         else:
             print(f"build_provider_clients: 供应商 {name!r} 的format {fmt!r} 未知,跳过", flush=True)
