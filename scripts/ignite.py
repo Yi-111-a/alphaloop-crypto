@@ -308,23 +308,32 @@ def build_provider_clients(config: dict) -> dict:
         trader_model = provider_cfg.get("trader_model")
         deep_model = provider_cfg.get("deep_model")
         auth_mode = provider_cfg.get("auth", "api_key")  # "api_key"(x-api-key,默认) | "auth_token"(Bearer)
+        # 每供应商可覆盖的读超时(2026-07-16大脑德比第一轮实测:kimi-k2.7
+        # 这类思考模型对完整交易prompt的单次响应可以超过客户端默认的180s,
+        # httpx.ReadTimeout→anthropic.APITimeoutError→该分支整个决策周期
+        # 作废,虽然30分钟后的下一轮会自愈,但持续超时=该大脑永远饿死)。
+        timeout_seconds = float(provider_cfg.get("timeout_seconds", 180.0))
         if fmt == "anthropic":
             routine = AnthropicLLMClient(
                 model=trader_model, max_daily_calls=max_daily_calls,
                 base_url=base_url, usage_path=usage_path, api_key=api_key, auth=auth_mode,
+                timeout_seconds=timeout_seconds,
             )
             deep = AnthropicLLMClient(
                 model=deep_model, max_daily_calls=max_daily_calls,
                 base_url=base_url, usage_path=usage_path, api_key=api_key, auth=auth_mode,
+                timeout_seconds=timeout_seconds,
             )
         elif fmt == "openai":
             routine = OpenAIChatLLMClient(
                 model=trader_model, api_key=api_key, base_url=base_url,
                 max_daily_calls=max_daily_calls, usage_path=usage_path,
+                timeout_seconds=timeout_seconds,
             )
             deep = OpenAIChatLLMClient(
                 model=deep_model, api_key=api_key, base_url=base_url,
                 max_daily_calls=max_daily_calls, usage_path=usage_path,
+                timeout_seconds=timeout_seconds,
             )
         else:
             print(f"build_provider_clients: 供应商 {name!r} 的format {fmt!r} 未知,跳过", flush=True)
