@@ -124,6 +124,7 @@ import copy
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -829,6 +830,65 @@ def evaluate_tactic_tournament(
     return events
 
 
+_HORIZON_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([mhd])$")
+
+
+def parse_horizon_ms(horizon: str) -> Optional[int]:
+    """把决策里声明的论点有效期("4h"/"12h"/"1d"/"30m")解析成毫秒;解析不了
+    或为0返回None(=不做到期强平,宁可漏过不误杀)。"""
+    if not isinstance(horizon, str):
+        return None
+    m = _HORIZON_RE.match(horizon.strip().lower())
+    if not m:
+        return None
+    value = float(m.group(1))
+    unit_ms = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}[m.group(2)]
+    ms = int(value * unit_ms)
+    return ms if ms > 0 else None
+
+
+def find_horizon_expired_positions(
+    open_positions: dict[str, set], latest_decisions: dict, now_ms: int
+) -> list[tuple[str, str, int]]:
+    """horizon到期强平的选取逻辑(纯函数,2026-07-16用户要求"特定时间平仓"):
+
+    每笔非hold决策都声明了horizon(论点有效期)——此前它只是Reflector判定
+    应验/证伪的窗口,仓位本身到期后继续无限期漂移,"hold是最省力输出"让
+    逆势旧仓越积越多(实测存量27多/3空,而修复后的新开仓已是9多/5空)。
+    现在让horizon成为真承诺:某仓位对应的最近一笔open/adjust决策的
+    ts+horizon < now,即判到期,由调用方确定性强平——继续持有必须在之后的
+    周期里给出全新论点重新建仓,论点不许无限期免检。
+
+    open_positions: {branch: set(symbol)};latest_decisions:
+    {(branch, symbol): decision_dict(最近一笔open/adjust)};返回
+    [(branch, symbol, expired_at_ms)]。horizon解析失败的仓位跳过(不误杀)。"""
+    expired: list[tuple[str, str, int]] = []
+    for branch, symbols in open_positions.items():
+        for symbol in symbols:
+            d = latest_decisions.get((branch, symbol))
+            if not d:
+                continue
+            horizon_ms = parse_horizon_ms(d.get("horizon", ""))
+            if horizon_ms is None:
+                continue
+            expiry = int(d.get("ts", 0)) + horizon_ms
+            if now_ms > expiry:
+                expired.append((branch, symbol, expiry))
+    return expired
+
+
+def load_latest_position_decisions() -> dict:
+    """从 decisions.jsonl 建 {(branch, symbol): 最近一笔open/adjust决策}。
+    hold/close不算——hold不代表新论点,close后仓位已不在。每次全量读文件,
+    第三代刚清零文件很小;将来大了再优化,不提前设计。"""
+    latest: dict = {}
+    records = log_writer.read_jsonl("decisions.jsonl", root=LOG_ROOT)
+    for d in records:
+        if d.get("action") in ("open_long", "open_short", "adjust"):
+            latest[(d.get("branch", "main"), d.get("symbol"))] = d
+    return latest
+
+
 def evaluate_cull(
     roster: dict, now_ms: int, tournament_cfg: dict, nav_series_lookup=None
 ) -> Optional[dict]:
@@ -1436,6 +1496,42 @@ def main() -> None:
                     print(f"[{now}] 紧急风控平仓触发: {risk_result['triggered']}", flush=True)
             except Exception:  # noqa: BLE001
                 print(f"[{now}] run_risk_check_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
+
+            # horizon到期确定性强平(2026-07-16用户要求"特定时间平仓",与
+            # 风控哨兵共用每小时节拍,见 find_horizon_expired_positions 的
+            # docstring)。确定性动作,不经过Trader/LLM——这是让每笔决策里
+            # 声明的论点有效期从装饰变成真承诺。
+            if (config.get("risk_check", {}) or {}).get("enforce_horizon_expiry", True):
+                try:
+                    latest_pos_decisions = load_latest_position_decisions()
+                    open_pos_map: dict[str, set] = {}
+                    all_sims = {"main": scheduler.simulators["main"], **evo_simulators}
+                    for b, s in all_sims.items():
+                        if s.positions:
+                            open_pos_map[b] = set(s.positions.keys())
+                    for branch_x, symbol_x, expired_at in find_horizon_expired_positions(
+                        open_pos_map, latest_pos_decisions, now
+                    ):
+                        sim_x = all_sims.get(branch_x)
+                        pos_x = sim_x.positions.get(symbol_x) if sim_x else None
+                        if pos_x is None:
+                            continue
+                        close_decision = main_module.Decision(
+                            ts=now, symbol=symbol_x, action="close", target_notional_pct=0.0,
+                            leverage=pos_x.leverage,
+                            thesis=(
+                                f"论点有效期(horizon)到期,确定性平仓——该仓位最近一次论点声明的"
+                                f"horizon已于{expired_at}过期,继续持有必须在后续周期给出全新论点。"
+                            ),
+                            falsifier="本决策为horizon到期机制触发,不设新的可证伪主张。",
+                            horizon="0h", branch=branch_x,
+                        )
+                        sim_x.log_decision(close_decision)
+                        next_bar_x = next_bar_provider(symbol_x, now)
+                        sim_x.execute(close_decision, next_bar_x)
+                        print(f"[{now}] [{branch_x}] horizon到期强平: {symbol_x}", flush=True)
+                except Exception:  # noqa: BLE001
+                    print(f"[{now}] horizon到期强平 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
             last_risk_check_ms = now
 
         # 用户要求(2026-07-14):面板"未实现盈亏"要更实时,不要跟风控哨兵

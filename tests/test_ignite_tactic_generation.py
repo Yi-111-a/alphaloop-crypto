@@ -244,3 +244,54 @@ class TestEvaluateCull:
         }
         event = ignite.evaluate_cull(roster, now, CULL_CFG, nav_series_lookup=lookup.get)
         assert event["branch"] == "evo/b"
+
+
+# ---------------------------------------------------------------------------
+# horizon到期强平(2026-07-16用户要求"特定时间平仓"):论点有效期从装饰
+# 变成真承诺。
+# ---------------------------------------------------------------------------
+
+
+class TestHorizonExpiry:
+    def test_parse_horizon_ms(self):
+        assert ignite.parse_horizon_ms("4h") == 4 * 3_600_000
+        assert ignite.parse_horizon_ms("30m") == 30 * 60_000
+        assert ignite.parse_horizon_ms("1d") == 86_400_000
+        assert ignite.parse_horizon_ms("1.5h") == int(1.5 * 3_600_000)
+        assert ignite.parse_horizon_ms("0h") is None       # 0=不强平
+        assert ignite.parse_horizon_ms("永远") is None      # 解析不了不误杀
+        assert ignite.parse_horizon_ms("") is None
+        assert ignite.parse_horizon_ms(None) is None
+
+    def test_expired_position_selected(self):
+        now = 100 * HOUR_MS
+        open_pos = {"main": {"BTC/USDT:USDT"}}
+        latest = {("main", "BTC/USDT:USDT"): {"ts": now - 13 * HOUR_MS, "horizon": "12h"}}
+        expired = ignite.find_horizon_expired_positions(open_pos, latest, now)
+        assert len(expired) == 1
+        assert expired[0][0] == "main" and expired[0][1] == "BTC/USDT:USDT"
+
+    def test_unexpired_position_kept(self):
+        now = 100 * HOUR_MS
+        open_pos = {"main": {"BTC/USDT:USDT"}}
+        latest = {("main", "BTC/USDT:USDT"): {"ts": now - 5 * HOUR_MS, "horizon": "12h"}}
+        assert ignite.find_horizon_expired_positions(open_pos, latest, now) == []
+
+    def test_adjust_renews_the_clock(self):
+        """adjust也算新论点声明——最近一笔open/adjust的ts起算,不是最初开仓时间。"""
+        now = 100 * HOUR_MS
+        open_pos = {"evo/x": {"ETH/USDT:USDT"}}
+        # 开仓在20小时前(horizon 12h早过了),但6小时前adjust续期过
+        latest = {("evo/x", "ETH/USDT:USDT"): {"ts": now - 6 * HOUR_MS, "horizon": "12h"}}
+        assert ignite.find_horizon_expired_positions(open_pos, latest, now) == []
+
+    def test_unparseable_horizon_skipped(self):
+        now = 100 * HOUR_MS
+        open_pos = {"main": {"BTC/USDT:USDT"}}
+        latest = {("main", "BTC/USDT:USDT"): {"ts": 0, "horizon": "看情况"}}
+        assert ignite.find_horizon_expired_positions(open_pos, latest, now) == []
+
+    def test_position_without_decision_record_skipped(self):
+        now = 100 * HOUR_MS
+        open_pos = {"main": {"BTC/USDT:USDT"}}
+        assert ignite.find_horizon_expired_positions(open_pos, {}, now) == []

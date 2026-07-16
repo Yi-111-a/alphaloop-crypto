@@ -673,3 +673,194 @@ def test_download_archive_returns_none_on_404_not_treated_as_error(tmp_path, mon
     )
     assert result.empty
     assert list(result.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+# ----------------------------------------------------------------------
+# M9 感官扩展 1/2:fetch_spot_ohlcv(现货K线,供策略算basis用)
+# ----------------------------------------------------------------------
+
+
+class SpotAwareExchange(FakeExchange):
+    """记录每次 fetch_ohlcv 被调用时传入的 symbol——用来断言
+    fetch_spot_ohlcv 真的把永续symbol转成了现货symbol再调用交易所,而不是
+    原样传永续symbol进去。"""
+
+    def __init__(self):
+        super().__init__()
+        self.ohlcv_symbols_seen: list[str] = []
+
+    def fetch_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
+        self.ohlcv_symbols_seen.append(symbol)
+        return super().fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+
+
+class NoSpotMarketExchange(FakeExchange):
+    """模拟"这个symbol没有现货挂牌"的交易所:fetch_ohlcv 对现货symbol一律
+    抛异常(真实ccxt场景下通常是BadSymbol),永续symbol正常工作。"""
+
+    def fetch_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
+        if ":" not in symbol:
+            raise Exception(f"no spot market for {symbol}")
+        return super().fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+
+
+def test_fetch_spot_ohlcv_converts_perp_symbol_and_calls_exchange_with_spot_symbol(tmp_path):
+    fake = SpotAwareExchange()
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_spot_ohlcv("BTC/USDT:USDT", timeframe="4h", since=None, limit=3)
+
+    assert list(df.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+    assert len(df) == 3
+    assert fake.ohlcv_symbols_seen == ["BTC/USDT"]  # 永续":USDT"后缀被去掉了
+
+
+def test_fetch_spot_ohlcv_uses_cache_file_distinct_from_perp_cache(tmp_path):
+    """现货K线缓存文件名必须与永续K线的缓存文件区分开,不能混进同一个
+    文件互相污染。"""
+    cache_dir = tmp_path / "cache"
+    fake = FakeExchange()
+    dp = DataPipeline(cache_dir=cache_dir, exchange=fake, backoff_base_seconds=0.0)
+
+    dp.fetch_ohlcv("BTC/USDT:USDT", timeframe="4h", since=None, limit=3)
+    dp.fetch_spot_ohlcv("BTC/USDT:USDT", timeframe="4h", since=None, limit=3)
+
+    perp_cache = cache_dir / "ohlcv_BTC-USDT_USDT_4h.parquet"
+    spot_cache = cache_dir / "ohlcv_spot_BTC-USDT_4h.parquet"
+    assert perp_cache.exists()
+    assert spot_cache.exists()
+    assert perp_cache != spot_cache
+
+
+def test_fetch_spot_ohlcv_cache_avoids_second_network_call(tmp_path):
+    fake = FakeExchange()
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    dp.fetch_spot_ohlcv("BTC/USDT:USDT", timeframe="4h", since=0, limit=5)
+    calls_after_first = fake.ohlcv_calls
+    assert calls_after_first > 0
+
+    dp.fetch_spot_ohlcv("BTC/USDT:USDT", timeframe="4h", since=0, limit=5)
+    assert fake.ohlcv_calls == calls_after_first  # 零新增网络调用
+
+
+def test_fetch_spot_ohlcv_returns_empty_dataframe_when_spot_market_unavailable(tmp_path):
+    """现货没上市/交易所不认识这个symbol时,返回空DataFrame,不抛异常——
+    这是"增强感官输入"的既有约定。"""
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=NoSpotMarketExchange(), backoff_base_seconds=0.0)
+
+    df = dp.fetch_spot_ohlcv("BTC/USDT:USDT", timeframe="4h", since=0, limit=5)
+
+    assert df.empty
+    assert list(df.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+# ----------------------------------------------------------------------
+# M9 感官扩展 2/2:fetch_open_interest_history(持仓量OI历史)
+# ----------------------------------------------------------------------
+
+
+class OIAwareExchange(FakeExchange):
+    """模拟真实ccxt fetch_open_interest_history 的返回结构(见
+    site-packages/ccxt/okx.py 约7509-7550行 parse_open_interest 与
+    base/exchange.py 约7867行 safe_open_interest 规整后的dict形状):每条
+    至少含 timestamp/openInterestValue/openInterestAmount 三个键。"""
+
+    def __init__(self, n: int = 5, use_amount_field: bool = False):
+        super().__init__()
+        self.n = n
+        self.use_amount_field = use_amount_field
+        self.oi_calls = 0
+        self.oi_call_args: list[tuple] = []
+
+    def fetch_open_interest_history(self, symbol, timeframe="1d", since=None, limit=None, params=None):
+        self.oi_calls += 1
+        self.oi_call_args.append((symbol, since, limit))
+        start = since if since is not None else 0
+        step = 86_400_000  # 1天(与ccxt默认timeframe='1d'一致)
+        rows = []
+        for i in range(self.n):
+            ts = start + i * step
+            if self.use_amount_field:
+                rows.append({"timestamp": ts, "openInterestValue": None, "openInterestAmount": 1000.0 + i})
+            else:
+                rows.append({"timestamp": ts, "openInterestValue": 2_000_000.0 + i, "openInterestAmount": None})
+        return rows
+
+
+def test_fetch_open_interest_history_shape_and_maps_open_interest_value(tmp_path):
+    fake = OIAwareExchange(n=4)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_open_interest_history("BTC/USDT:USDT", since=0, limit=4)
+
+    assert list(df.columns) == ["timestamp", "open_interest"]
+    assert len(df) == 4
+    assert df["open_interest"].iloc[0] == pytest.approx(2_000_000.0)
+
+
+def test_fetch_open_interest_history_falls_back_to_open_interest_amount_when_value_missing(tmp_path):
+    """非OKX/期权市场等只填openInterestAmount不填openInterestValue的场景,
+    应回退取openInterestAmount(自行拍板的字段选择,见data_pipeline.py
+    模块docstring)。"""
+    fake = OIAwareExchange(n=3, use_amount_field=True)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_open_interest_history("BTC/USDT:USDT", since=0, limit=3)
+
+    assert df["open_interest"].iloc[0] == pytest.approx(1000.0)
+
+
+def test_fetch_open_interest_history_cache_avoids_second_call(tmp_path):
+    fake = OIAwareExchange(n=5)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    dp.fetch_open_interest_history("BTC/USDT:USDT", since=0, limit=5)
+    calls_after_first = fake.oi_calls
+    assert calls_after_first > 0
+
+    dp.fetch_open_interest_history("BTC/USDT:USDT", since=0, limit=5)
+    assert fake.oi_calls == calls_after_first  # 零新增网络调用
+
+
+def test_fetch_open_interest_history_returns_empty_when_exchange_missing_method(tmp_path):
+    """交易所对象压根没有实现 fetch_open_interest_history 时(getattr探测
+    失败),优雅降级为空DataFrame,不尝试调用一个不存在的方法。"""
+    fake = FakeExchange()  # 本文件顶部的FakeExchange没有实现这个方法
+    assert not hasattr(fake, "fetch_open_interest_history")
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    df = dp.fetch_open_interest_history("BTC/USDT:USDT", since=0, limit=5)
+
+    assert df.empty
+    assert list(df.columns) == ["timestamp", "open_interest"]
+
+
+def test_fetch_open_interest_history_returns_empty_when_exchange_raises(tmp_path):
+    """交易所实现了这个方法但调用抛异常(比如真实OKX对某个symbol/某段
+    since返回NotSupported或网络异常)时,同样优雅降级为空DataFrame,不
+    向上抛异常——OI是增强感官输入,不该打断整个决策/回测流程。"""
+
+    class RaisingOIExchange(FakeExchange):
+        def fetch_open_interest_history(self, symbol, timeframe="1d", since=None, limit=None, params=None):
+            raise RuntimeError("simulated: OKX history too short for requested since")
+
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=RaisingOIExchange(), backoff_base_seconds=0.0)
+
+    df = dp.fetch_open_interest_history("BTC/USDT:USDT", since=0, limit=5)
+
+    assert df.empty
+    assert list(df.columns) == ["timestamp", "open_interest"]
+
+
+def test_fetch_open_interest_history_single_call_unchanged_when_since_is_none(tmp_path):
+    """since=None 时不改变既有的单次调用(向下游其它方法的既定约定看齐:
+    since有值才代表调用方要"从某个历史起点到现在"）。这里只关心调用不炸、
+    参数原样透传给底层交易所方法,不额外做分页。"""
+    fake = OIAwareExchange(n=2)
+    dp = DataPipeline(cache_dir=tmp_path / "cache", exchange=fake, backoff_base_seconds=0.0)
+
+    dp.fetch_open_interest_history("BTC/USDT:USDT", since=None, limit=3)
+
+    assert fake.oi_calls == 1
+    assert fake.oi_call_args == [("BTC/USDT:USDT", None, 3)]

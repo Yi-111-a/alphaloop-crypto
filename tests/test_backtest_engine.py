@@ -78,11 +78,21 @@ class StubDataPipeline:
     方法,签名与 LOCKED.data_pipeline.DataPipeline 完全一致,但直接从内存里
     的合成 DataFrame 切片返回,不碰磁盘/网络——保证测试完全离线确定性。"""
 
-    def __init__(self, ohlcv_by_symbol: dict[str, pd.DataFrame], funding_by_symbol: dict[str, pd.DataFrame] | None = None):
+    def __init__(
+        self,
+        ohlcv_by_symbol: dict[str, pd.DataFrame],
+        funding_by_symbol: dict[str, pd.DataFrame] | None = None,
+        spot_by_symbol: dict[str, pd.DataFrame] | None = None,
+        oi_by_symbol: dict[str, pd.DataFrame] | None = None,
+    ):
         self.ohlcv_by_symbol = ohlcv_by_symbol
         self.funding_by_symbol = funding_by_symbol or {}
+        self.spot_by_symbol = spot_by_symbol or {}
+        self.oi_by_symbol = oi_by_symbol or {}
         self.ohlcv_calls = 0
         self.funding_calls = 0
+        self.spot_calls = 0
+        self.oi_calls = 0
 
     def fetch_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
         self.ohlcv_calls += 1
@@ -98,6 +108,24 @@ class StubDataPipeline:
         df = self.funding_by_symbol.get(symbol)
         if df is None:
             return pd.DataFrame(columns=["timestamp", "funding_rate"])
+        if since is not None:
+            df = df[df["timestamp"] >= since]
+        return df.head(limit).reset_index(drop=True)
+
+    def fetch_spot_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
+        self.spot_calls += 1
+        df = self.spot_by_symbol.get(symbol)
+        if df is None:
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        if since is not None:
+            df = df[df["timestamp"] >= since]
+        return df.head(limit).reset_index(drop=True)
+
+    def fetch_open_interest_history(self, symbol, since=None, limit=1000):
+        self.oi_calls += 1
+        df = self.oi_by_symbol.get(symbol)
+        if df is None:
+            return pd.DataFrame(columns=["timestamp", "open_interest"])
         if since is not None:
             df = df[df["timestamp"] >= since]
         return df.head(limit).reset_index(drop=True)
@@ -151,8 +179,14 @@ def make_allin_leverage_strategy():
     return _strategy
 
 
-def make_engine(tmp_path: Path, ohlcv_by_symbol: dict[str, pd.DataFrame], funding_by_symbol: dict[str, pd.DataFrame] | None = None) -> tuple[BacktestEngine, StubDataPipeline]:
-    dp = StubDataPipeline(ohlcv_by_symbol, funding_by_symbol)
+def make_engine(
+    tmp_path: Path,
+    ohlcv_by_symbol: dict[str, pd.DataFrame],
+    funding_by_symbol: dict[str, pd.DataFrame] | None = None,
+    spot_by_symbol: dict[str, pd.DataFrame] | None = None,
+    oi_by_symbol: dict[str, pd.DataFrame] | None = None,
+) -> tuple[BacktestEngine, StubDataPipeline]:
+    dp = StubDataPipeline(ohlcv_by_symbol, funding_by_symbol, spot_by_symbol, oi_by_symbol)
     engine = BacktestEngine(config=load_config(), data_pipeline=dp, scratch_root=tmp_path / "scratch")
     return engine, dp
 
@@ -472,5 +506,203 @@ def test_ctx_recent_funding_injected_alongside_recent_bars(tmp_path):
         return []
 
     engine.run(echo_strategy, [BTC], [window], experiment_id="exp_funding_injected")
+
+    assert seen_non_empty["flag"] is True
+
+
+# ---------------------------------------------------------------------------
+# M9 感官扩展:ctx.recent_spot(现货K线) —— 与 ctx.recent_funding 同一套
+# 时间边界铁律测试,逐字照抄上面几条funding测试的手法。
+# ---------------------------------------------------------------------------
+
+
+def test_ctx_recent_spot_never_leaks_future_data(tmp_path):
+    """未来函数检测(照抄 test_ctx_recent_funding_never_leaks_future_data):
+    回放过程中任何一个bar喂给策略的ctx.recent_spot,其内部时间戳的最大值
+    绝不能超过该bar的ctx.ts。"""
+    n = 30
+    ohlcv = make_wavy_ohlcv(n)
+    spot_df = make_wavy_ohlcv(n, price=49_900.0)  # 现货价格与永续小幅有差,模拟真实basis
+
+    engine, _ = make_engine(tmp_path, {BTC: ohlcv}, spot_by_symbol={BTC: spot_df})
+    window = BacktestWindow(label="val_1", start_ts=BASE_TS, end_ts=BASE_TS + n * STEP_MS)
+
+    observed = []
+
+    def echo_strategy(ctx):
+        sdf = ctx.recent_spot.get(BTC)
+        max_ts = int(sdf["timestamp"].max()) if sdf is not None and not sdf.empty else None
+        observed.append((ctx.ts, max_ts))
+        return []
+
+    engine.run(echo_strategy, [BTC], [window], experiment_id="exp_spot_boundary")
+
+    assert observed, "expected the echo strategy to be invoked at least once"
+    assert any(max_ts is not None for _, max_ts in observed), (
+        "expected at least some bars to see non-empty spot data (otherwise this test is vacuous)"
+    )
+
+    for ctx_ts, max_spot_ts in observed:
+        if max_spot_ts is None:
+            continue
+        assert max_spot_ts <= ctx_ts, (
+            "future function detected: ctx.recent_spot max timestamp %r > ctx.ts %r"
+            % (max_spot_ts, ctx_ts)
+        )
+        assert max_spot_ts == ctx_ts - 1, (
+            "expected max spot timestamp to be exactly ctx.ts - 1 (cursor cutoff == cur_ts), "
+            "got %r for ctx.ts=%r" % (max_spot_ts, ctx_ts)
+        )
+
+
+def test_ctx_recent_spot_is_empty_dataframe_when_symbol_has_no_spot_data(tmp_path):
+    """窗口内某symbol完全没有现货数据时(比如该symbol只上了永续没上现货),
+    ctx.recent_spot[symbol]必须是一个列齐全的空DataFrame,而不是该symbol
+    缺key/None。"""
+    n = 10
+    ohlcv = make_flat_ohlcv(n)
+    engine, _ = make_engine(tmp_path, {BTC: ohlcv})  # 不提供任何spot_by_symbol
+    window = BacktestWindow(label="val_1", start_ts=BASE_TS, end_ts=BASE_TS + n * STEP_MS)
+
+    probe = {}
+
+    def echo_strategy(ctx):
+        if "checked" not in probe:
+            sdf = ctx.recent_spot.get(BTC)
+            probe["checked"] = True
+            probe["is_dataframe"] = isinstance(sdf, pd.DataFrame)
+            probe["is_empty"] = sdf.empty if sdf is not None else None
+            probe["columns"] = list(sdf.columns) if sdf is not None else None
+        return []
+
+    engine.run(echo_strategy, [BTC], [window], experiment_id="exp_spot_empty")
+
+    assert probe.get("checked") is True
+    assert probe["is_dataframe"] is True
+    assert probe["is_empty"] is True
+    assert probe["columns"] == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_ctx_recent_spot_injected_alongside_recent_bars(tmp_path):
+    """基本注入验收:有真实现货数据时,ctx.recent_spot确实被填充。"""
+    n = 15
+    ohlcv = make_wavy_ohlcv(n)
+    spot_df = make_wavy_ohlcv(n, price=49_950.0)
+    engine, _ = make_engine(tmp_path, {BTC: ohlcv}, spot_by_symbol={BTC: spot_df})
+    window = BacktestWindow(label="val_1", start_ts=BASE_TS, end_ts=BASE_TS + n * STEP_MS)
+
+    seen_non_empty = {"flag": False}
+
+    def echo_strategy(ctx):
+        sdf = ctx.recent_spot.get(BTC)
+        if sdf is not None and not sdf.empty:
+            seen_non_empty["flag"] = True
+            assert set(sdf.columns) >= {"timestamp", "open", "high", "low", "close", "volume"}
+        return []
+
+    engine.run(echo_strategy, [BTC], [window], experiment_id="exp_spot_injected")
+
+    assert seen_non_empty["flag"] is True
+
+
+# ---------------------------------------------------------------------------
+# M9 感官扩展:ctx.recent_oi(持仓量历史) —— 同一套时间边界铁律测试。
+# ---------------------------------------------------------------------------
+
+
+def test_ctx_recent_oi_never_leaks_future_data(tmp_path):
+    """未来函数检测(照抄 test_ctx_recent_funding_never_leaks_future_data)。"""
+    n = 30
+    ohlcv = make_wavy_ohlcv(n)
+    oi_df = pd.DataFrame(
+        {
+            "timestamp": [BASE_TS + i * STEP_MS for i in range(n)],
+            "open_interest": [1_000_000.0 + i * 100 for i in range(n)],
+        }
+    )
+
+    engine, _ = make_engine(tmp_path, {BTC: ohlcv}, oi_by_symbol={BTC: oi_df})
+    window = BacktestWindow(label="val_1", start_ts=BASE_TS, end_ts=BASE_TS + n * STEP_MS)
+
+    observed = []
+
+    def echo_strategy(ctx):
+        odf = ctx.recent_oi.get(BTC)
+        max_ts = int(odf["timestamp"].max()) if odf is not None and not odf.empty else None
+        observed.append((ctx.ts, max_ts))
+        return []
+
+    engine.run(echo_strategy, [BTC], [window], experiment_id="exp_oi_boundary")
+
+    assert observed, "expected the echo strategy to be invoked at least once"
+    assert any(max_ts is not None for _, max_ts in observed), (
+        "expected at least some bars to see non-empty OI data (otherwise this test is vacuous)"
+    )
+
+    for ctx_ts, max_oi_ts in observed:
+        if max_oi_ts is None:
+            continue
+        assert max_oi_ts <= ctx_ts, (
+            "future function detected: ctx.recent_oi max timestamp %r > ctx.ts %r"
+            % (max_oi_ts, ctx_ts)
+        )
+        assert max_oi_ts == ctx_ts - 1, (
+            "expected max OI timestamp to be exactly ctx.ts - 1 (cursor cutoff == cur_ts), "
+            "got %r for ctx.ts=%r" % (max_oi_ts, ctx_ts)
+        )
+
+
+def test_ctx_recent_oi_is_empty_dataframe_when_symbol_has_no_oi_data(tmp_path):
+    """窗口内某symbol完全没有OI数据时(OKX的OI历史深度可能只有几十天,
+    远窗口边界之外的symbol/时段完全没有数据是预期场景),
+    ctx.recent_oi[symbol]必须是一个列齐全的空DataFrame,而不是该symbol
+    缺key/None。"""
+    n = 10
+    ohlcv = make_flat_ohlcv(n)
+    engine, _ = make_engine(tmp_path, {BTC: ohlcv})  # 不提供任何oi_by_symbol
+    window = BacktestWindow(label="val_1", start_ts=BASE_TS, end_ts=BASE_TS + n * STEP_MS)
+
+    probe = {}
+
+    def echo_strategy(ctx):
+        if "checked" not in probe:
+            odf = ctx.recent_oi.get(BTC)
+            probe["checked"] = True
+            probe["is_dataframe"] = isinstance(odf, pd.DataFrame)
+            probe["is_empty"] = odf.empty if odf is not None else None
+            probe["columns"] = list(odf.columns) if odf is not None else None
+        return []
+
+    engine.run(echo_strategy, [BTC], [window], experiment_id="exp_oi_empty")
+
+    assert probe.get("checked") is True
+    assert probe["is_dataframe"] is True
+    assert probe["is_empty"] is True
+    assert probe["columns"] == ["timestamp", "open_interest"]
+
+
+def test_ctx_recent_oi_injected_alongside_recent_bars(tmp_path):
+    """基本注入验收:有真实OI数据时,ctx.recent_oi确实被填充。"""
+    n = 15
+    ohlcv = make_wavy_ohlcv(n)
+    oi_df = pd.DataFrame(
+        {
+            "timestamp": [BASE_TS + i * STEP_MS for i in range(n)],
+            "open_interest": [2_000_000.0] * n,
+        }
+    )
+    engine, _ = make_engine(tmp_path, {BTC: ohlcv}, oi_by_symbol={BTC: oi_df})
+    window = BacktestWindow(label="val_1", start_ts=BASE_TS, end_ts=BASE_TS + n * STEP_MS)
+
+    seen_non_empty = {"flag": False}
+
+    def echo_strategy(ctx):
+        odf = ctx.recent_oi.get(BTC)
+        if odf is not None and not odf.empty:
+            seen_non_empty["flag"] = True
+            assert set(odf.columns) >= {"timestamp", "open_interest"}
+        return []
+
+    engine.run(echo_strategy, [BTC], [window], experiment_id="exp_oi_injected")
 
     assert seen_non_empty["flag"] is True

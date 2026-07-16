@@ -193,8 +193,10 @@ def build_ledger_record(
     holdout_edge_vs_benchmark_pct: Optional[float],
     wall_time_seconds: float,
     revert_reason: Optional[str] = None,
+    holdout_trade_count: Optional[int] = None,
+    holdout_return_pct: Optional[float] = None,
 ) -> dict:
-    """schema 逐字遵守任务说明里列出的字段集合,另加两个向后兼容的新字段:
+    """schema 逐字遵守任务说明里列出的字段集合,另加四个向后兼容的新字段:
 
     - revert_reason:kept时为None;status=="reverted"时按触发原因区分——
       "insufficient_trades"(任务2:验证窗口trade_count总和不足门槛,直接
@@ -205,8 +207,19 @@ def build_ledger_record(
       class,其余来源为None。写进ledger是为了下次
       collect_known_strategy_classes()能认出"这个类别已经出现过"，不需要
       额外的状态文件。
+    - holdout_trade_count / holdout_return_pct(本次改动新增,修"holdout
+      躺赢"缺陷):分别来自 results['holdout'].trade_count 和
+      results['holdout'].return_pct(绝对收益,不是edge)。动机——实测发现
+      holdout窗口BTC大跌期间,8个在holdout里零交易的策略全部得到完全相同
+      的 holdout_edge_vs_benchmark_pct(因为它们的持仓/净值曲线在holdout
+      全程都是"没有任何操作",edge纯粹等于"跑赢/跑输BTC基准"的镜像,不是
+      策略自己的能力)。这两个字段让下游(人工review/研究总监prompt)能
+      识别"这个holdout_edge到底有没有参考价值"——holdout_trade_count==0时
+      holdout_edge_vs_benchmark_pct不代表任何真实的策略能力,只是基准
+      涨跌的镜像。lint_failed/backtest_failed状态下(回测从未跑起来)
+      两个字段均为None,与holdout_edge_vs_benchmark_pct同一处理口径。
 
-    读旧行(不含这两个key)的调用方一律用 .get(...) 取值,缺字段不会报错——
+    读旧行(不含这四个key)的调用方一律用 .get(...) 取值,缺字段不会报错——
     向后兼容是字段新增的硬要求,不是可选项。"""
     return {
         "experiment_id": experiment_id,
@@ -222,6 +235,8 @@ def build_ledger_record(
         "wall_time_seconds": wall_time_seconds,
         "revert_reason": revert_reason,
         "strategy_class": idea.strategy_class,
+        "holdout_trade_count": holdout_trade_count,
+        "holdout_return_pct": holdout_return_pct,
     }
 
 
@@ -922,6 +937,11 @@ def run_single_experiment(
     val_trade_count = compute_val_trade_count(results)
     holdout_result = results.get("holdout")
     holdout_edge = holdout_result.edge_vs_benchmark_pct if holdout_result is not None else None
+    # 修"holdout躺赢"缺陷:同时记下holdout窗口的真实交易笔数与绝对收益,
+    # 供下游识别"这个holdout_edge是不是零交易的镜像分数"(见
+    # build_ledger_record docstring)。
+    holdout_trade_count = int(holdout_result.trade_count) if holdout_result is not None else None
+    holdout_return_pct = float(holdout_result.return_pct) if holdout_result is not None else None
 
     # ---- 任务2:最小样本量门槛——比分数判定更前置,总交易笔数不够直接
     # revert,分数再好也不算数(见 config.yaml backtest.min_val_trades 注释:
@@ -951,6 +971,7 @@ def run_single_experiment(
         val_edge_vs_benchmark_pct=val_edge, val_max_drawdown_pct=val_dd,
         holdout_edge_vs_benchmark_pct=holdout_edge, wall_time_seconds=wall_time_seconds,
         revert_reason=revert_reason,
+        holdout_trade_count=holdout_trade_count, holdout_return_pct=holdout_return_pct,
     )
     append_ledger(ctx.ledger_path, record)
     print_fn(
@@ -1052,10 +1073,14 @@ def collect_known_strategy_classes(ledger_entries: list[dict], policy_descriptio
 
 
 def _summarize_trajectory(ledger_entries: list[dict]) -> list[str]:
+    # holdout_trade_count/holdout_return_pct(本次改动新增,修"holdout躺赢"
+    # 缺陷)一并带上,让总监能看到"这条holdout_edge是不是零交易的镜像分数"——
+    # 见 build_ledger_record docstring 与 build_director_prompt 里的专门提示。
     return [
         f"- policy_id={e.get('policy_id')} hypothesis={(e.get('hypothesis') or '')[:60]!r} "
         f"status={e.get('status')} val_edge={e.get('val_edge_vs_benchmark_pct')} "
-        f"val_dd={e.get('val_max_drawdown_pct')} holdout_edge={e.get('holdout_edge_vs_benchmark_pct')}"
+        f"val_dd={e.get('val_max_drawdown_pct')} holdout_edge={e.get('holdout_edge_vs_benchmark_pct')} "
+        f"holdout_trade_count={e.get('holdout_trade_count')} holdout_return_pct={e.get('holdout_return_pct')}"
         for e in ledger_entries
     ]
 
@@ -1085,8 +1110,11 @@ def build_director_prompt(
         "'真正做研究'。",
         "",
         "## 实验轨迹(全部ledger记录:policy_id/hypothesis/status/"
-        "val_edge/val_dd/holdout_edge)",
+        "val_edge/val_dd/holdout_edge/holdout_trade_count/holdout_return_pct)",
         "\n".join(trajectory_lines) if trajectory_lines else "(尚无实验记录,冷启动)",
+        "注意:holdout_trade_count=0 的策略,其holdout edge只是基准涨跌的"
+        "镜像,不代表策略能力——评估轨迹/挑选参照对象时请忽略这类记录的"
+        "holdout表现,不要把它当作该策略在holdout窗口上真实验证过的信号。",
         "",
         "## 分支死亡/晋升档案(LOG/tactic_promotions.jsonl)",
         "\n".join(death_lines) if death_lines else "(尚无记录)",

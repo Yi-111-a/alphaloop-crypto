@@ -20,6 +20,17 @@ scripts/backfill_history.py —— M6 一次性历史数据回填脚本。
 (config.yaml data.history_days,当前 730 天;上市不满 730 天的币种则补齐
 到"上市以来全部历史")。
 
+M9 感官扩展(研究总监备忘录里要的两只新"眼睛",顺带回填):除永续K线/
+资金费率历史外,现在还会为每个symbol回填:
+  - 现货K线(DataPipeline.fetch_spot_ohlcv):供策略计算现货溢价basis用。
+  - 持仓量(OI)历史(DataPipeline.fetch_open_interest_history):OKX侧
+    这项数据的可用历史深度实测/文档均显示明显短于K线/资金费率(只有
+    几十天量级,交易所自身数据保留策略的限制),回填时如实按实际拿到
+    的跨度打印,不因为"没拿满history_days"而报错——这是预期内的正常
+    现象,不是本脚本或DataPipeline的缺陷。
+这两项都和既有的OHLCV/资金费率回填一样,单个symbol失败/没有数据不应该
+中止整个回填批次,同样各自单独try/except并打印。
+
 跑法(**本机网络时断时续,不要在本机跑这个脚本**——按用户/任务要求,这个
 脚本只负责"写出来",实际执行留到网络稳定的服务器上):
     cd alphaloop
@@ -134,6 +145,32 @@ def backfill(dp: DataPipeline, symbols: list[str], history_days: int, timeframe:
             print(f"  funding_rate_history: {len(funding)} 条, 跨度约 {span_days:.1f} 天", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"  funding_rate_history 拉取失败,跳过: {exc!r}", flush=True)
+
+        # M9:现货K线回填(供策略计算现货溢价basis用)。
+        try:
+            spot = dp.fetch_spot_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=100_000)
+            span_days = (
+                (int(spot["timestamp"].max()) - int(spot["timestamp"].min())) / MS_PER_DAY
+                if not spot.empty
+                else 0.0
+            )
+            print(f"  spot_ohlcv({timeframe}): {len(spot)} 根K线, 跨度约 {span_days:.1f} 天", flush=True)
+        except Exception as exc:  # noqa: BLE001 - 单个symbol没有现货对应/拉取失败不应该中止整个回填批次
+            print(f"  spot_ohlcv({timeframe}) 拉取失败,跳过: {exc!r}", flush=True)
+
+        # M9:持仓量(OI)历史回填。OKX侧这项数据的可用历史深度实测/文档均
+        # 显示明显短于K线/资金费率(只有几十天量级,交易所自身限制),如实
+        # 打印实际拿到的跨度,不是错误。
+        try:
+            oi = dp.fetch_open_interest_history(symbol, since=since_ms, limit=100_000)
+            span_days = (
+                (int(oi["timestamp"].max()) - int(oi["timestamp"].min())) / MS_PER_DAY
+                if not oi.empty
+                else 0.0
+            )
+            print(f"  open_interest_history: {len(oi)} 条, 跨度约 {span_days:.1f} 天(OKX历史深度通常远短于{history_days}天,属预期)", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  open_interest_history 拉取失败,跳过: {exc!r}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> None:

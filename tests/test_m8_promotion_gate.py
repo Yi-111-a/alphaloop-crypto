@@ -759,6 +759,37 @@ class _FundingRecordingDataPipeline:
         )
 
 
+class _SpotOIRecordingDataPipeline:
+    """M9离线fake:fetch_ohlcv固定返回空K线(本节测试只关心spot/OI注入),
+    fetch_spot_ohlcv/fetch_open_interest_history各自记录调用参数,可选按
+    symbol模拟拉取失败。手法与 _FundingRecordingDataPipeline 完全一致。"""
+
+    def __init__(self, spot_by_symbol=None, oi_by_symbol=None, raise_spot_for=None, raise_oi_for=None):
+        self.spot_by_symbol = spot_by_symbol or {}
+        self.oi_by_symbol = oi_by_symbol or {}
+        self.raise_spot_for = raise_spot_for or set()
+        self.raise_oi_for = raise_oi_for or set()
+        self.spot_calls: list[tuple[str, int]] = []
+        self.oi_calls: list[tuple[str, int, int]] = []
+
+    def fetch_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    def fetch_spot_ohlcv(self, symbol, timeframe="4h", since=None, limit=1000):
+        self.spot_calls.append((symbol, limit))
+        if symbol in self.raise_spot_for:
+            raise RuntimeError(f"synthetic spot fetch failure for {symbol}")
+        return self.spot_by_symbol.get(
+            symbol, pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        )
+
+    def fetch_open_interest_history(self, symbol, since=None, limit=1000):
+        self.oi_calls.append((symbol, since, limit))
+        if symbol in self.raise_oi_for:
+            raise RuntimeError(f"synthetic OI fetch failure for {symbol}")
+        return self.oi_by_symbol.get(symbol, pd.DataFrame(columns=["timestamp", "open_interest"]))
+
+
 def _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module):
     """monkeypatch掉 ASSET.strategy.policy_trader.load_policy,让
     DispatchingTrader.decide() 拿到 _RecordingPolicyModule 而不是真的从磁盘
@@ -851,3 +882,135 @@ def test_dispatching_trader_handles_data_pipeline_without_funding_method(monkeyp
     fdf = ctx.recent_funding["BTC/USDT:USDT"]
     assert fdf.empty
     assert list(fdf.columns) == ["timestamp", "funding_rate"]
+
+
+# ===========================================================================
+# M9新增:DispatchingTrader.decide() 里的 ctx.recent_spot / ctx.recent_oi
+# 前向注入——与上面ctx.recent_funding的几条测试逐字照抄同一套手法。
+# ===========================================================================
+
+
+def test_dispatching_trader_injects_recent_spot_into_ctx(monkeypatch):
+    """基本注入验收:ctx.recent_spot里确实出现了data_pipeline返回的现货
+    K线数据,且拉取的limit与recent_bars用的是同一个值
+    (REQUIRED_HISTORY_BARS + _HISTORY_BUFFER_BARS)。"""
+    import ASSET.strategy.policy_trader as policy_trader_module
+
+    spot_df = pd.DataFrame({
+        "timestamp": [BASE_TS - 1000], "open": [49_900.0], "high": [49_950.0],
+        "low": [49_850.0], "close": [49_900.0], "volume": [10.0],
+    })
+    dp = _SpotOIRecordingDataPipeline(spot_by_symbol={"BTC/USDT:USDT": spot_df})
+    policy_module = _RecordingPolicyModule()
+    dispatcher = _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module)
+
+    dispatcher.decide(ts=BASE_TS, positions=[], latest_snapshot={"BTC/USDT:USDT": {"last": 50_000.0}})
+
+    assert len(policy_module.seen_ctxs) == 1
+    ctx = policy_module.seen_ctxs[0]
+    assert "BTC/USDT:USDT" in ctx.recent_spot
+    pd.testing.assert_frame_equal(
+        ctx.recent_spot["BTC/USDT:USDT"].reset_index(drop=True),
+        spot_df.reset_index(drop=True),
+    )
+    expected_limit = policy_module.REQUIRED_HISTORY_BARS + policy_trader_module._HISTORY_BUFFER_BARS
+    assert dp.spot_calls == [("BTC/USDT:USDT", expected_limit)]
+
+
+def test_dispatching_trader_injects_recent_oi_into_ctx(monkeypatch):
+    """基本注入验收:ctx.recent_oi里确实出现了data_pipeline返回的OI数据,
+    且拉取参数(since/limit)符合"近30天"的设计。"""
+    import ASSET.strategy.policy_trader as policy_trader_module
+
+    oi_df = pd.DataFrame({"timestamp": [BASE_TS - 1000], "open_interest": [3_000_000.0]})
+    dp = _SpotOIRecordingDataPipeline(oi_by_symbol={"BTC/USDT:USDT": oi_df})
+    policy_module = _RecordingPolicyModule()
+    dispatcher = _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module)
+
+    dispatcher.decide(ts=BASE_TS, positions=[], latest_snapshot={"BTC/USDT:USDT": {"last": 50_000.0}})
+
+    assert len(policy_module.seen_ctxs) == 1
+    ctx = policy_module.seen_ctxs[0]
+    assert "BTC/USDT:USDT" in ctx.recent_oi
+    pd.testing.assert_frame_equal(
+        ctx.recent_oi["BTC/USDT:USDT"].reset_index(drop=True),
+        oi_df.reset_index(drop=True),
+    )
+    assert dp.oi_calls == [
+        (
+            "BTC/USDT:USDT",
+            BASE_TS - policy_trader_module._OI_LOOKBACK_MS,
+            policy_trader_module._OI_FETCH_LIMIT,
+        )
+    ]
+
+
+def test_dispatching_trader_spot_and_oi_cache_hit_within_ten_minutes(monkeypatch):
+    """同一个symbol在10分钟memo缓存窗口内,recent_spot/recent_oi都只真正
+    拉取一次;超过窗口后应该再拉一次——手法与ctx.recent_funding的同款测试
+    一致,这里对spot/OI两个缓存分别断言。"""
+    dp = _SpotOIRecordingDataPipeline()
+    policy_module = _RecordingPolicyModule()
+    dispatcher = _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module)
+    snapshot = {"BTC/USDT:USDT": {"last": 50_000.0}}
+
+    dispatcher.decide(ts=BASE_TS, positions=[], latest_snapshot=snapshot)
+    dispatcher.decide(ts=BASE_TS + 5 * 60_000, positions=[], latest_snapshot=snapshot)  # 5分钟后,仍在缓存窗口内
+    assert len(dp.spot_calls) == 1, "expected the second call (5 minutes later) to hit the spot cache"
+    assert len(dp.oi_calls) == 1, "expected the second call (5 minutes later) to hit the OI cache"
+
+    dispatcher.decide(ts=BASE_TS + 11 * 60_000, positions=[], latest_snapshot=snapshot)  # 超过10分钟缓存窗口
+    assert len(dp.spot_calls) == 2, "expected a fresh spot fetch once the 10-minute cache window has elapsed"
+    assert len(dp.oi_calls) == 2, "expected a fresh OI fetch once the 10-minute cache window has elapsed"
+
+
+def test_dispatching_trader_spot_fetch_failure_yields_empty_dataframe_not_exception(monkeypatch):
+    """data_pipeline.fetch_spot_ohlcv 抛异常时,decide() 不应该跟着崩——
+    现货K线是增强感官输入,不是决策周期能否完成的前提。"""
+    dp = _SpotOIRecordingDataPipeline(raise_spot_for={"BTC/USDT:USDT"})
+    policy_module = _RecordingPolicyModule()
+    dispatcher = _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module)
+
+    result = dispatcher.decide(ts=BASE_TS, positions=[], latest_snapshot={"BTC/USDT:USDT": {"last": 50_000.0}})
+
+    assert result == []
+    ctx = policy_module.seen_ctxs[0]
+    sdf = ctx.recent_spot["BTC/USDT:USDT"]
+    assert sdf.empty
+    assert list(sdf.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_dispatching_trader_oi_fetch_failure_yields_empty_dataframe_not_exception(monkeypatch):
+    """data_pipeline.fetch_open_interest_history 抛异常时,decide() 不应该
+    跟着崩——OI是增强感官输入,不是决策周期能否完成的前提。"""
+    dp = _SpotOIRecordingDataPipeline(raise_oi_for={"BTC/USDT:USDT"})
+    policy_module = _RecordingPolicyModule()
+    dispatcher = _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module)
+
+    result = dispatcher.decide(ts=BASE_TS, positions=[], latest_snapshot={"BTC/USDT:USDT": {"last": 50_000.0}})
+
+    assert result == []
+    ctx = policy_module.seen_ctxs[0]
+    odf = ctx.recent_oi["BTC/USDT:USDT"]
+    assert odf.empty
+    assert list(odf.columns) == ["timestamp", "open_interest"]
+
+
+def test_dispatching_trader_handles_data_pipeline_without_spot_or_oi_methods(monkeypatch):
+    """向后兼容:data_pipeline 是本文件既有的 FakeDataPipeline(只实现了
+    fetch_ohlcv,压根没有fetch_spot_ohlcv/fetch_open_interest_history方法)
+    ——这是M9升级前所有既有测试都在用的替身,升级后必须继续零改动可用。"""
+    bars = _make_bars(5, base_price=50_000.0, drift_pct=0.0)
+    dp = FakeDataPipeline({"BTC/USDT:USDT": bars})
+    policy_module = _RecordingPolicyModule()
+    dispatcher = _make_dispatcher_with_stub_policy(monkeypatch, dp, policy_module)
+
+    dispatcher.decide(ts=BASE_TS, positions=[], latest_snapshot={"BTC/USDT:USDT": {"last": 50_000.0}})
+
+    ctx = policy_module.seen_ctxs[0]
+    sdf = ctx.recent_spot["BTC/USDT:USDT"]
+    odf = ctx.recent_oi["BTC/USDT:USDT"]
+    assert sdf.empty
+    assert list(sdf.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+    assert odf.empty
+    assert list(odf.columns) == ["timestamp", "open_interest"]

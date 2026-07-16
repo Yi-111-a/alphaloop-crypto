@@ -285,6 +285,51 @@ def test_full_round_kept_commits_protocol_then_result_in_order(tmp_path, monkeyp
     assert ledger_records[0]["experiment_id"] == record["experiment_id"]
 
 
+def test_full_round_records_holdout_trade_count_and_return_pct_for_zero_trade_holdout(tmp_path, monkeypatch):
+    """修"holdout躺赢"缺陷的核心验收:holdout窗口零交易(trade_count=0)时,
+    ledger记录里的holdout_trade_count必须真实反映0,holdout_return_pct必须
+    是holdout窗口的绝对收益(return_pct),而不是edge_vs_benchmark_pct——
+    这两个字段是下游识别"这条holdout_edge是不是纯粹的基准镜像"的依据。"""
+    repo = init_repo(tmp_path)
+    monkeypatch.setattr(rl, "BacktestEngine", FakeBacktestEngine)
+    FakeBacktestEngine.injected_results = {
+        "train": _make_result("train", edge_pct=999.0),
+        "val_1": _make_result("val_1", edge_pct=5.0, max_dd_pct=1.0),
+        "val_2": _make_result("val_2", edge_pct=3.0, max_dd_pct=1.0),
+        "holdout": _make_result("holdout", edge_pct=12.4177, is_holdout=True, trade_count=0),
+    }
+    llm = make_llm_sequence([GOOD_POLICY_SOURCE])
+    ctx = make_ctx(repo, llm)
+
+    record = rl.run_single_experiment(ctx, experiment_index=0, dry_run=False, print_fn=lambda s: None)
+
+    assert record["holdout_trade_count"] == 0
+    # _make_result 把 return_pct 也设成了 edge_pct(见helper注释,单测里两者
+    # 同值),这里断言的是"确实取自return_pct这个字段"而不是巧合——用一个
+    # edge与return不同的场景在下面的build_ledger_record单测里单独覆盖。
+    assert record["holdout_return_pct"] == pytest.approx(12.4177)
+
+
+def test_build_ledger_record_holdout_return_pct_is_absolute_return_not_edge():
+    """holdout_return_pct 必须来自 BacktestResult.return_pct(绝对收益),
+    不是 edge_vs_benchmark_pct——用两者不同值的场景直接验证不会被搞混。"""
+    idea = rl.Idea(
+        source="seed_variant", policy_id="momentum_v2", parent_policy_id="momentum_v1",
+        hypothesis="test hypothesis", reference_policy_id="momentum_v1",
+    )
+    record = rl.build_ledger_record(
+        experiment_id="momentum_v2_0000", idea=idea,
+        commit_sha_protocol="aaa", commit_sha_result="bbb", status="kept",
+        val_edge_vs_benchmark_pct=1.0, val_max_drawdown_pct=0.5,
+        holdout_edge_vs_benchmark_pct=12.4177,  # 与真实BTC跌14%场景一致的镜像edge
+        wall_time_seconds=3.0,
+        holdout_trade_count=0, holdout_return_pct=-2.3,  # 策略自己的绝对收益,与edge不同
+    )
+    assert record["holdout_trade_count"] == 0
+    assert record["holdout_return_pct"] == pytest.approx(-2.3)
+    assert record["holdout_edge_vs_benchmark_pct"] == pytest.approx(12.4177)
+
+
 def test_full_round_reverted_has_no_result_commit_and_file_restored(tmp_path, monkeypatch):
     repo = init_repo(tmp_path)
     monkeypatch.setattr(rl, "BacktestEngine", FakeBacktestEngine)
@@ -474,7 +519,8 @@ REQUIRED_LEDGER_FIELDS = {
     "commit_sha_protocol", "commit_sha_result", "status",
     "val_edge_vs_benchmark_pct", "val_max_drawdown_pct",
     "holdout_edge_vs_benchmark_pct", "wall_time_seconds",
-    "revert_reason", "strategy_class",  # 本次改动新增的两个向后兼容字段
+    "revert_reason", "strategy_class",  # 向后兼容字段(此前一次改动新增)
+    "holdout_trade_count", "holdout_return_pct",  # 本次改动新增:修"holdout躺赢"缺陷
 }
 
 
@@ -670,6 +716,25 @@ def test_build_director_prompt_contains_trajectory_and_death_archive_and_classes
     assert "evo/20260701-carry" in prompt
     assert "momentum" in prompt
     assert "directions" in prompt
+
+
+def test_build_director_prompt_warns_about_zero_trade_holdout_being_a_mirror_score():
+    """修"holdout躺赢"缺陷:prompt里必须包含holdout_trade_count/
+    holdout_return_pct这两个字段,以及提醒总监"holdout_trade_count=0的策略
+    其holdout edge只是基准涨跌镜像"的那句话——否则总监会被8个零交易策略
+    "完全相同的高edge"这种假象误导,认为它们都是有效策略。"""
+    ledger_entries = [
+        {"policy_id": "aggressive_v1", "hypothesis": "零交易躺赢", "status": "reverted",
+         "val_edge_vs_benchmark_pct": -1.0, "val_max_drawdown_pct": 0.0,
+         "holdout_edge_vs_benchmark_pct": 12.4177, "holdout_trade_count": 0, "holdout_return_pct": 0.0},
+    ]
+    prompt = rl.build_director_prompt(
+        ledger_entries, [], {"aggressive_v1": "激进战术"}, known_classes=["aggressive"],
+    )
+    assert "holdout_trade_count" in prompt
+    assert "holdout_return_pct" in prompt
+    assert "holdout_trade_count=0" in prompt
+    assert "镜像" in prompt
 
 
 # ---------------------------------------------------------------------------

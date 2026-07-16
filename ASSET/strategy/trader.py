@@ -70,6 +70,40 @@ _HOLD_FALLBACK_SYMBOL = "BTC/USDT:USDT"
 _HYPOTHESIS_RE = re.compile(r"H\d+")
 
 
+def _position_trend_audit(positions, latest_snapshot: dict) -> str:
+    """逐仓对照当前趋势,点名"逆势持仓"(2026-07-16,见调用处注释)。
+
+    判定标准从严:该symbol的24h与7d涨跌方向一致、且都与持仓方向相反,才算
+    逆势(只看单边窗口容易把正常回调误报成逆势,噪声报警会让模型学会无视
+    这段文字)。positions鸭子类型兼容PerpPosition对象和dict两种形态。"""
+    audits: list[str] = []
+    pos_list = positions.values() if isinstance(positions, dict) else positions
+    for p in pos_list:
+        symbol = getattr(p, "symbol", None) or (p.get("symbol") if isinstance(p, dict) else None)
+        side = getattr(p, "side", None) or (p.get("side") if isinstance(p, dict) else None)
+        if not symbol or side not in ("long", "short"):
+            continue
+        ticker = latest_snapshot.get(symbol)
+        if not isinstance(ticker, dict):
+            continue
+        chg24 = ticker.get("chg_24h_pct")
+        chg7 = ticker.get("chg_7d_pct")
+        if not isinstance(chg24, (int, float)) or not isinstance(chg7, (int, float)):
+            continue
+        against_long = side == "long" and chg24 < 0 and chg7 < 0
+        against_short = side == "short" and chg24 > 0 and chg7 > 0
+        if against_long or against_short:
+            audits.append(f"{symbol} {side} (24h {chg24:+.1f}%, 7d {chg7:+.1f}%)")
+    if not audits:
+        return ""
+    return (
+        "POSITION-VS-TREND AUDIT -- these open positions are COUNTER-TREND on both 24h "
+        "and 7d windows: " + "; ".join(audits) + ". For EACH of them you must this cycle "
+        "either close it, or explicitly defend keeping it as a mean-reversion thesis with "
+        "a falsifier. Silently holding a counter-trend position is not an acceptable output."
+    )
+
+
 def _market_regime_line(latest_snapshot: dict) -> str:
     """从快照的 chg_24h_pct/chg_7d_pct 字段(由 scripts/ignite.py 的
     snapshot_provider 注入)汇总一行"大势"描述,直接放进 Trader prompt。
@@ -383,6 +417,16 @@ class Trader:
             # 它连"全场都在跌"都不知道,只能凭当前价瞎猜方向。
             lines.append("")
             lines.append(regime_line)
+        audit_line = _position_trend_audit(
+            context.get("positions") or [], context.get("latest_snapshot") or {}
+        )
+        if audit_line:
+            # 持仓-趋势审计(2026-07-16用户观察"还是大部分做多":方向修复后
+            # 新仓位已经9多/5空,但存量27多/3空——旧的逆势仓位靠"hold是最省力
+            # 输出"无限期漂移,没有机制逼模型重新审视。这里逐仓点名,要么平
+            # 要么显式辩护,沉默续持不再是可接受的默认。)
+            lines.append("")
+            lines.append(audit_line)
         if retry_feedback:
             lines.append("")
             lines.append(

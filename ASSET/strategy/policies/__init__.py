@@ -107,6 +107,24 @@ class StrategyContext:
                           隐式假设。carry_v1.py 就是这么写的，示例:
                               funding_map = getattr(ctx, "recent_funding", {})
                               fdf = funding_map.get(symbol)
+      recent_spot    symbol -> 现货K线DataFrame(列同recent_bars:
+                     ["timestamp","open","high","low","close","volume"]),
+                     按timestamp升序排列,只包含<=ctx.ts的记录(与
+                     recent_funding同源的时间边界纪律)。basis(现货溢价,
+                     basis = perp_close/spot_close - 1)由策略代码自己算,
+                     本字段只提供原料——ctx本身不预先算好这个衍生指标,
+                     理由与"snapshot只给last价格、不预先算收益率"是同一种
+                     设计原则。带默认值{}(field(default_factory=dict)),
+                     是M9新增字段,既有构造点不传它也不能报错;策略代码
+                     读取时同样应该用
+                     `getattr(ctx, 'recent_spot', {})` 这种防御性写法
+                     (理由与recent_funding完全一致,见上文)。
+      recent_oi      symbol -> 持仓量(OI)历史DataFrame(列
+                     ["timestamp","open_interest"],与
+                     LOCKED.data_pipeline.OI_COLUMNS同构),按timestamp升序
+                     排列,只包含<=ctx.ts的记录。带默认值{}
+                     (field(default_factory=dict)),是M9新增字段,读取
+                     方式与recent_spot/recent_funding同一套防御性约定。
     """
 
     ts: int
@@ -115,6 +133,8 @@ class StrategyContext:
     recent_bars: dict[str, "pd.DataFrame"]
     memory_context: list[str] = field(default_factory=list)
     recent_funding: dict[str, "pd.DataFrame"] = field(default_factory=dict)
+    recent_spot: dict[str, "pd.DataFrame"] = field(default_factory=dict)
+    recent_oi: dict[str, "pd.DataFrame"] = field(default_factory=dict)
 
 
 StrategyFn = Callable[[StrategyContext], list[Decision]]

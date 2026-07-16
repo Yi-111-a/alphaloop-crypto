@@ -410,6 +410,19 @@ def test_strategy_context_recent_funding_defaults_to_empty_dict_without_crashing
     assert ctx.recent_funding == {}
 
 
+def test_strategy_context_recent_spot_and_recent_oi_default_to_empty_dict_without_crashing():
+    """M9新增的recent_spot/recent_oi字段同recent_funding一样,不传也不能
+    报错,默认值是空dict(而不是None)。"""
+    ctx = StrategyContext(
+        ts=1_700_000_000_000,
+        positions={},
+        snapshot={},
+        recent_bars={},
+    )
+    assert ctx.recent_spot == {}
+    assert ctx.recent_oi == {}
+
+
 @pytest.mark.parametrize("policy_id", ["momentum_v1", "aggressive_v1", "conservative_v1", "diversified_v1"])
 @pytest.mark.parametrize("ctx_factory", [_trending_ctx, _flat_ctx], ids=["trending", "flat"])
 def test_non_carry_seed_policies_ignore_recent_funding_field(policy_id, ctx_factory):
@@ -434,5 +447,41 @@ def test_non_carry_seed_policies_ignore_recent_funding_field(policy_id, ctx_fact
         recent_funding={sym: funding_df for sym in ctx_base.snapshot},
     )
     decisions_with = module.decide(ctx_with_funding)
+
+    assert decisions_without == decisions_with
+
+
+@pytest.mark.parametrize("policy_id", POLICY_IDS)
+@pytest.mark.parametrize("ctx_factory", [_trending_ctx, _flat_ctx], ids=["trending", "flat"])
+def test_all_seed_policies_ignore_recent_spot_and_recent_oi_fields(policy_id, ctx_factory):
+    """M9新增的recent_spot/recent_oi字段:全部5个种子策略(含carry_v1)目前
+    都不读这两个字段——只有recent_funding被carry_v1消费,basis/OI感官暂时
+    还没有任何种子策略消费它。往ctx里塞进非空的recent_spot/recent_oi数据,
+    断言输出与不塞时逐字段相同,确保加字段这件事本身不悄悄改变任何既有
+    策略在任何合成场景下的输出。"""
+    module = load_policy(policy_id)
+
+    ctx_without = ctx_factory()
+    decisions_without = module.decide(ctx_without)
+
+    ctx_base = ctx_factory()
+    spot_df = pd.DataFrame(
+        {
+            "timestamp": [ctx_base.ts - 1000],
+            "open": [99.0], "high": [100.0], "low": [98.0], "close": [99.5], "volume": [1000.0],
+        }
+    )
+    oi_df = pd.DataFrame({"timestamp": [ctx_base.ts - 1000], "open_interest": [5_000_000.0]})
+    ctx_with_extra_senses = StrategyContext(
+        ts=ctx_base.ts,
+        positions=ctx_base.positions,
+        snapshot=ctx_base.snapshot,
+        recent_bars=ctx_base.recent_bars,
+        memory_context=ctx_base.memory_context,
+        recent_funding=ctx_base.recent_funding,
+        recent_spot={sym: spot_df for sym in ctx_base.snapshot},
+        recent_oi={sym: oi_df for sym in ctx_base.snapshot},
+    )
+    decisions_with = module.decide(ctx_with_extra_senses)
 
     assert decisions_without == decisions_with
