@@ -69,6 +69,27 @@ _HOLD_FALLBACK_SYMBOL = "BTC/USDT:USDT"
 
 _HYPOTHESIS_RE = re.compile(r"H\d+")
 
+# horizon可解析性校验用的解析器——与 scripts/ignite.py::parse_horizon_ms 保持
+# 同一语法(那边是执行侧,这边是准入侧;这边从严:范围写法'2-4 weeks'在准入
+# 时也拒绝,要求模型给一个确定的期限,存量记录的宽容解析由执行侧负责)。
+_HORIZON_VALIDATION_RE = re.compile(
+    r"^(\d+(?:\.\d+)?)\s*(m|min|minutes?|h|hrs?|hours?|d|days?|w|wks?|weeks?)$"
+)
+_HORIZON_VALIDATION_UNIT_MS = {
+    "m": 60_000, "min": 60_000, "minute": 60_000, "minutes": 60_000,
+    "h": 3_600_000, "hr": 3_600_000, "hrs": 3_600_000, "hour": 3_600_000, "hours": 3_600_000,
+    "d": 86_400_000, "day": 86_400_000, "days": 86_400_000,
+    "w": 604_800_000, "wk": 604_800_000, "wks": 604_800_000, "week": 604_800_000, "weeks": 604_800_000,
+}
+
+
+def _parse_horizon_for_validation(horizon: str) -> Optional[int]:
+    m = _HORIZON_VALIDATION_RE.match(horizon.strip().lower())
+    if not m:
+        return None
+    ms = int(float(m.group(1)) * _HORIZON_VALIDATION_UNIT_MS[m.group(2)])
+    return ms if ms > 0 else None
+
 
 def _position_trend_audit(positions, latest_snapshot: dict) -> str:
     """逐仓对照当前趋势,点名"逆势持仓"(2026-07-16,见调用处注释)。
@@ -270,6 +291,15 @@ def _validate_decision_dict(
     horizon = d.get("horizon")
     if not isinstance(horizon, str) or not horizon.strip():
         errors.append("horizon_invalid: must be non-empty str")
+    elif action != "hold" and _parse_horizon_for_validation(horizon) is None:
+        # 2026-07-16:horizon现在是真承诺(到期确定性强平,见scripts/ignite.py
+        # 的find_horizon_expired_positions)——上线首日模型用"2 weeks"/"soon"等
+        # 自由文本让17/29笔持仓逃过了到期检查,这里从源头强制可解析格式。
+        errors.append(
+            f"horizon_invalid: {horizon!r} is not machine-parseable. Use a bare "
+            "number+unit like '30m', '12h', '3d', '1w' (this horizon is ENFORCED: "
+            "the position is force-closed when it expires, so state it precisely)."
+        )
 
     ts = d.get("ts")
     if not isinstance(ts, int) or isinstance(ts, bool):

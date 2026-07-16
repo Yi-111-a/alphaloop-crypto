@@ -295,3 +295,14 @@ class TestHorizonExpiry:
         now = 100 * HOUR_MS
         open_pos = {"main": {"BTC/USDT:USDT"}}
         assert ignite.find_horizon_expired_positions(open_pos, {}, now) == []
+
+    def test_parse_horizon_freeform_variants(self):
+        """2026-07-16实测扩容:模型用自由文本写有效期,17/29笔持仓逃检。"""
+        W = 604_800_000
+        assert ignite.parse_horizon_ms("1w") == W
+        assert ignite.parse_horizon_ms("2 weeks") == 2 * W
+        assert ignite.parse_horizon_ms("1 day") == 86_400_000
+        assert ignite.parse_horizon_ms("3 days") == 3 * 86_400_000
+        assert ignite.parse_horizon_ms("2-4 weeks") == 4 * W  # 范围取上界=承诺最多4周
+        assert ignite.parse_horizon_ms("48 hours") == 48 * 3_600_000
+        assert ignite.parse_horizon_ms("soon") is None  # 纯口语还是不认

@@ -830,20 +830,33 @@ def evaluate_tactic_tournament(
     return events
 
 
-_HORIZON_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([mhd])$")
+_HORIZON_RE = re.compile(
+    r"^(\d+(?:\.\d+)?)"                      # 数值
+    r"(?:\s*-\s*(\d+(?:\.\d+)?))?"           # 可选范围上界("2-4 weeks"取上界)
+    r"\s*(m|min|minutes?|h|hrs?|hours?|d|days?|w|wks?|weeks?)$"  # 单位
+)
+_HORIZON_UNIT_MS = {
+    "m": 60_000, "min": 60_000, "minute": 60_000, "minutes": 60_000,
+    "h": 3_600_000, "hr": 3_600_000, "hrs": 3_600_000, "hour": 3_600_000, "hours": 3_600_000,
+    "d": 86_400_000, "day": 86_400_000, "days": 86_400_000,
+    "w": 604_800_000, "wk": 604_800_000, "wks": 604_800_000, "week": 604_800_000, "weeks": 604_800_000,
+}
 
 
 def parse_horizon_ms(horizon: str) -> Optional[int]:
-    """把决策里声明的论点有效期("4h"/"12h"/"1d"/"30m")解析成毫秒;解析不了
-    或为0返回None(=不做到期强平,宁可漏过不误杀)。"""
+    """把决策里声明的论点有效期解析成毫秒;解析不了或为0返回None(=不做
+    到期强平)。2026-07-16实测扩容:上线首日发现模型用自由文本写有效期
+    ("2 weeks"/"1 day"/"1w"/"2-4 weeks"),29笔持仓里17笔因解析失败而免检,
+    "宁可漏过不误杀"变成了事实上的逃生通道——现在支持周/天/范围写法
+    (范围取上界:声明"2-4周"意味着承诺最多4周)。同时trader.py的校验层
+    已开始强制新决策的horizon必须可解析,这里的宽容解析主要服务存量记录。"""
     if not isinstance(horizon, str):
         return None
     m = _HORIZON_RE.match(horizon.strip().lower())
     if not m:
         return None
-    value = float(m.group(1))
-    unit_ms = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}[m.group(2)]
-    ms = int(value * unit_ms)
+    value = float(m.group(2)) if m.group(2) else float(m.group(1))  # 范围取上界
+    ms = int(value * _HORIZON_UNIT_MS[m.group(3)])
     return ms if ms > 0 else None
 
 
