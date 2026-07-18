@@ -2,7 +2,9 @@
 
 **Different AI brains trade the same live market. The survivor takes over the main account.**
 
-English | [中文](README.md)
+English | [中文](README.md) | **[🔴 Live panel →](http://45.76.188.163:8080)**
+
+> That link is the ongoing competition: real-time NAV for all 6 brains, positions, and the full reasoning behind every decision, refreshed every minute.
 
 A 24/7 unattended crypto **paper-trading** evolution system (no real money). It doesn't backtest against canned data — it trades on live OKX market data with real funding-rate settlement, pitting multiple LLMs against each other in real time, while a nightly pipeline evolves deterministic strategy code through backtesting.
 
