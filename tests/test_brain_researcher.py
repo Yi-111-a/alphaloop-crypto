@@ -384,6 +384,87 @@ def test_propose_rejected_when_val_trade_count_below_min_threshold(tmp_path, mon
 # ---------------------------------------------------------------------------
 
 
+_CRASHY_POLICY_SOURCE = '''"""test-only: 猜了不存在的持仓字段,静态审查查不出,只有真调一次才暴露。"""
+from ASSET.strategy.policies import StrategyContext
+from LOCKED.schemas import Decision
+
+REQUIRED_HISTORY_BARS = 4
+DESCRIPTION = "test crashy policy"
+
+
+def decide(ctx: StrategyContext) -> list:
+    for _sym, pos in (ctx.positions or {}).items():
+        _ = pos.net_size  # PerpPosition没有这个字段 -> AttributeError
+    return []
+'''
+
+
+def _live_config():
+    return make_config(quant_derby={"proposal_cooldown_hours": 4, "gate_mode": "live"})
+
+
+def test_live_gate_accepts_without_backtest(tmp_path, monkeypatch):
+    """live模式(用户2026-07-19"不需要验证期,直接上手"):lint+冒烟通过即
+    上场,全程不碰BacktestEngine——这里故意不打桩引擎,若代码路径试图回测,
+    真实引擎会因缺数据报错,测试就会失败,以此证明确实没跑回测。"""
+    policies_dir, log_root = make_env(tmp_path)
+    (policies_dir / "flat_v1.py").write_text(GOOD_POLICY_SOURCE, encoding="utf-8")
+    meta = base_meta(policy_id="flat_v1")
+    llm = make_llm_sequence(
+        [json.dumps({"journal": "直接上场。", "action": "propose", "policy_code": CANDIDATE_POLICY_SOURCE})]
+    )
+
+    result = br.run_brain_review(
+        BRANCH, meta, llm, BASE_TS + HOUR_MS,
+        config=_live_config(), memory_store=FakeMemoryStore(),
+        nav_series_lookup=lambda b: [(BASE_TS, 100.0)],
+        market_context="(无)",
+        log_root=log_root, policies_dir=policies_dir, state={"version_counter": 0},
+    )
+
+    assert result["gate_result"]["verdict"] == "accepted"
+    assert result["gate_result"]["metrics"]["gate_mode"] == "live"
+    assert result["proposed_policy_id"] == "ark_kimi_v1"
+    assert "live关卡" in result["journal"]
+
+
+def test_live_gate_smoke_catches_runtime_crash(tmp_path, monkeypatch):
+    """带病代码(net_size式接口笔误)被冒烟调用拦下:不上线、verdict=
+    smoke_failed、不消耗提案冷却(下小时可带反馈重试)。"""
+    policies_dir, log_root = make_env(tmp_path)
+    (policies_dir / "flat_v1.py").write_text(GOOD_POLICY_SOURCE, encoding="utf-8")
+    meta = base_meta(policy_id="flat_v1")
+    llm = make_llm_sequence(
+        [json.dumps({"journal": "交一版带病代码。", "action": "propose", "policy_code": _CRASHY_POLICY_SOURCE})]
+    )
+
+    result = br.run_brain_review(
+        BRANCH, meta, llm, BASE_TS + HOUR_MS,
+        config=_live_config(), memory_store=FakeMemoryStore(),
+        nav_series_lookup=lambda b: [(BASE_TS, 100.0)],
+        market_context="(无)",
+        log_root=log_root, policies_dir=policies_dir, state={"version_counter": 0},
+    )
+
+    assert result["proposed_policy_id"] is None
+    assert result["gate_result"]["verdict"] == "smoke_failed"
+    assert "net_size" in (result["gate_result"].get("error") or "")
+    assert "last_proposal_ms" not in result["state"]
+
+
+def test_journals_survive_respawn_via_provider_filter(tmp_path):
+    """"死了就记住":复活后分支名变了(-g2),日志按provider过滤仍能读到
+    前世记录——大脑是永久选手,教训跨生死延续。"""
+    policies_dir, log_root = make_env(tmp_path)
+    br._append_brain_journal(
+        log_root, ts=BASE_TS, branch="evo/x-brain-ark-kimi", provider="ARK-Kimi",
+        journal="前世教训:杠杆太高爆仓了", action="keep", policy_id="p1",
+    )
+    records = br._read_recent_journals(log_root, "evo/x-brain-ark-kimi-g2", provider="ARK-Kimi")
+    assert len(records) == 1
+    assert "前世教训" in records[0]["journal"]
+
+
 def test_cold_start_exemption_waives_cooldown_on_seed_policy(tmp_path, monkeypatch):
     """冷启动豁免(用户2026-07-19"直接免除"):现任还是种子空仓策略时,
     冷却完全不生效——即使2小时前刚提过案,新提案照样直接进回测关卡。

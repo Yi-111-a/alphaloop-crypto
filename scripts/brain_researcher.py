@@ -63,10 +63,12 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from ASSET.strategy.policies import StrategyContext
 from ASSET.strategy.policy_lint import lint_policy_source
 from LOCKED.backtest_engine import BacktestEngine, BacktestWindow  # noqa: F401 (BacktestWindow 供测试/类型引用)
 from LOCKED.data_pipeline import DataPipeline
 from LOCKED.log_writer import append_jsonl, read_jsonl
+from LOCKED.schemas import Decision, PerpPosition  # noqa: F401 (冒烟测试构造/类型校验用)
 from scripts.llm_bridge import _strip_code_fences as strip_code_fences
 from scripts.research_loop import (
     build_default_windows,
@@ -169,9 +171,18 @@ def _next_candidate_policy_id(provider_slug: str, version_counter: int, policies
 # ---------------------------------------------------------------------------
 
 
-def _read_recent_journals(log_root: Path, branch: str, limit: int = _RECENT_JOURNAL_LIMIT) -> list[dict]:
+def _read_recent_journals(
+    log_root: Path, branch: str, provider: Optional[str] = None, limit: int = _RECENT_JOURNAL_LIMIT
+) -> list[dict]:
+    """按大脑身份(provider)优先过滤,分支名兜底(2026-07-19"死了就记住"
+    修正):复活后分支名从 evo/...-brain 变成 evo/...-brain-g2,按分支名查
+    日志会在每次死亡后失忆——大脑是永久选手,它的研究日志必须跨生死延续,
+    死因和教训才能真的带进下一世。provider为空(异常meta)时退回按分支名。"""
     records = read_jsonl(_JOURNAL_LOG_PATH, root=Path(log_root))
-    own = [r for r in records if r.get("branch") == branch]
+    if provider:
+        own = [r for r in records if r.get("provider") == provider]
+    else:
+        own = [r for r in records if r.get("branch") == branch]
     own.sort(key=lambda r: r.get("ts", 0))
     return own[-limit:]
 
@@ -427,6 +438,44 @@ def run_policy_gate(
             "violations": violations,
         }
 
+    # live模式(用户2026-07-19指令"不需要验证期,直接上手,上场如果死了
+    # 就记住然后下一次"):不跑历史回测,不比分数——lint合规+冒烟调用能跑,
+    # 就直接上场,生死由实盘锦标赛裁决(爆仓即死/末位斩杀),死亡教训通过
+    # 跨生死的研究日志(见_read_recent_journals按provider过滤)带进下一世。
+    # 保留的两道底线不是"验证期":静态审查挡作弊,冒烟挡"上场第一个执行
+    # 周期就崩"的带病代码(net_size那类接口笔误,静态审查查不出来)。
+    gate_mode = str((config.get("quant_derby", {}) or {}).get("gate_mode", "backtest"))
+    if gate_mode == "live":
+        try:
+            candidate_module = load_policy_from_dir(candidate_policy_id, policies_dir)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "verdict": "smoke_failed",
+                "candidate_policy_id": candidate_policy_id,
+                "incumbent_policy_id": incumbent_policy_id,
+                "candidate_score": None,
+                "incumbent_score": None,
+                "error": f"模块加载失败: {exc!r}",
+            }
+        smoke_error = _smoke_test_policy(candidate_module)
+        if smoke_error:
+            return {
+                "verdict": "smoke_failed",
+                "candidate_policy_id": candidate_policy_id,
+                "incumbent_policy_id": incumbent_policy_id,
+                "candidate_score": None,
+                "incumbent_score": None,
+                "error": smoke_error,
+            }
+        return {
+            "verdict": "accepted",
+            "candidate_policy_id": candidate_policy_id,
+            "incumbent_policy_id": incumbent_policy_id,
+            "candidate_score": None,
+            "incumbent_score": None,
+            "metrics": {"gate_mode": "live"},
+        }
+
     try:
         project_root = _infer_project_root(policies_dir)
         data_end_ts = determine_data_end_ts(config, project_root / "data_cache")
@@ -559,6 +608,55 @@ def _append_policy_gate_log(log_root: Path, *, ts: int, branch: str, gate_result
 # ---------------------------------------------------------------------------
 
 
+def _smoke_test_policy(module) -> Optional[str]:
+    """live模式的冒烟调用:用完全确定性的合成数据(等差价格序列)分别在
+    "带一个持仓"和"空仓"两种形状下各调一次decide(),验证代码活着——不检验
+    策略聪明与否(那是实盘锦标赛的事),只挡"上场第一个执行周期就崩"的
+    带病代码(2026-07-19教训:豆包猜了不存在的pos.net_size,静态审查查
+    不出属性错误,这类病必须真调一次才暴露)。返回None=通过,str=失败原因。"""
+    import pandas as pd  # noqa: PLC0415 -- 只有live冒烟需要,不拖累模块导入
+
+    n = 240
+    bars = pd.DataFrame({
+        "timestamp": [1_700_000_000_000 + i * 3_600_000 for i in range(n)],
+        "open": [100.0 + i * 0.1 for i in range(n)],
+        "high": [100.5 + i * 0.1 for i in range(n)],
+        "low": [99.5 + i * 0.1 for i in range(n)],
+        "close": [100.2 + i * 0.1 for i in range(n)],
+        "volume": [1000.0 + (i % 7) * 50.0 for i in range(n)],
+    })
+    ts = int(bars["timestamp"].iloc[-1])
+    symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+    last = float(bars["close"].iloc[-1])
+    with_position = {
+        "BTC/USDT:USDT": PerpPosition(
+            symbol="BTC/USDT:USDT", side="long", notional=20.0,
+            entry_price=last * 0.98, margin=10.0, leverage=2,
+        ),
+    }
+    for label, positions in (("带持仓", with_position), ("空仓", {})):
+        ctx = StrategyContext(
+            ts=ts,
+            positions=positions,
+            snapshot={s: {"last": last} for s in symbols},
+            recent_bars={s: bars.copy() for s in symbols},
+            memory_context=[],
+        )
+        try:
+            result = module.decide(ctx)
+        except Exception as exc:  # noqa: BLE001 -- 冒烟的意义就是捕获一切运行时病灶
+            return f"decide()在{label}冒烟调用中抛异常: {exc!r}\n{traceback.format_exc(limit=3)}"
+        if not isinstance(result, list):
+            return f"decide()在{label}冒烟调用中返回{type(result).__name__},必须是list"
+        for item in result:
+            if not isinstance(item, Decision):
+                return (
+                    f"decide()在{label}冒烟调用中返回了{type(item).__name__}元素,"
+                    "必须是LOCKED.schemas.Decision对象"
+                )
+    return None
+
+
 def _cooldown_status(state: dict, now_ms: int, cooldown_hours: float) -> tuple[bool, float]:
     last_proposal_ms = state.get("last_proposal_ms")
     if last_proposal_ms is None:
@@ -623,7 +721,7 @@ def run_brain_review(
             last_review_ms, now_ms, return_since_last_review_pct, current_drawdown_pct
         )
 
-        recent_journals = _read_recent_journals(log_root, branch)
+        recent_journals = _read_recent_journals(log_root, branch, provider=provider)
 
         project_root = _infer_project_root(policies_dir)
         direction_memo_summary = _read_direction_memo_summary(project_root, config)
@@ -727,18 +825,27 @@ def run_brain_review(
         # 里AttributeError)。回滚last_proposal_ms,让研究员下个小时就能带着
         # 关卡反馈重试,而不是被自己的笔误锁死4小时;真正跑完回测的提案
         # (accepted/rejected)照常消耗冷却,防噪声轰炸的初衷不变。
-        if verdict in ("lint_failed", "error"):
+        if verdict in ("lint_failed", "smoke_failed", "error"):
             if _prior_proposal_ms is None:
                 state.pop("last_proposal_ms", None)
             else:
                 state["last_proposal_ms"] = _prior_proposal_ms
+        _is_live_gate = (gate_result.get("metrics") or {}).get("gate_mode") == "live"
+        _accepted_note = (
+            f"live关卡通过(无回测验证):候选{candidate_policy_id}静态审查+冒烟调用通过,"
+            "已直接上场——生死由实盘锦标赛裁决,爆仓即死、死亡记录永久公示。"
+            if _is_live_gate
+            else f"回测关卡通过:候选{candidate_policy_id}分数({gate_result.get('candidate_score')})"
+            f"严格优于现任{current_policy_id}({gate_result.get('incumbent_score')}),已换码。"
+        )
         verdict_note = {
-            "accepted": f"回测关卡通过:候选{candidate_policy_id}分数({gate_result.get('candidate_score')})"
-            f"严格优于现任{current_policy_id}({gate_result.get('incumbent_score')}),已换码。",
+            "accepted": _accepted_note,
             "rejected": f"回测关卡未通过(reason={gate_result.get('reason')}):候选{candidate_policy_id}"
             f"分数({gate_result.get('candidate_score')})未能严格优于现任({gate_result.get('incumbent_score')}),"
             "策略文件留档但不上线。",
             "lint_failed": f"候选{candidate_policy_id}静态审查未通过,违规:{gate_result.get('violations')},不上线。",
+            "smoke_failed": f"候选{candidate_policy_id}冒烟调用失败(代码带病,上场第一个周期就会崩):"
+            f"{gate_result.get('error')},不上线。",
             "error": f"回测关卡运行异常:{gate_result.get('error')},不上线。",
         }.get(verdict, f"未知verdict={verdict!r}")
         full_journal = f"{journal_text}\n\n[系统] {verdict_note}"
