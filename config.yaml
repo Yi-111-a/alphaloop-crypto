@@ -134,7 +134,12 @@ funding:
   source: real                 # 用ccxt拉取真实资金费率结算,不自己复现溢价公式
 constraints:
   max_position_notional_pct: 100   # 单币名义仓位上限:不超过净值的100%(即单币最多10倍杠杆下用10%保证金)
-  max_total_notional_pct: 300      # 全组合名义敞口上限:净值的300%(总杠杆实际上限3倍,见说明)
+  max_total_notional_pct: 10000    # 用户2026-07-18:"300%上限也给去了"——大脑德比
+                                   # 全放开,总敞口上限设为实际不可能触及的10000%
+                                   # (单仓仍受max_position_notional_pct=100%约束,
+                                   # 13个标的理论极限1300%,远够不到这个数)。风险
+                                   # 控制交还给每个大脑自己:爆仓即死+15%回撤淘汰
+                                   # 就是全部的惩罚机制,这正是德比要比的东西
   min_free_margin_pct: 15          # 最低可用保证金比例
   max_drawdown_pct: 20             # 总回撤熔断线
   daily_loss_freeze_pct: 8         # 单日净值跌超8% → 冻结24h强制反思

@@ -369,7 +369,13 @@ def test_leverage_over_max_is_rejected(tmp_path, log_root, make_decision):
 
 
 def test_total_notional_over_limit_is_rejected(tmp_path, log_root, make_decision):
-    sim = make_sim(tmp_path, log_root, branch="total-notional-test")
+    # 生产config.yaml的max_total_notional_pct已按用户要求(2026-07-18
+    # "300%上限也给去了")放开到实际不可触及的10000——这里显式传一个带
+    # 300上限的config副本,测的是LOCKED/simulator.py里这条检查机制本身
+    # 仍然工作,不再依赖生产配置恰好是300。
+    cfg = load_config()
+    cfg = {**cfg, "constraints": {**cfg["constraints"], "max_total_notional_pct": 300}}
+    sim = make_sim(tmp_path, log_root, branch="total-notional-test", config=cfg)
     symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
     base_ts = 1_700_000_000_000
 
