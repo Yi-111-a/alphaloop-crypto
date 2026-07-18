@@ -440,6 +440,7 @@ def run_policy_gate(
 
         incumbent_score = 0.0
         incumbent_metrics: dict[str, Any] = {}
+        incumbent_val_trades: Optional[int] = None
         if incumbent_policy_id and (policies_dir / f"{incumbent_policy_id}.py").exists():
             incumbent_module = load_policy_from_dir(incumbent_policy_id, policies_dir)
             incumbent_results = engine.run(
@@ -447,15 +448,35 @@ def run_policy_gate(
             )
             incumbent_scoring = {label: r for label, r in incumbent_results.items() if label != "holdout"}
             incumbent_score = engine.score(incumbent_scoring)
+            incumbent_val_trades = compute_val_trade_count(incumbent_results)
             inc_edge, inc_dd = compute_val_stats(incumbent_results)
             incumbent_metrics = {"val_edge_vs_benchmark_pct": inc_edge, "val_max_drawdown_pct": inc_dd}
 
         min_val_trades = int((config.get("backtest", {}) or {}).get("min_val_trades", 10))
+
+        # "躺赢现任"修正(2026-07-19第五代开赛第一小时的真实教训):flat_v1
+        # 恒空仓作为现任,在BTC下跌的验证窗口里零交易白得+14.17的边际分
+        # (edge = 0% − 基准跌幅,gen3就发现并记录过的"躺赢 artifact"),
+        # 所有真实策略都被这个虚高门槛挡在场外——MiniMax交出+10.37的真实
+        # 策略也换不掉一个什么都不做的空壳,德比可能永远开不了场。修正
+        # 原则与候选侧的min_val_trades门槛完全对称:验证窗口交易笔数不足
+        # 的现任"没有足够证据证明它的分数是本事而不是artifact",丧失用
+        # 分数护体的资格,对照分数按0.0(=没有现任)处理——候选仍要通过
+        # 自己的全部关卡(lint/爆仓一票否决/min_val_trades/分数严格>0),
+        # 上线后的生死交给实盘锦标赛裁决,那才是斩杀机制存在的意义。
+        incumbent_effective_score = incumbent_score
+        incumbent_insufficient = (
+            incumbent_val_trades is not None and incumbent_val_trades < min_val_trades
+        )
+        if incumbent_insufficient:
+            incumbent_effective_score = 0.0
         metrics = {
             "candidate_val_trade_count": candidate_val_trades,
             "candidate_val_edge_vs_benchmark_pct": candidate_val_edge,
             "candidate_val_max_drawdown_pct": candidate_val_dd,
             "min_val_trades": min_val_trades,
+            "incumbent_val_trade_count": incumbent_val_trades,
+            "incumbent_insufficient_trades": incumbent_insufficient,
             **({f"incumbent_{k}": v for k, v in incumbent_metrics.items()} if incumbent_metrics else {}),
         }
 
@@ -463,7 +484,11 @@ def run_policy_gate(
             verdict = "rejected"
             reason = "insufficient_trades"
         else:
-            verdict = "accepted" if decide_keep_or_revert(candidate_score, incumbent_score) == "kept" else "rejected"
+            verdict = (
+                "accepted"
+                if decide_keep_or_revert(candidate_score, incumbent_effective_score) == "kept"
+                else "rejected"
+            )
             reason = None if verdict == "accepted" else "score_not_better"
 
         return {

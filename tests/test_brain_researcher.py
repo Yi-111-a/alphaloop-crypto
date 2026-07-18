@@ -267,7 +267,10 @@ def test_propose_lint_failure_is_not_shipped_but_file_kept_on_disk(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _run_propose_with_fake_gate(tmp_path, monkeypatch, candidate_edge, incumbent_edge, min_val_trades=10, trade_count=6):
+def _run_propose_with_fake_gate(
+    tmp_path, monkeypatch, candidate_edge, incumbent_edge,
+    min_val_trades=10, trade_count=6, incumbent_trade_count=6,
+):
     policies_dir, log_root = make_env(tmp_path)
     (policies_dir / "legacy_carry_v3.py").write_text(GOOD_POLICY_SOURCE, encoding="utf-8")
     meta = base_meta()
@@ -286,8 +289,8 @@ def _run_propose_with_fake_gate(tmp_path, monkeypatch, candidate_edge, incumbent
         },
         "gate_incumbent_legacy_carry_v3": {
             "train": _make_result("train", edge_pct=999.0),
-            "val_1": _make_result("val_1", edge_pct=incumbent_edge, max_dd_pct=1.0),
-            "val_2": _make_result("val_2", edge_pct=incumbent_edge, max_dd_pct=1.0),
+            "val_1": _make_result("val_1", edge_pct=incumbent_edge, max_dd_pct=1.0, trade_count=incumbent_trade_count),
+            "val_2": _make_result("val_2", edge_pct=incumbent_edge, max_dd_pct=1.0, trade_count=incumbent_trade_count),
             "holdout": _make_result("holdout", edge_pct=0.0, is_holdout=True),
         },
     }
@@ -304,6 +307,23 @@ def _run_propose_with_fake_gate(tmp_path, monkeypatch, candidate_edge, incumbent
         log_root=log_root, policies_dir=policies_dir, state={"version_counter": 0},
     )
     return result, policies_dir, log_root
+
+
+def test_idle_incumbent_loses_score_shield(tmp_path, monkeypatch):
+    """"躺赢现任"修正(2026-07-19第五代开赛第一小时的真实场景):恒空仓的
+    flat_v1在BTC下跌的验证窗口里零交易白得高分(edge=0−基准跌幅),真实
+    策略全被这个artifact门槛挡在场外。验证交易笔数不足的现任丧失分数护体
+    资格(对照分按0.0处理),分数为正、样本充足的真实候选应当过关——上线
+    后的生死由实盘锦标赛裁决。"""
+    result, policies_dir, log_root = _run_propose_with_fake_gate(
+        tmp_path, monkeypatch,
+        candidate_edge=5.0,        # 候选真实分数 5−0.5×1=4.5,远低于现任的19.5
+        incumbent_edge=20.0,       # 现任artifact高分——但零交易
+        incumbent_trade_count=0,   # 现任验证窗口零交易 -> 样本不足 -> 无护体资格
+    )
+    assert result["gate_result"]["verdict"] == "accepted"
+    assert result["proposed_policy_id"] == "ark_kimi_v1"
+    assert result["gate_result"]["metrics"]["incumbent_insufficient_trades"] is True
 
 
 def test_propose_rejected_when_candidate_score_not_better_than_incumbent(tmp_path, monkeypatch):
