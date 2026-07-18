@@ -384,6 +384,52 @@ def test_propose_rejected_when_val_trade_count_below_min_threshold(tmp_path, mon
 # ---------------------------------------------------------------------------
 
 
+def test_cold_start_exemption_waives_cooldown_on_seed_policy(tmp_path, monkeypatch):
+    """冷启动豁免(用户2026-07-19"直接免除"):现任还是种子空仓策略时,
+    冷却完全不生效——即使2小时前刚提过案,新提案照样直接进回测关卡。
+    冷却防的是"对已上线策略的实盘噪声过度反应",种子策略没有实盘行为,
+    这时冷却只会拖延开赛。"""
+    policies_dir, log_root = make_env(tmp_path)
+    (policies_dir / "flat_v1.py").write_text(GOOD_POLICY_SOURCE, encoding="utf-8")
+    meta = base_meta(policy_id="flat_v1")  # 现任=make_config默认seed_policy
+    llm = make_llm_sequence(
+        [json.dumps({"journal": "冷启动期,立刻再交一版。", "action": "propose", "policy_code": CANDIDATE_POLICY_SOURCE})]
+    )
+    now_ms = BASE_TS + 2 * HOUR_MS  # 距上次提案仅2小时,常规冷却(4h)本应拦下
+
+    FakeGateEngine.injected = {
+        "gate_ark_kimi_v2": {
+            "train": _make_result("train", edge_pct=999.0),
+            "val_1": _make_result("val_1", edge_pct=5.0, max_dd_pct=1.0),
+            "val_2": _make_result("val_2", edge_pct=5.0, max_dd_pct=1.0),
+            "holdout": _make_result("holdout", edge_pct=0.0, is_holdout=True),
+        },
+        "gate_incumbent_flat_v1": {
+            "train": _make_result("train", edge_pct=999.0),
+            "val_1": _make_result("val_1", edge_pct=14.0, trade_count=0),  # 躺赢空仓现任
+            "val_2": _make_result("val_2", edge_pct=14.0, trade_count=0),
+            "holdout": _make_result("holdout", edge_pct=0.0, is_holdout=True),
+        },
+    }
+    monkeypatch.setattr(br, "BacktestEngine", FakeGateEngine)
+    monkeypatch.setattr(br, "DataPipeline", FakeDataPipeline)
+    monkeypatch.setattr(br, "determine_data_end_ts", lambda config, cache_dir: BASE_TS)
+
+    result = br.run_brain_review(
+        BRANCH, meta, llm, now_ms,
+        config=make_config(), memory_store=FakeMemoryStore(),
+        nav_series_lookup=lambda b: [(BASE_TS, 100.0)],
+        market_context="(无)",
+        log_root=log_root, policies_dir=policies_dir,
+        state={"last_proposal_ms": BASE_TS, "version_counter": 1},
+    )
+
+    # 没有被"冷却搁置",而是真的进了关卡并过关
+    assert result["gate_result"] is not None
+    assert result["gate_result"]["verdict"] == "accepted"
+    assert result["proposed_policy_id"] == "ark_kimi_v2"
+
+
 def test_propose_during_cooldown_is_shelved_as_keep(tmp_path):
     policies_dir, log_root = make_env(tmp_path)
     (policies_dir / "legacy_carry_v3.py").write_text(GOOD_POLICY_SOURCE, encoding="utf-8")

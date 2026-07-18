@@ -625,6 +625,13 @@ def run_brain_review(
             (config.get("quant_derby", {}) or {}).get("proposal_cooldown_hours", _DEFAULT_PROPOSAL_COOLDOWN_HOURS)
         )
         in_cooldown, cooldown_remaining_hours = _cooldown_status(state, now_ms, cooldown_hours)
+        # 冷启动豁免(用户2026-07-19指令"直接免除"):现任还是种子空仓策略
+        # (quant_derby.seed_policy)时,冷却完全不生效——冷却防的是"对已上线
+        # 策略的实盘噪声过度反应",而种子策略根本没有实盘行为可言,这时冷却
+        # 唯一的作用是拖延开赛。真策略上线后冷却立即恢复全额生效。
+        _seed_policy_id = str((config.get("quant_derby", {}) or {}).get("seed_policy", "flat_v1"))
+        if current_policy_id == _seed_policy_id and in_cooldown:
+            in_cooldown, cooldown_remaining_hours = False, 0.0
 
         prompt = build_review_prompt(
             branch=branch,
