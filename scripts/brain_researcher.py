@@ -287,6 +287,28 @@ def build_review_prompt(
         "- ctx.memory_context: list[str],记忆检索文本,可以是空列表\n"
         "模块必须导出 decide(ctx) -> list[Decision]、REQUIRED_HISTORY_BARS: int、"
         "DESCRIPTION: str。无信号时返回空列表[],不要构造hold Decision。\n\n"
+        "## Decision 构造契约(2026-07-19新增:第一份候选策略返回了裸dict,"
+        "回测引擎按属性访问decision.ts直接AttributeError判废——这不是可选风格,"
+        "是硬性类型契约)\n"
+        "决策必须是 `from LOCKED.schemas import Decision` 的 Decision 对象,"
+        "绝对不能是dict。构造示例(照抄这个import和字段名):\n"
+        "```python\n"
+        "from LOCKED.schemas import Decision\n"
+        "Decision(\n"
+        "    ts=ctx.ts,                       # 只能用ctx.ts\n"
+        "    symbol=symbol,                   # 必须是ctx.snapshot里存在的symbol\n"
+        "    action=\"open_long\",             # open_long/open_short/close/adjust\n"
+        "    target_notional_pct=25.0,        # 目标名义仓位,占净值的百分点\n"
+        "    leverage=3,                      # 整数1-10\n"
+        "    thesis=\"至少20个字符的中文开仓论点……\",\n"
+        "    falsifier=\"至少20个字符的中文证伪条件描述……\",\n"
+        "    horizon=\"12h\",                  # 严格格式:整数+h/d,如 12h / 3d\n"
+        "    falsifier_condition=\"price<48000\",  # 机器可读止损:price+比较符+数字\n"
+        ")\n"
+        "```\n"
+        "thesis/falsifier 都必须≥20字符,horizon 必须是'12h'/'3d'这种整数+h/d"
+        "格式,falsifier_condition 必须匹配 price<num / price>=num 模式——"
+        "这些是schema层校验,不合规的Decision在回测里同样直接判废。\n\n"
         "## 硬性确定性/沙箱禁止事项(action=\"propose\"时违反任何一条都会被静态检查直接判废)\n"
         "- 禁止任何网络调用/网络库导入(requests/httpx/urllib/socket/ccxt/anthropic/aiohttp/http/websocket/grpc等)\n"
         "- 禁止读墙钟(time.time()/time.time_ns()/datetime.now()/utcnow()/date.today()等)——"
@@ -491,6 +513,10 @@ def _append_policy_gate_log(log_root: Path, *, ts: int, branch: str, gate_result
             "incumbent_score": gate_result.get("incumbent_score"),
             "verdict": gate_result.get("verdict"),
             "metrics": gate_result.get("metrics"),
+            # error详情必须落盘(2026-07-19第一次真实gate error的教训:verdict
+            # =error但traceback只留在内存返回值里,磁盘上没有任何线索,诊断
+            # 只能靠手动重跑整个回测——和kimi max_tokens那次一样的观察盲区)。
+            "error": gate_result.get("error"),
         },
         root=Path(log_root),
     )
@@ -627,6 +653,7 @@ def run_brain_review(
             return {"journal": journal_text, "proposed_policy_id": None, "gate_result": None, "state": state}
 
         # ---- action == "propose" 且不在冷却期:走回测关卡 ----
+        _prior_proposal_ms = state.get("last_proposal_ms")
         state["last_proposal_ms"] = now_ms
         provider_slug = _provider_slug(provider)
         version_counter = int(state.get("version_counter", 0) or 0)
@@ -656,6 +683,16 @@ def run_brain_review(
         _append_policy_gate_log(log_root, ts=now_ms, branch=branch, gate_result=gate_result)
 
         verdict = gate_result.get("verdict")
+        # lint_failed/error:候选根本没跑出一个分数——这不是"一次值得冷却的
+        # 认真提案",是提交环节本身失败(2026-07-19首例:候选返回裸dict在回测
+        # 里AttributeError)。回滚last_proposal_ms,让研究员下个小时就能带着
+        # 关卡反馈重试,而不是被自己的笔误锁死4小时;真正跑完回测的提案
+        # (accepted/rejected)照常消耗冷却,防噪声轰炸的初衷不变。
+        if verdict in ("lint_failed", "error"):
+            if _prior_proposal_ms is None:
+                state.pop("last_proposal_ms", None)
+            else:
+                state["last_proposal_ms"] = _prior_proposal_ms
         verdict_note = {
             "accepted": f"回测关卡通过:候选{candidate_policy_id}分数({gate_result.get('candidate_score')})"
             f"严格优于现任{current_policy_id}({gate_result.get('incumbent_score')}),已换码。",
