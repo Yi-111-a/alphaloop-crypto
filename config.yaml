@@ -147,9 +147,15 @@ constraints:
 cycle:                           # 用户明确要求"快速验证"改成的高频节拍(原为4h/
                                   # 2次天/3天),见 scripts/ignite.py 模块docstring
                                   # 的完整节拍说明
-  decision_interval_hours: 0.5   # 30分钟一次正式决策(原4小时)。2026-07-15起
-                                  # 所有分支(含凉兮)统一用这一个节拍,凉兮的
-                                  # 专属5分钟scheduler已按用户要求下线
+  decision_interval_hours: 0.0833333  # =5分钟。第五代架构(2026-07-18,quant_derby
+                                  # 模式专用值):所有分支(含main)都是零LLM的
+                                  # 确定性代码策略(见DispatchingTrader+policy_id),
+                                  # 5分钟一次决策周期不产生任何额外API调用成本,
+                                  # 代码执行本身很便宜。**若切回brain_derby/
+                                  # tactic_evolution等"大脑直接交易"的模式,必须
+                                  # 改回0.5**,否则每个决策周期都是一次真实付费
+                                  # LLM调用,5分钟节拍下调用量是30分钟节拍的6倍,
+                                  # API成本会直接爆炸。
   reflection_per_day: 12         # 每2小时一轮反思(2026-07-15从48降下来:反思
                                   # 现在覆盖main+全部active分支,一轮就是7-8次
                                   # deep模型调用,48轮/天太贵且30分钟内几乎没有
@@ -198,14 +204,23 @@ tactic_tournament:                # 用户要求"自动进化+晋升赢家"(2026
                                   # 不适合"5个纯提示词战术、需要反复观察、不能一次性
                                   # 判死"这个场景。见scripts/ignite.py模块docstring的
                                   # 完整设计说明。
-  mode: brain_derby               # 大脑德比(用户2026-07-16最终指令:"不要各个不同
-                                  # 性格的分支了,直接改成不同的ai大脑"):所有evo
-                                  # 分支拿到一字不差的中性任务书,唯一变量是llm_
-                                  # provider指向的大模型;出局(FAIL/CULLED)后同一
-                                  # 个大脑带新100U满血复活(死亡次数永久累计),
-                                  # PROMOTE=大脑本体接管main(state/main_brain.json)。
-                                  # 删掉这一行(或写tactic_evolution)回到历史模式:
-                                  # 性格分支+LLM生成替补战术。
+  mode: quant_derby                # 三选一:
+                                  #   quant_derby(第五代架构,2026-07-18用户最终
+                                  #     指令"废除大模型直接交易——所有交易由确定性
+                                  #     策略代码执行,大模型转岗为量化研究员",
+                                  #     现行模式):每个大脑一个分支,从建档起就带
+                                  #     policy_id,全部走M7确定性代码路径零LLM
+                                  #     交易;大脑每小时研究、改码须过回测关卡才能
+                                  #     接管交易权;出局同一大脑带着已验证的
+                                  #     policy_id/policy_history满血复活(账户清零,
+                                  #     研究成果不清零);PROMOTE直接切换
+                                  #     state/main_policy.json,不走M8 git-merge链路。
+                                  #   brain_derby(上一代,2026-07-16~07-18):所有
+                                  #     evo分支拿到一字不差的中性任务书,大脑直接
+                                  #     交易;出局同一个大脑带新100U满血复活;
+                                  #     PROMOTE=大脑本体接管main(state/main_brain.json)。
+                                  #   tactic_evolution(缺省,最早的历史模式):
+                                  #     性格分支+LLM生成替补战术。
   min_hours_before_judgment: 168 # 改造规格书M8§4.2:从4小时收紧到168小时(7天)。
                                   # 信噪比理由:窗口太短时,小时级净值的正常波动
                                   # 量级(尤其是高杠杆/高频分支)本身就能轻易超过
@@ -228,6 +243,28 @@ tactic_tournament:                # 用户要求"自动进化+晋升赢家"(2026
                                   # 保护期理应覆盖至少一个完整的考核窗口,否则
                                   # 窗口拉长之后这个保护期反而比窗口本身还短,
                                   # 起不到"新分支至少活过一轮考核"的保护作用
+quant_derby:                     # 量化研究员德比专属配置(第五代架构,2026-07-18)。
+                                  # 与上面 tactic_tournament 段并存而不是合并进去——
+                                  # 那一段是"锦标赛裁决"这一层(晋升/淘汰/复活的
+                                  # 阈值),这一段是"研究员模块"这一层(大脑多久
+                                  # 审一次自己的代码、多久允许提交一次新代码),
+                                  # 两层节拍互相独立,分开配置更清楚。
+  seed_policy: flat_v1            # 每个新分支(首次建档/复活)起步用的种子策略
+                                  # policy_id,对应 ASSET/strategy/policies/
+                                  # flat_v1.py(恒空仓)。scripts/ignite.py的
+                                  # build_quant_derby_defaults读这里,不是硬编码。
+  proposal_cooldown_hours: 4      # 大脑研究员提交一次新策略代码后,至少要等这么久
+                                  # 才允许再次提交下一版——防止一次决策周期改一次码
+                                  # 这种高频抖动,给回测/观察留出有意义的时间窗口。
+                                  # 由研究员模块(scripts/brain_researcher.py)读取
+                                  # 并自行节拍控制,本文件只声明数值。
+  review_interval_hours: 1        # 大脑研究员的例行研究/复盘节拍(分析行情、复盘
+                                  # 历史决策表现、判断是否需要改代码),与
+                                  # cycle.research_interval_hours是两个独立的
+                                  # "研究"概念——那个是main.py既有的Researcher
+                                  # 通用市场研究,这个是量化德比里"研究员盯着自己
+                                  # 这个分支的策略代码表现"这一新增职责的专属节拍。
+                                  # 由研究员模块读取并自行节拍控制,本文件只声明数值。
 backtest:                          # M6 内环回测(改造规格书§5,2026-07-15)
   scratch_root: ASSET/strategy/experiments   # 回测产物隔离目录,绝不碰生产LOG/state
   windows:

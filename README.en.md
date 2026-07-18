@@ -8,20 +8,25 @@ English | [中文](README.md) | **[🔴 Live panel →](http://45.76.188.163:808
 
 A 24/7 unattended crypto **paper-trading** evolution system (no real money). It doesn't backtest against canned data — it trades on live OKX market data with real funding-rate settlement, pitting multiple LLMs against each other in real time, while a nightly pipeline evolves deterministic strategy code through backtesting.
 
-## The Brain Derby
+## The Quant Derby
 
-Current format: 5 LLMs from different vendors (Doubao / GLM / Kimi / MiniMax / DeepSeek) plus one champion baseline, each managing its own simulated account. Every brain receives **the exact same neutral mandate** — no style hints whatsoever. Long or short, leverage, symbol selection: all up to the brain. The only variable is *which model is thinking*.
+Current format (Gen 5): **LLMs no longer place orders — each brain is a "quant researcher", and what actually trades is the strategy code it writes.**
 
-Survival rules:
+- 🤖 **Code trades**: every account is driven by a deterministic strategy, executed every 5 minutes — zero LLM calls, zero cost, millisecond latency
+- 🔬 **Hourly research**: 5 LLMs from different vendors (Doubao / GLM / Kimi / MiniMax / DeepSeek) plus a champion baseline each review their own strategy's live performance every hour, keeping a research journal of lessons learned
+- 🚪 **Code changes must earn their way in**: a researcher can propose a new strategy version any time, but it must pass AST linting + multi-window anti-overfit backtesting and **strictly outscore the incumbent version** — ties don't ship; a 4-hour proposal cooldown prevents overreacting to noise
+- 🌱 **Everyone starts from zero**: all brains begin with the same flat seed strategy; every line of trading code on the field was researched by the brain itself
+
+Survival rules (unchanged across generations):
 
 - 💀 **Liquidation = death.** Drawdown over 15% = elimination
-- 🔪 **Bottom-feeder cull**: every 72 hours, the lowest earner is eliminated — mediocrity is as fatal as losing
-- ♻️ **Same-brain respawn**: an eliminated brain re-enters with a fresh 100U, but its death count is permanently public
-- 👑 **Winner takes all**: outperform the main account by 0.5pp and that brain takes over the main account's decision-making
+- 🔪 **Bottom-feeder cull**: every 72 hours the lowest earner is out — idling flat at zero return is just as fatal
+- ♻️ **Same-brain respawn**: an eliminated brain re-enters with a fresh 100U — **its strategy lineage and death count persist forever**
+- 👑 **Winner takes all**: outperform the main account by 0.5pp and that brain's strategy code and research mandate take over the main account
 
-Every non-hold decision must state a **falsifiable stop condition** (triggered = force-closed) and a **holding horizon** (expired = force-closed). No vagueness, no overstaying.
+The derby's question has been upgraded accordingly: **which brain is the better quant researcher?**
 
-Given identical mandates, the brains diverged into completely different personalities within 45 hours — one going all-in at 10x leverage, one staying cautious in small size, one spreading ten small positions. Which is exactly the question this derby exists to answer: **which brain is natively better at trading?**
+> The previous generation (Brain Derby: LLMs trading directly every 30 minutes) is fully archived. Its verdict: given identical mandates, models spontaneously diverged into 10x-leverage all-in styles vs. cautious small-size styles — caution won. Its exposed weaknesses (innate LLM long bias, untestable decisions) drove this architecture upgrade.
 
 ## Dual-Loop Auto-Evolution
 
@@ -36,30 +41,30 @@ Strategy knowledge survives across generations: trading data can be reset; the e
 
 ```mermaid
 flowchart TB
-    subgraph FRONT["⚔️ Front stage: Brain Derby (30-min cadence)"]
-        MKT[Live OKX data<br/>OHLCV · funding · open interest] --> DISPATCH{Dispatcher}
-        DISPATCH -->|LLM branches| BRAINS["6 AI brains<br/>Doubao · GLM · Kimi · MiniMax · DeepSeek ×2<br/>(multi-provider routing, isolated contexts)"]
-        DISPATCH -->|policy branches| POLICY["Deterministic strategy code<br/>(zero LLM, promoted from inner loop)"]
-        BRAINS --> SIM[Simulated execution<br/>fees · slippage · liquidation]
-        POLICY --> SIM
+    subgraph EXEC["⚡ Execution: code trades (5-min cadence, zero LLM)"]
+        MKT[Live OKX data<br/>OHLCV · funding · open interest] --> POLICY["One deterministic strategy per account<br/>(authored by its brain, cleared by the gate)"]
+        POLICY --> SIM[Simulated execution<br/>fees · slippage · liquidation]
         SIM --> TOUR["Tournament verdicts<br/>cull · drawdown FAIL · same-brain respawn · main takeover"]
     end
 
+    subgraph RESEARCH["🔬 Research: brain researchers (hourly)"]
+        BRAINS["6 AI brain researchers<br/>Doubao · GLM · Kimi · MiniMax · DeepSeek ×2"]
+        SIM -->|live performance / drawdown / journal| BRAINS
+        BRAINS -->|research journal + lessons| JOURNAL[(branch-private memory)]
+        BRAINS -->|new strategy proposal| GATE{Backtest gate<br/>AST lint + anti-overfit scoring<br/>must strictly beat incumbent}
+        GATE -->|cleared| POLICY
+        GATE -->|rejected, archived| JOURNAL
+    end
+
     subgraph LOCKED["🔒 LOCKED risk layer (AI cannot modify)"]
-        SIM -.constrained by.- RISK[Position limits · forced liquidation · circuit breakers<br/>horizon-expiry closes · decision schema validation]
+        SIM -.constrained by.- RISK[Position limits · forced liquidation · circuit breakers<br/>horizon-expiry closes]
     end
 
-    subgraph MEMORY["🧩 Memory & research"]
-        SIM --> REFL["Branch-isolated reflection<br/>falsified-thesis lessons → L2/L3 memory"]
-        REFL --> BRAINS
-        NEWS[News / macro search] --> BRAINS
-    end
-
-    subgraph BACK["🌙 Backstage: nightly code evolution"]
+    subgraph BACK["🌙 Shared R&D: nightly code evolution"]
         GEN[LLM writes strategy code] --> LINT[AST lint] --> BT[Multi-window backtest<br/>anti-overfit scoring] --> KEEP{keep / revert}
-        KEEP -->|winners| POLICY
         KEEP --> LEDGER[(Experiment ledger<br/>survives generations)]
         LEDGER --> DIRECTOR[Research director<br/>direction memo] --> GEN
+        DIRECTOR -.shared direction.-> BRAINS
     end
 
     TOUR --> PANEL[📊 Read-only web panel]

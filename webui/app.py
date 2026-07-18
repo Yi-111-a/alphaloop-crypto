@@ -423,6 +423,14 @@ def api_branches() -> dict:
         seen[branch]["generation"] = meta.get("generation")
         seen[branch]["deaths"] = meta.get("deaths")
         seen[branch]["promotions"] = meta.get("promotions")
+        # 量化研究员德比(2026-07-18):policy_id是这个分支当前正在跑的
+        # M7确定性策略代码id(见 scripts/ignite.py::build_quant_derby_
+        # defaults / respawn_quant_branch,brain_researcher研究员模块提交
+        # 新代码通过回测关卡后也会更新这个字段)——原样读roster里已有的
+        # 值,不做任何推断,零计算原则同上。M8内环admit_policy_to_forward_
+        # pool送进来的老式policy分支也有这个字段,一并被这里透传,不是
+        # quant_derby独占。
+        seen[branch]["policy_id"] = meta.get("policy_id")
     main_entry: dict = {"branch": "main", "label": "main", "kind": "main"}
     # main当前由哪个大脑执掌(大脑德比PROMOTE后 state/main_brain.json 记录
     # 赢家provider,见 scripts/ignite.py::save_main_brain)——文件不存在时

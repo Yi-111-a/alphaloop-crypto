@@ -604,6 +604,13 @@ MAIN_POLICY_PATH = STATE_ROOT / "main_policy.json"
 # 大脑德比里"赢家通吃"的含义从"战术文字接管main"变成"大脑本体接管main"
 # (所有分支的任务书一字不差,能接管的只有大脑)。
 MAIN_BRAIN_PATH = STATE_ROOT / "main_brain.json"
+# 第五代量化德比(2026-07-19):每个大脑研究员的持久状态(上次检验时间/
+# 上次提案时间/策略版本计数),按分支名为key。这份状态归主循环所有,
+# scripts/brain_researcher.py 模块只读写传入的 state dict、不碰磁盘——
+# 落盘时机由这里统一控制(每次检验完立刻写,与名册"必须立刻落盘"同一条
+# 纪律:version_counter 如果只留在内存里,重启后会从头编号,撞掉已存在的
+# 策略文件名)。
+BRAIN_RESEARCHER_STATE_PATH = STATE_ROOT / "brain_researcher_state.json"
 
 _DAY_MS = 86_400_000
 
@@ -679,12 +686,51 @@ _BRAIN_DERBY_STAKES_SUFFIX = (
     "选择,不靠把仓位缩到没有意义。"
 )
 
+# ---------------------------------------------------------------------------
+# 量化研究员德比(quant derby,第五代架构决定,2026-07-18用户最终指令:
+# "废除大模型直接交易——所有交易由确定性策略代码执行,大模型转岗为'量化
+# 研究员'")。与大脑德比(brain_derby)共用"每个供应商大脑一个分支、出局
+# 同脑复活、赢家接管main"这整套骨架(kind仍标'brain',respawn/PROMOTE的
+# 事件驱动结构不变),唯一的、也是最核心的差异:这里每个分支从一开始就带
+# policy_id(见 build_quant_derby_defaults),DispatchingTrader 因此对
+# 所有分支(含main,见main()里的种子写入)都走 M7 确定性代码路径——大脑
+# 本身不再被Trader.decide()问一次"这个周期怎么交易",它的输出只流向
+# scripts/brain_researcher.py(另一个并行改造任务,不在本文件范围内)的
+# 研究/改码请求,不流向下单决策。tactics字段因此也不再是喂给交易LLM的
+# 任务书,而是写给面板/人工巡检看的说明文字(见下方_QUANT_DERBY_BRIEFING
+# docstring式注释)。
+# ---------------------------------------------------------------------------
+_QUANT_DERBY_BRIEFING = (
+    "量化研究员德比(第五代架构):这个分支的实盘交易账户完全由确定性"
+    "策略代码执行,不再由大模型直接下单——大模型的角色是这个分支背后的"
+    "量化研究员,每小时分析行情/资金费率/宏观信息、复盘历史决策表现,"
+    "并在有把握时提交新的策略代码。新代码必须先通过 ASSET/strategy 内环"
+    "回测关卡(训练/验证窗口 + policy_lint 静态审查,见 config.yaml "
+    "backtest 段)才允许真正接管本分支的交易执行权——通不过关卡,本分支"
+    "继续沿用上一份已验证代码,没有'先上线再验证'这个选项。起步策略是"
+    "种子策略flat_v1(恒空仓,零收益),长期空仓在末位斩杀规则下等同慢性"
+    "死亡,研究员必须尽快提出并验证真正能交易的策略。锦标赛的斩杀/复活/"
+    "接管main三条规则与大脑德比完全一致,不因为改成代码交易而放松:净值"
+    "从历史峰值回撤超过15%或触发末位斩杀 -> 立即强制平仓出局,同一个大脑"
+    "研究员带着它已经验证过的最新策略代码满血复活(账户清零,但研究成果"
+    "——即policy_id/policy_history这份代码血统——永久保留、不清零);净值"
+    "持续跑赢main 0.5个百分点以上 -> 这份策略代码直接切换接管main账户"
+    "(state/main_policy.json),同时这个大脑研究员也接管main的研究权"
+    "(state/main_brain.json),赢家通吃。"
+)
+
 
 def tournament_mode(config: dict) -> str:
-    """tactic_tournament.mode 配置项:"brain_derby"(2026-07-16起的现行模式,
-    大脑德比)或缺省的"tactic_evolution"(历史模式,性格分支+LLM生成替补
-    战术)。代码默认值故意选历史模式——已有测试和老配置在不写mode时的行为
-    不变,现行模式由config.yaml显式声明。"""
+    """tactic_tournament.mode 配置项,三选一:
+      - "quant_derby"(2026-07-18起的现行模式,量化研究员德比,第五代架构:
+        废除大模型直接交易,所有分支从一开始就带policy_id、全部走M7确定性
+        代码路径,大脑转岗研究员)。
+      - "brain_derby"(2026-07-16~07-18的模式,大脑德比:5个LLM大脑直接
+        交易,任务书一字不差)。
+      - 缺省的"tactic_evolution"(最早的历史模式,性格分支+LLM生成替补
+        战术)。
+    代码默认值故意选历史模式——已有测试和老配置在不写mode时的行为不变,
+    现行模式由config.yaml显式声明。"""
     return str((config.get("tactic_tournament") or {}).get("mode", "tactic_evolution"))
 
 
@@ -702,6 +748,25 @@ def load_main_brain() -> Optional[str]:
         except (json.JSONDecodeError, OSError):
             pass
     return None
+
+
+def load_brain_researcher_state() -> dict:
+    """全部大脑研究员的持久状态 {branch: {last_review_ms, last_proposal_ms,
+    version_counter}}。文件损坏/不存在时返回空dict——研究员循环对"从没
+    检验过"的分支的处理就是立刻到期,这正是冷启动想要的行为。"""
+    if BRAIN_RESEARCHER_STATE_PATH.exists():
+        try:
+            data = json.loads(BRAIN_RESEARCHER_STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_brain_researcher_state(state: dict) -> None:
+    BRAIN_RESEARCHER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BRAIN_RESEARCHER_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
 def save_main_brain(provider: str, source_branch: str, now_ms: int) -> None:
@@ -734,6 +799,50 @@ def build_brain_derby_defaults(rotation_pool: list, now_ms: int) -> dict:
             "tactics": _BRAIN_DERBY_MANDATE + _BRAIN_DERBY_STAKES_SUFFIX,
             "llm_provider": provider,
             "kind": "brain",
+            "generation": 1,
+            "deaths": 0,
+            "promotions": 0,
+        }
+        for provider in providers
+    }
+
+
+def build_quant_derby_defaults(rotation_pool: list, now_ms: int, seed_policy_id: str) -> dict:
+    """量化研究员德比模式下"名册文件不存在,首次建档用什么"的默认值——
+    与 build_brain_derby_defaults 同构(每个可用供应商大脑一个分支,轮转
+    池为空时同样退化为单分支、用_DEFAULT_LLM_PROVIDER顶上),但每条meta
+    多带两个字段:
+
+      - policy_id: seed_policy_id —— 与大脑德比"分支从裸提示词起步"的
+        根本区别在这里:量化德比的分支从诞生起就带着一个真实的M7确定性
+        策略代码id(DispatchingTrader.policy_resolver能立刻查到它,零LLM
+        交易路径从第一个决策周期就生效),不是"等锦标赛判定PROMOTE、
+        M8内环admit_policy_to_forward_pool事后才接上policy_id"那种
+        延迟绑定。
+      - policy_history: [seed_policy_id] —— 这个分支背后的大脑研究员
+        迄今为止验证过的所有策略代码id,按时间顺序累计(种子策略是
+        第一条记录)。研究员模块(scripts/brain_researcher.py,另一个
+        并行任务)提交新代码并通过回测关卡后,应当把新policy_id追加到
+        这个列表末尾、同时更新policy_id字段指向最新版本——本文件只负责
+        建档时预置种子值,不负责研究员写回时的字段更新协议(那部分由
+        研究员模块自己实现,但字段名约定在这里定死,双方必须遵守同一套
+        key)。
+
+    tactics字段用_QUANT_DERBY_BRIEFING(人类可读的德比说明,给面板/巡检
+    看,不是交易LLM的任务书——DispatchingTrader对带policy_id的分支根本
+    不读这个字段,直接走load_policy(policy_id)的纯代码路径)。kind仍然是
+    'brain'(与大脑德比共用respawn事件驱动骨架里"kind=='brain'才认为是
+    可复活的大脑分支"这条判断)。
+    """
+    providers = sorted(rotation_pool) if rotation_pool else [_DEFAULT_LLM_PROVIDER]
+    date_compact = datetime.datetime.utcfromtimestamp(now_ms / 1000).strftime("%Y%m%d")
+    return {
+        f"evo/{date_compact}-quant-{provider}": {
+            "tactics": _QUANT_DERBY_BRIEFING,
+            "llm_provider": provider,
+            "kind": "brain",
+            "policy_id": seed_policy_id,
+            "policy_history": [seed_policy_id],
             "generation": 1,
             "deaths": 0,
             "promotions": 0,
@@ -783,6 +892,71 @@ def respawn_brain_branch(roster: dict, dead_branch: str, decision: str, now_ms: 
         "deaths": deaths,
         "promotions": promotions,
         "respawned_from": dead_branch,
+    }
+    return roster, new_branch
+
+
+def respawn_quant_branch(roster: dict, dead_branch: str, decision: str, now_ms: int) -> tuple[dict, Optional[str]]:
+    """量化研究员德比的换血规则——与respawn_brain_branch同一条"大脑是永久
+    选手,账户才是消耗品"的纪律,但多继承一份"研究血统":复活的新分支必须
+    带着死者临终时的 policy_id / policy_history,而不是像大脑德比那样只
+    继承一份一字不差的中性任务书。理由:量化德比里研究员的真实产出是
+    "验证过、能通过回测关卡的策略代码",这份产出和大脑本体一样是永久的,
+    只有交易账户(净值/持仓)本身随着死亡清零——如果复活时连policy_id都
+    丢了,退回种子策略flat_v1,相当于抹掉这个大脑此前所有研究成果,
+    每次死亡都从零开始,长期看等价于永远困在种子策略里、永远被末位斩杀
+    淘汰,研究员模块的迭代成果完全没有积累意义。
+
+    新分支id格式 evo/{YYYYMMDD}-quant-{provider}-g{generation}(世代号
+    从2起,与respawn_brain_branch同一套防冲突自增逻辑)。deaths/
+    promotions累计规则、"非大脑分支返回(roster, None)"的跳过规则,均与
+    respawn_brain_branch完全一致——两者本可以合并成一个参数化函数,这里
+    选择写成独立函数而不是给respawn_brain_branch加分支参数,是因为
+    "分支id里的-brain-/-quant-段字面量"和"是否继承policy_id/policy_
+    history"这两点差异分散在函数体的不同位置,参数化后可读性反而更差
+    (调用点需要记住"这个bool到底控制哪几行"),两个短小独立的函数更符合
+    本文件一贯"宁可少量重复,不要隐晦的参数化分支"的风格(参见
+    read_main_daily_nav_series/read_branch_daily_nav_series这对同构但
+    独立的函数)。
+    """
+    dead_meta = roster.get(dead_branch) or {}
+    provider = dead_meta.get("llm_provider")
+    if not provider or dead_meta.get("kind") != "brain":
+        return roster, None
+
+    deaths = int(dead_meta.get("deaths", 0)) + (1 if decision in ("FAIL", "CULLED") else 0)
+    promotions = int(dead_meta.get("promotions", 0)) + (1 if decision == "PROMOTE" else 0)
+    generation = int(dead_meta.get("generation", 1)) + 1
+    date_compact = datetime.datetime.utcfromtimestamp(now_ms / 1000).strftime("%Y%m%d")
+    new_branch = f"evo/{date_compact}-quant-{provider}-g{generation}"
+    while new_branch in roster:
+        generation += 1
+        new_branch = f"evo/{date_compact}-quant-{provider}-g{generation}"
+
+    # 研究血统继承:policy_id/policy_history跟着大脑走,不跟着死掉的账户
+    # 一起清零。dead_meta理论上总应该带着这两个字段(建档/晋升/复活三处
+    # 都会写),但仍然做防御性兜底——policy_history缺失时至少从当前
+    # policy_id重建一条单元素历史,而不是让新分支彻底没有policy_id
+    # (那会让DispatchingTrader把它当成老式提示词分支,静默退回LLM路径,
+    # 与"量化德比全部分支零LLM"的设计初衷相悖)。
+    inherited_policy_id = dead_meta.get("policy_id")
+    inherited_policy_history = list(
+        dead_meta.get("policy_history") or ([inherited_policy_id] if inherited_policy_id else [])
+    )
+
+    roster = dict(roster)
+    roster[new_branch] = {
+        "tactics": _QUANT_DERBY_BRIEFING,
+        "llm_provider": provider,
+        "kind": "brain",
+        "status": "active",
+        "created_ms": now_ms,
+        "generation": generation,
+        "deaths": deaths,
+        "promotions": promotions,
+        "respawned_from": dead_branch,
+        "policy_id": inherited_policy_id,
+        "policy_history": inherited_policy_history,
     }
     return roster, new_branch
 
@@ -1831,16 +2005,59 @@ def main() -> None:
         ),
     }
 
-    # 大脑德比(用户2026-07-16最终指令):config.yaml声明tactic_tournament.
-    # mode: brain_derby时,上面这份"性格分支"默认名册整体弃用,换成"每个
-    # 可用供应商大脑一个分支、任务书一字不差"的德比名册(见
-    # build_brain_derby_defaults docstring)。_DEFAULT_EVO_TACTICS的定义
-    # 保留不删:历史模式的回退路径 + 既有测试的行为锚点。此后所有需要
-    # "名册首次建档默认值"的地方(make_policy_resolver、Trader的roster_
-    # loader、主循环的load_tournament_roster)统一用roster_defaults这一个
-    # 变量,保证不管哪种模式,全进程看到的都是同一份defaults。
-    derby_mode = tournament_mode(config) == "brain_derby"
-    if derby_mode:
+    # 模式分派(2026-07-18第五代架构扩展为三态):config.yaml声明
+    # tactic_tournament.mode 决定名册首次建档用哪份默认值——
+    #   - "quant_derby"(现行,量化研究员德比):每个可用供应商大脑一个分支,
+    #     从建档起就带policy_id,全部走M7确定性代码路径,大脑转岗研究员。
+    #   - "brain_derby"(上一代):每个可用供应商大脑一个分支,任务书一字
+    #     不差,大脑直接交易。
+    #   - 缺省"tactic_evolution"(历史模式):性格分支+LLM生成替补战术。
+    # _DEFAULT_EVO_TACTICS的定义保留不删:历史模式的回退路径 + 既有测试的
+    # 行为锚点。此后所有需要"名册首次建档默认值"的地方(make_policy_
+    # resolver、Trader的roster_loader、主循环的load_tournament_roster)
+    # 统一用roster_defaults这一个变量,保证不管哪种模式,全进程看到的都是
+    # 同一份defaults。
+    #
+    # derby_mode(brain_derby/quant_derby都为True)沿用既有语义:两者共用
+    # "出局同脑复活、PROMOTE后不再请LLM生成替补战术"这条骨架,判断逻辑里
+    # 只需要一个quant_mode额外区分"复活时是否要继承policy_id/policy_
+    # history"、"PROMOTE时是否走policy_id直切而不是M8两级晋升/战术文字
+    # 接管"这两处真正有行为差异的地方(见respawn_quant_branch调用点与
+    # 下面锦标赛裁决区的quant_mode分支)。
+    _tournament_mode_name = tournament_mode(config)
+    derby_mode = _tournament_mode_name in ("brain_derby", "quant_derby")
+    quant_mode = _tournament_mode_name == "quant_derby"
+    if quant_mode:
+        quant_cfg = config.get("quant_derby", {}) or {}
+        seed_policy_id = str(quant_cfg.get("seed_policy", "flat_v1"))
+        roster_defaults = build_quant_derby_defaults(
+            evo_rotation_pool(available_provider_clients), clock.now_ms(), seed_policy_id
+        )
+        # main分支的起点(第五代架构要求:主账户从第一轮起就必须走零LLM
+        # 代码路径,不能像brain_derby/tactic_evolution时代那样默认停留在
+        # LLM路径直到某个分支PROMOTE)——只在main_policy.json完全不存在
+        # 时写种子值,已经晋升过(不管是这次改造前的老状态还是本次进程内
+        # 已经发生过一次PROMOTE)绝不覆盖,与load_main_policy_id/
+        # save_main_policy_id"只有真正的晋升事件才更新这个文件"的既有
+        # 纪律保持一致。
+        if not MAIN_POLICY_PATH.exists():
+            save_main_policy_id(seed_policy_id, "genesis", clock.now_ms())
+            print(
+                f"=== 量化德比首次启动:main分支写入种子策略 policy_id="
+                f"{seed_policy_id!r},main从第一个决策周期起即走零LLM代码"
+                f"路径 ===",
+                flush=True,
+            )
+        _decision_interval_h = float(config["cycle"]["decision_interval_hours"])
+        print(
+            f"=== 量化研究员德比模式:{len(roster_defaults)} 个大脑研究员参赛 "
+            f"{[m['llm_provider'] for m in roster_defaults.values()]},种子策略="
+            f"{seed_policy_id!r},全部分支(含main)零LLM代码交易,大脑只研究"
+            f"不下单;决策执行节拍={_decision_interval_h}小时"
+            f"({_decision_interval_h * 60:.0f}分钟)===",
+            flush=True,
+        )
+    elif derby_mode:
         roster_defaults = build_brain_derby_defaults(
             evo_rotation_pool(available_provider_clients), clock.now_ms()
         )
@@ -1866,6 +2083,20 @@ def main() -> None:
     # _DEFAULT_EVO_TACTICS 作为"名册文件不存在时的首次建档默认值"——两者
     # 必须是同一份 defaults,否则 policy_resolver 在名册还没被主循环第一次
     # 写盘之前查到的可能是一份不同的初始名册。
+    #
+    # quant_derby零LLM验证(2026-07-18第五代架构,不需要额外拆分Trader的
+    # 理由):这层DispatchingTrader分发本来就是"policy_resolver查得到
+    # policy_id就走代码路径,查不到才落回llm_trader"——quant_derby模式下
+    # roster_defaults里每个分支从建档起就自带policy_id(build_quant_derby_
+    # defaults),main分支也在上面quant_mode分支里被立刻写入种子policy_id
+    # (state/main_policy.json不存在时)。也就是说quant_derby模式下
+    # make_policy_resolver(clock, roster_defaults)对"main"和所有active
+    # 分支的解析永远非None,DispatchingTrader.decide()因此永远不会调用
+    # 到self.llm_trader.decide()(即下面构造的裸Trader,唯一会真正触发
+    # llm_client_resolver/AgentBridgeLLMClient文件握手的路径)——这正是
+    # "quant_derby模式下不得对任何分支发起LLM交易决策"这条要求的落点,
+    # 由现成的分发机制自然满足,不需要为这个模式单独改写Trader/
+    # DispatchingTrader的实现。
     scheduler.trader = DispatchingTrader(
         llm_trader=trader,
         policy_resolver=make_policy_resolver(clock, roster_defaults),
@@ -1972,6 +2203,111 @@ def main() -> None:
                 print(f"[{now}] [{evo_branch}] run_decision_cycle 异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
             # 每处理完一个分支就刷新心跳:思考模式API下单次决策可达1-3分钟,
             # 一轮7个分支远超watchdog的stale阈值,只在循环结尾写会被误杀。
+            write_heartbeat(clock, {"status": "running"})
+
+        # 大脑研究员小时检验(第五代量化德比,2026-07-19,用户指令"不能让
+        # 大模型做决策,每小时检验代码总结经验"):每个大脑作为量化研究员
+        # 定期审视自己策略代码的实盘表现,写研究日志(进分支私有记忆),
+        # 必要时提交新版策略——新代码必须通过回测关卡(分数严格超过现任、
+        # 4小时提案冷却)才会上线,见 scripts/brain_researcher.py。
+        # 每轮主循环最多处理一个"最过期"的研究员:回测关卡单次可能要跑
+        # 几分钟,一轮串行处理全部6个会把5分钟的交易执行节拍堵死;摊到
+        # 多轮循环后,交易执行最多被延迟一个关卡的时长,而检验节拍
+        # (review_interval_hours=1)对6个研究员依然绰绰有余(每小时有
+        # ~60轮循环可分)。
+        if quant_mode and available_provider_clients:
+            try:
+                _qd_cfg = config.get("quant_derby", {}) or {}
+                review_interval_ms = int(float(_qd_cfg.get("review_interval_hours", 1)) * 3_600_000)
+                researcher_state = load_brain_researcher_state()
+                # main也是参赛研究员:它的大脑=main_brain.json覆盖(PROMOTE
+                # 后归赢家)或默认deepseek,策略指针在main_policy.json——
+                # main如果永远停在种子空仓策略上,第一个做出正收益策略的
+                # 大脑就能白捡PROMOTE,比较失去意义。
+                review_candidates: list[tuple[str, dict]] = [(
+                    "main",
+                    {
+                        "llm_provider": load_main_brain() or _DEFAULT_LLM_PROVIDER,
+                        "policy_id": load_main_policy_id(),
+                        "policy_history": [],
+                        "kind": "brain",
+                    },
+                )]
+                for _rb, _rmeta in tournament_roster.items():
+                    if (
+                        isinstance(_rmeta, dict) and _rmeta.get("status") == "active"
+                        and _rmeta.get("kind") == "brain" and _rmeta.get("policy_id")
+                    ):
+                        review_candidates.append((_rb, _rmeta))
+                _due = [
+                    (rb, rmeta) for rb, rmeta in review_candidates
+                    if now - int((researcher_state.get(rb) or {}).get("last_review_ms", 0)) >= review_interval_ms
+                ]
+                if _due:
+                    _due.sort(key=lambda x: int((researcher_state.get(x[0]) or {}).get("last_review_ms", 0)))
+                    review_branch, review_meta = _due[0]
+                    _provider = review_meta.get("llm_provider")
+                    _pair = (
+                        available_provider_clients.get(_provider)
+                        or available_provider_clients.get(_DEFAULT_LLM_PROVIDER)
+                        or next(iter(available_provider_clients.values()))
+                    )
+                    market_lines: list[str] = []
+                    try:
+                        for _sym, _ticker in sorted(snapshot_provider(now).items()):
+                            if isinstance(_ticker, dict):
+                                market_lines.append(
+                                    f"{_sym}: last={_ticker.get('last')} "
+                                    f"chg_24h={_ticker.get('chg_24h_pct')}% chg_7d={_ticker.get('chg_7d_pct')}%"
+                                )
+                    except Exception:  # noqa: BLE001 -- 快照失败不该阻断检验本身
+                        pass
+                    from brain_researcher import run_brain_review  # noqa: PLC0415
+
+                    review_result = run_brain_review(
+                        review_branch, review_meta, _pair[1], now,
+                        config=config, memory_store=memory_store,
+                        nav_series_lookup=lambda b: (
+                            read_main_hourly_nav_series() if b == "main" else read_branch_hourly_nav_series(b)
+                        ),
+                        market_context="\n".join(market_lines) or "(市场快照暂不可用)",
+                        log_root=LOG_ROOT,
+                        policies_dir=PROJECT_ROOT / "ASSET" / "strategy" / "policies",
+                        state=dict(researcher_state.get(review_branch) or {}),
+                    )
+                    researcher_state[review_branch] = review_result.get("state") or {"last_review_ms": now}
+                    save_brain_researcher_state(researcher_state)
+
+                    new_policy_id = review_result.get("proposed_policy_id")
+                    if new_policy_id:
+                        # 关卡通过——切线上指针。名册必须现读现写(检验期间
+                        # 锦标赛可能已改写名册,拿循环顶部的旧副本覆盖会丢
+                        # 裁决结果)。
+                        if review_branch == "main":
+                            save_main_policy_id(new_policy_id, "main-researcher", now)
+                        else:
+                            _fresh = load_tournament_roster(now, roster_defaults)
+                            if isinstance(_fresh.get(review_branch), dict):
+                                _fm = dict(_fresh[review_branch])
+                                _fm["policy_id"] = new_policy_id
+                                _fm["policy_history"] = list(_fm.get("policy_history") or []) + [new_policy_id]
+                                _fresh[review_branch] = _fm
+                                save_tournament_roster(_fresh)
+                        print(
+                            f"[{now}] [{review_branch}] 研究员新策略过关上线: {new_policy_id}"
+                            f"(下一个执行周期立即生效,不需要重启)",
+                            flush=True,
+                        )
+                    else:
+                        _gr = review_result.get("gate_result")
+                        _verdict = _gr.get("verdict") if isinstance(_gr, dict) else None
+                        print(
+                            f"[{now}] [{review_branch}] 研究员检验完成: keep"
+                            + (f"(关卡裁决: {_verdict})" if _verdict else ""),
+                            flush=True,
+                        )
+            except Exception:  # noqa: BLE001
+                print(f"[{now}] 大脑研究员检验异常(已记录,继续循环):\n{traceback.format_exc()}", flush=True)
             write_heartbeat(clock, {"status": "running"})
 
         if now - last_settlement_check_ms >= 3_600_000:
@@ -2286,7 +2622,35 @@ def main() -> None:
                         # 维持原有的"战术文字接管main"行为不变(它们没有真实
                         # 代码可以合并,GitMergeExecutor对它们没有意义)。
                         policy_id = roster[branch].get("policy_id")
-                        if policy_id is None:
+                        if quant_mode:
+                            # 量化研究员德比PROMOTE(2026-07-18第五代架构):
+                            # 这里的policy_id从分支建档起就存在(不是M8内环
+                            # admit_policy_to_forward_pool事后才接上的),
+                            # 晋升的对象本来就是ASSET/strategy/policies/
+                            # 目录下的一个.py文件,不是需要真正合并代码的
+                            # git分支——promote_policy_branch()那条两级
+                            # 晋升链路(register_branch/judge()/
+                            # GitMergeExecutor.attempt_merge())是为"候选
+                            # 分支=真实git分支,需要跑测试+真实merge"这个
+                            # 场景设计的,量化德比里没有这个前提,不需要、
+                            # 也不应该硬套那条链路——直接切换
+                            # state/main_policy.json的policy_id指针就是
+                            # 全部真相。main研究权(state/main_brain.json)
+                            # 同时交给赢家大脑,与大脑德比"赢家通吃"是同一
+                            # 语义,只是现在通吃的是"代码+研究权"而不是
+                            # "提示词+决策权"。
+                            winning_provider = roster[branch].get("llm_provider")
+                            save_main_policy_id(policy_id, branch, now)
+                            if winning_provider:
+                                save_main_brain(winning_provider, branch, now)
+                            print(
+                                f"[{now}] 量化德比PROMOTE: main分支切换为 "
+                                f"policy_id={policy_id!r}(来自{branch},大脑"
+                                f"{winning_provider}同时接管main研究权,"
+                                f"立即生效,不需要重启)",
+                                flush=True,
+                            )
+                        elif policy_id is None:
                             if derby_mode and roster[branch].get("kind") == "brain":
                                 # 大脑德比:所有分支任务书一字不差,"赢家的
                                 # 战术文字接管main"没有信息量——接管main的
@@ -2366,9 +2730,18 @@ def main() -> None:
                         # policy分支(M8内环送进来的)不归复活规则管,名额
                         # 留给内环下一次admit补充。
                         if derby_mode:
-                            roster, respawned_id = respawn_brain_branch(
-                                roster, resolved_branch, ev["decision"], now
-                            )
+                            # quant_mode:复活时必须继承研究血统(policy_id/
+                            # policy_history),respawn_quant_branch专门做
+                            # 这件事;brain_derby复活的是裸大脑,沿用原有
+                            # respawn_brain_branch不变。
+                            if quant_mode:
+                                roster, respawned_id = respawn_quant_branch(
+                                    roster, resolved_branch, ev["decision"], now
+                                )
+                            else:
+                                roster, respawned_id = respawn_brain_branch(
+                                    roster, resolved_branch, ev["decision"], now
+                                )
                             if respawned_id is not None:
                                 save_tournament_roster(roster)
                                 new_meta = roster[respawned_id]
@@ -2377,20 +2750,31 @@ def main() -> None:
                                     {
                                         "ts": now, "resolved_branch": resolved_branch,
                                         "resolved_decision": ev["decision"],
-                                        "status": "brain_respawn",
+                                        "status": "quant_respawn" if quant_mode else "brain_respawn",
                                         "new_branch_id": respawned_id,
                                         "llm_provider": new_meta["llm_provider"],
                                         "generation": new_meta["generation"],
                                         "deaths": new_meta["deaths"],
                                         "promotions": new_meta["promotions"],
+                                        # policy_id/policy_history只有quant_mode下有意义
+                                        # (brain_derby的respawn_brain_branch不写这两个
+                                        # 字段,new_meta.get在那种情况下自然是None/空)。
+                                        "policy_id": new_meta.get("policy_id"),
+                                        "policy_history": new_meta.get("policy_history"),
                                     },
                                     root=LOG_ROOT,
                                 )
                                 print(
-                                    f"[{now}] 大脑德比复活: {new_meta['llm_provider']} 带着新的100U"
+                                    f"[{now}] "
+                                    f"{'量化德比' if quant_mode else '大脑德比'}复活: "
+                                    f"{new_meta['llm_provider']} 带着新的100U"
                                     f"重新入场 -> {respawned_id}(第{new_meta['generation']}世代,"
-                                    f"累计死亡{new_meta['deaths']}次/晋升{new_meta['promotions']}次,"
-                                    f"立即生效,不需要重启)",
+                                    f"累计死亡{new_meta['deaths']}次/晋升{new_meta['promotions']}次"
+                                    + (
+                                        f",继承policy_id={new_meta.get('policy_id')!r}"
+                                        if quant_mode else ""
+                                    )
+                                    + ",立即生效,不需要重启)",
                                     flush=True,
                                 )
                             else:
