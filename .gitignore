@@ -14,3 +14,13 @@ ASSET/research_notes/*.md
 universe_active.json
 *.db
 scratch/
+
+# 夜间研究内环在运行机上生成的实验产物(协议/结果/账本/总监备忘录)——
+# 属于那台机器的研究历史,不随代码仓库分发
+ASSET/strategy/experiments/
+
+# 部署与本地环境
+*.bundle
+.env
+.venv/
+venv/
